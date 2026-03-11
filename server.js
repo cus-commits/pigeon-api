@@ -2994,14 +2994,17 @@ ${batchDataText}`;
 
   console.log(`[AutoScan] ALL TIERS COMPLETE. Sonnet passed: ${opusCandidates.length}/${companyCards.length}. Opus scores: ${Object.keys(scoreMap).length}. Pass: ${passSet.size}`);
 
-    // Fuzzy score lookup helper
+    // Fuzzy score lookup helper — strict matching to avoid false positives
     const getScore = (name) => {
       const n = (name || '').toLowerCase().trim();
       if (scoreMap[n]) return scoreMap[n];
       const noParen = n.replace(/\s*\(.*?\)\s*/g, '').trim();
       if (scoreMap[noParen]) return scoreMap[noParen];
-      for (const [k, v] of Object.entries(scoreMap)) {
-        if (k.includes(noParen) || noParen.includes(k)) return v;
+      // Only match if name is 5+ chars AND one starts with the other (not just includes)
+      if (noParen.length >= 5) {
+        for (const [k, v] of Object.entries(scoreMap)) {
+          if (k.length >= 5 && (k.startsWith(noParen) || noParen.startsWith(k))) return v;
+        }
       }
       return 0;
     };
@@ -3028,12 +3031,13 @@ ${batchDataText}`;
       const matchScore = (name) => {
         const n = (name || '').toLowerCase().trim();
         if (scoreMap[n]) return scoreMap[n];
-        // Try without parenthetical: "Stormy (YC W26)" → "stormy"
         const noParen = n.replace(/\s*\(.*?\)\s*/g, '').trim();
         if (scoreMap[noParen]) return scoreMap[noParen];
-        // Try matching partial — company card name might be subset of scored name
-        for (const [k, v] of Object.entries(scoreMap)) {
-          if (k.includes(noParen) || noParen.includes(k)) return v;
+        // Strict: 5+ chars and startsWith only
+        if (noParen.length >= 5) {
+          for (const [k, v] of Object.entries(scoreMap)) {
+            if (k.length >= 5 && (k.startsWith(noParen) || noParen.startsWith(k))) return v;
+          }
         }
         return 0;
       };
@@ -3128,8 +3132,10 @@ ${batchDataText}`;
         if (scoreMap[n]) return scoreMap[n];
         const noParen = n.replace(/\s*\(.*?\)\s*/g, '').trim();
         if (scoreMap[noParen]) return scoreMap[noParen];
-        for (const [k, v] of Object.entries(scoreMap)) {
-          if (k.includes(noParen) || noParen.includes(k)) return v;
+        if (noParen.length >= 5) {
+          for (const [k, v] of Object.entries(scoreMap)) {
+            if (k.length >= 5 && (k.startsWith(noParen) || noParen.startsWith(k))) return v;
+          }
         }
         return 0;
       };
