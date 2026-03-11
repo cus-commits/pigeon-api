@@ -2175,7 +2175,7 @@ app.get('/api/autoscan/status/:personId?', (req, res) => {
   // Auto-clear stale "scanning" statuses older than 30 min
   const now = Date.now();
   for (const [pid, s] of Object.entries(global._scanStatus || {})) {
-    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 30 * 60 * 1000) {
+    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 10 * 60 * 1000) {
       console.log(`[AutoScan] Clearing stale scanning status for ${pid} (started ${Math.round((now - s.startedAt)/60000)}min ago)`);
       global._scanStatus[pid] = { status: 'idle' };
     }
@@ -2202,6 +2202,23 @@ app.get('/api/autoscan/last-results/:personId', (req, res) => {
     }
   } catch (e) {
     res.json({ error: 'No results file' });
+  }
+});
+
+// Force clear scan status for a person (or all)
+app.post('/api/autoscan/clear-status/:personId?', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (!global._scanStatus) global._scanStatus = {};
+  if (req.params.personId) {
+    const old = global._scanStatus[req.params.personId];
+    global._scanStatus[req.params.personId] = { status: 'idle' };
+    console.log(`[AutoScan] Force cleared status for ${req.params.personId} (was: ${JSON.stringify(old)})`);
+    res.json({ success: true, cleared: req.params.personId, was: old });
+  } else {
+    const old = { ...global._scanStatus };
+    global._scanStatus = {};
+    console.log(`[AutoScan] Force cleared ALL scan statuses`);
+    res.json({ success: true, cleared: 'all', was: old });
   }
 });
 
