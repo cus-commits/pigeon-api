@@ -4009,7 +4009,10 @@ app.post('/api/signals/super', async (req, res) => {
       timeRange = 'week',
       stage = [],
       customKeywords = '',
+      superTier = 'sonnet', // 'sonnet' | 'opus20' | 'opus80'
     } = req.body;
+    const useOpus = superTier === 'opus20' || superTier === 'opus80';
+    const opusTopN = superTier === 'opus80' ? 80 : superTier === 'opus20' ? 20 : 0;
 
     if (sectors.length === 0 && !customKeywords.trim()) {
       return sendResult({ error: 'Pick at least one sector or add custom keywords.' });
@@ -4491,7 +4494,78 @@ ${signalText}`;
           });
 
           // Clean analysis text
-          const cleanAnalysis = analysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
+          let cleanAnalysis = analysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
+
+          // OPTIONAL: Opus deep scoring on top signals
+          let opusAnalysis = '';
+          if (useOpus && anthropicKey) {
+            const topForOpus = rated.filter(s => s.signal === 'HIGH' || s.signal === 'MEDIUM').slice(0, opusTopN);
+            if (topForOpus.length > 0) {
+              sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
+              const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
+
+Score each company/signal 1-10 based on investability. Consider: founder quality, product traction, market timing, uniqueness, funding stage fit.
+
+SCORING GUIDE:
+- 9-10: Exceptional — clear product, strong founder, right timing, must-meet
+- 7-8: Strong — good signal, worth a call
+- 5-6: Interesting but unclear — needs more research
+- 1-4: Not investable — noise, too early, wrong fit
+
+STEALTH COMPANIES: Apply -90% score penalty. Only score above 5 if exceptional repeat founder.
+
+Respond with a JSON block then brief analysis per company:
+\`\`\`json
+{"CompanyName": {"score": 8, "reason": "brief reason"}, ...}
+\`\`\`
+
+SIGNALS TO SCORE:
+${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) — ${s.text?.slice(0, 200)}`).join('\n')}`;
+
+              try {
+                const opusRes = await fetch('https://api.anthropic.com/v1/messages', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+                  body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 4096, messages: [{ role: 'user', content: opusPrompt }] }),
+                });
+                if (opusRes.ok) {
+                  const opusData = await opusRes.json();
+                  opusAnalysis = opusData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+                  
+                  // Parse Opus scores and merge into rated signals
+                  try {
+                    const jsonMatch = opusAnalysis.match(/```json\s*\n?([\s\S]*?)\n?```/);
+                    if (jsonMatch) {
+                      const opusScores = JSON.parse(jsonMatch[1]);
+                      for (const s of rated) {
+                        const name = s.companyName || s.title || '';
+                        const match = opusScores[name] || Object.values(opusScores).find((v, i) => Object.keys(opusScores)[i].toLowerCase() === name.toLowerCase());
+                        if (match?.score) {
+                          s._opusScore = match.score;
+                          s._opusReason = match.reason || '';
+                        }
+                      }
+                      console.log(`[Super] Opus scored ${Object.keys(opusScores).length} companies`);
+                    }
+                  } catch (e) { console.error('[Super] Opus JSON parse error:', e.message); }
+                  
+                  cleanAnalysis += '\n\n## Opus Deep Analysis\n' + opusAnalysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
+                  sendProgress(`Opus scored ${topForOpus.length} signals`, 'deepscore', {});
+                }
+              } catch (e) { console.error('[Super] Opus error:', e.message); }
+            }
+          }
+
+          // Re-sort: Opus scores first (if available), then HIGH/MEDIUM/LOW
+          rated.sort((a, b) => {
+            if (a._opusScore && b._opusScore) return b._opusScore - a._opusScore;
+            if (a._opusScore && !b._opusScore) return -1;
+            if (!a._opusScore && b._opusScore) return 1;
+            const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+            const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
+            if (sigDiff !== 0) return sigDiff;
+            return b.engagement - a.engagement;
+          });
 
           // AUTO-PUSH HIGH signals to DD pipeline
           // With Harmonic saved search: push up to 15 HIGH signals (3x multiplier)
@@ -4543,8 +4617,10 @@ ${signalText}`;
 
           sendProgress('Done — preparing results...', 'done', {});
           const elapsed = Math.round((Date.now() - startTime) / 1000);
-          const estimatedCost = (forClaude.length * 0.001).toFixed(3); // ~$0.001 per signal via Sonnet
-          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length, elapsed, estimatedCost });
+          const sonnetCost = forClaude.length * 0.001;
+          const opusCost = useOpus ? opusTopN * 0.015 : 0;
+          const estimatedCost = (sonnetCost + opusCost).toFixed(3);
+          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length, elapsed, estimatedCost, tier: superTier });
         } else {
           const errBody = await claudeRes.text().catch(() => '');
           console.error('[Super] Claude API failed (' + claudeRes.status + '):', errBody.slice(0, 300));
