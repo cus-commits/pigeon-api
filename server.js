@@ -3985,8 +3985,11 @@ app.post('/api/signals/super', async (req, res) => {
   res.flushHeaders();
 
   const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
-  const sendProgress = (msg) => { res.write(`data: ${JSON.stringify({ progress: msg })}\n\n`); };
+  const sendProgress = (msg, stage, meta) => { 
+    res.write(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`); 
+  };
   const sendResult = (data) => { clearInterval(keepAlive); res.write(`data: ${JSON.stringify(data)}\n\n`); res.end(); };
+  const startTime = Date.now();
 
   try {
     const _hdrKey = (req.headers['x-anthropic-key'] || '').trim();
@@ -4058,7 +4061,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- TWITTER ----
     if (sources.includes('twitter') && rapidApiKey) {
-      sendProgress('Scanning X/Twitter...');
+      sendProgress('Scanning X/Twitter...', 'import', { source: 'twitter' });
       const rapidHeaders = { 'x-rapidapi-host': 'twitter-v24.p.rapidapi.com', 'x-rapidapi-key': rapidApiKey };
       const twitterKws = uniqueKeywords.slice(0, 10);
       for (const kw of twitterKws) {
@@ -4106,7 +4109,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- FARCASTER ----
     if (sources.includes('farcaster') && neynarKey) {
-      sendProgress('Scanning Farcaster...');
+      sendProgress('Scanning Farcaster...', 'import', { source: 'farcaster' });
       const farcasterKws = uniqueKeywords.slice(0, 8);
       for (const kw of farcasterKws) {
         try {
@@ -4143,7 +4146,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- GITHUB ----
     if (sources.includes('github')) {
-      sendProgress('Scanning GitHub...');
+      sendProgress('Scanning GitHub...', 'import', { source: 'github' });
       const chainTerms = chains.filter(c => c !== 'Any Chain').map(c => c.toLowerCase());
       const ghKws = uniqueKeywords.slice(0, 6);
       for (const kw of ghKws) {
@@ -4189,7 +4192,7 @@ app.post('/api/signals/super', async (req, res) => {
       if (!phToken && phKey && phSecret) {
         // Get client credentials token
         try {
-          sendProgress('Authenticating with Product Hunt...');
+          sendProgress('Authenticating with Product Hunt...', 'import', { source: 'producthunt' });
           const tokenRes = await fetch('https://api.producthunt.com/v2/oauth/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -4205,7 +4208,7 @@ app.post('/api/signals/super', async (req, res) => {
       }
 
       if (phToken) {
-        sendProgress('Scanning Product Hunt...');
+        sendProgress('Scanning Product Hunt...', 'import', { source: 'producthunt' });
         const phHeaders = {
           'Accept': 'application/json',
           'Content-Type': 'application/json',
@@ -4308,7 +4311,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- HARMONIC ----
     if (sources.includes('harmonic') && harmonicKey) {
-      sendProgress('Scanning Harmonic database...');
+      sendProgress('Scanning Harmonic database...', 'import', { source: 'harmonic' });
       const harmonicHeaders = { apikey: harmonicKey };
       // Map stage labels to Harmonic API values
       const stageMap = {
@@ -4394,6 +4397,7 @@ app.post('/api/signals/super', async (req, res) => {
     }
 
     // Dedupe by similar text
+    sendProgress(`Filtering ${totalSignals} signals — deduplicating...`, 'filter', { total: totalSignals });
     const seen = new Set();
     const deduped = allSignals.filter(s => {
       const key = s.text.slice(0, 80).toLowerCase();
@@ -4403,12 +4407,13 @@ app.post('/api/signals/super', async (req, res) => {
     });
 
     // Sort by engagement and take top 80 for Claude
+    sendProgress(`${deduped.length} unique signals — sorting by engagement...`, 'filter', { deduped: deduped.length });
     const sorted = [...deduped].sort((a, b) => b.engagement - a.engagement);
     const forClaude = sorted.slice(0, 80);
 
     // Claude analysis
     if (anthropicKey && forClaude.length > 0) {
-      sendProgress(`Analyzing ${forClaude.length} signals with Claude...`);
+      sendProgress(`Screening ${forClaude.length} signals with Sonnet...`, 'screen', { total: forClaude.length });
       const signalText = forClaude.map((s, i) =>
         `[${i + 1}] SOURCE:${s.source.toUpperCase()} | ${s.title} (${s.subtitle}) | Followers:${s.followers} Engagement:${s.engagement}\n${s.text}`
       ).join('\n\n');
@@ -4536,7 +4541,10 @@ ${signalText}`;
             }
           }
 
-          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length });
+          sendProgress('Done — preparing results...', 'done', {});
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          const estimatedCost = (forClaude.length * 0.001).toFixed(3); // ~$0.001 per signal via Sonnet
+          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length, elapsed, estimatedCost });
         } else {
           const errBody = await claudeRes.text().catch(() => '');
           console.error('[Super] Claude API failed (' + claudeRes.status + '):', errBody.slice(0, 300));
@@ -4547,7 +4555,8 @@ ${signalText}`;
     }
 
     // Fallback: no Claude
-    return sendResult({ signals: sorted.slice(0, 80), analysis: null, sourceStats, totalSignals });
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    return sendResult({ signals: sorted.slice(0, 80), analysis: null, sourceStats, totalSignals, elapsed, estimatedCost: '0.00' });
 
   } catch (err) {
     console.error('[Super] Error:', err);
