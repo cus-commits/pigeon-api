@@ -4447,7 +4447,20 @@ app.post('/api/signals/super', async (req, res) => {
     // Sort by engagement and take top 80 for Claude
     sendProgress(`${deduped.length} unique signals — sorting by engagement...`, 'filter', { deduped: deduped.length });
     const sorted = [...deduped].sort((a, b) => b.engagement - a.engagement);
-    const forClaude = sorted.slice(0, 80);
+    
+    // Cost guard: estimate cost and warn if >$5
+    const maxForClaude = useOpus && opusTopN >= 80 ? 160 : 80; // Allow more signals for opus80 tier
+    const forClaude = sorted.slice(0, maxForClaude);
+    const estSonnetCost = forClaude.length * 0.001;
+    const estOpusCost = useOpus ? Math.min(opusTopN, forClaude.length) * 0.015 : 0;
+    const estTotalCost = estSonnetCost + estOpusCost;
+    
+    if (estTotalCost > 5) {
+      console.log(`[Super] COST WARNING: est $${estTotalCost.toFixed(2)} for ${forClaude.length} signals (tier: ${superTier})`);
+      sendProgress(`⚠️ High cost: ~$${estTotalCost.toFixed(2)} for ${forClaude.length} signals — proceeding with top 80 only`, 'filter', { costWarning: true, estCost: estTotalCost });
+      // Cap to 80 to control cost
+      forClaude.splice(80);
+    }
 
     // Claude analysis
     if (anthropicKey && forClaude.length > 0) {
