@@ -2281,7 +2281,15 @@ app.post('/api/autoscan', async (req, res) => {
 
   const scanMode = mode || 'daily';
   console.log(`[AutoScan] Starting ${scanMode} scan for ${personId} (profileMode: ${profile.scanMode || 'keywords'})`);
-  global._scanStatus[personId] = { status: 'scanning', startedAt: Date.now(), profileName: profile?.name || 'Scan' };
+  global._scanStatus[personId] = { status: 'scanning', startedAt: Date.now(), profileName: profile?.name || 'Scan', progress: 'Starting...', stage: 'import' };
+  
+  // Helper to update progress in status (so reconnecting frontends can see current stage)
+  const updateProgress = (msg, stage) => {
+    if (global._scanStatus[personId]) {
+      global._scanStatus[personId].progress = msg;
+      if (stage) global._scanStatus[personId].stage = stage;
+    }
+  };
   const authHeaders = { 'apikey': harmonicKey };
 
   // Load previously seen companies for this person (dismissed + DD additions)
@@ -2372,6 +2380,7 @@ app.post('/api/autoscan', async (req, res) => {
     
     console.log(`[AutoScan] PRE-ENRICH SONNET: Screening ${prescreenCards.length} raw companies...`);
     res.write(`: Screening ${prescreenCards.length} companies with Sonnet (before enrichment)...\n\n`);
+    updateProgress(`Screening ${prescreenCards.length} companies with Sonnet`, "prescreen");
 
     // Build category map for all companies
     freshCompanies.forEach(c => {
@@ -2467,6 +2476,7 @@ ${batchText}`;
     
     console.log(`[AutoScan] PRE-SCREEN COMPLETE: ${prescreenCards.length} → ${prescreenPassIds.size} passed (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%)`);
     res.write(`: Pre-screen done — ${prescreenPassIds.size} of ${prescreenCards.length} survived (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%) — enriching ${companyIds.length} companies...\n\n`);
+    updateProgress(`Enriching ${companyIds.length} companies via Harmonic`, "enrich");
     
     // Only enrich the Sonnet survivors
     companyIds = rawCards
@@ -2519,6 +2529,7 @@ ${batchText}`;
   // Fetch details via GraphQL — only enrich Sonnet survivors (already filtered)
   const scanTierEarly = profile.scanTier || 'full';
   console.log(`[AutoScan] Enriching ${companyIds.length} companies in GQL batches (tier: ${scanTierEarly})...`);
+  updateProgress(`Enriching ${companyIds.length} companies (GQL)`, "enrich");
   const GQL_BATCH_SIZE = 30;
   let fullCompanies = [];
   for (let i = 0; i < companyIds.length; i += GQL_BATCH_SIZE) {
@@ -2885,6 +2896,7 @@ ${batchText}`;
   const tierCfg = TIER_CONFIG[scanTier] || TIER_CONFIG.full;
   console.log(`[AutoScan] Scan tier: ${scanTier} — Opus cap: ${tierCfg.opusCap}, Sonnet rerank: ${tierCfg.sonnetRerank}`);
   res.write(`: Sonnet complete — ${opusCandidates.length} passed (${((opusCandidates.length / companyCards.length) * 100).toFixed(0)}%) — ${tierCfg.useOpus ? 'starting Opus...' : 'Sonnet deep scoring...'}\n\n`);
+    updateProgress(`Sonnet done — ${opusCandidates.length} passed — starting deep scoring`, "deepscore");
   
   // Cap Opus candidates based on tier
   const OPUS_CAP = tierCfg.opusCap;
@@ -2966,6 +2978,7 @@ ${batchDataText}`;
       const modelLabel = tierCfg.useOpus ? 'Opus' : 'Sonnet';
       console.log(`[AutoScan] ${modelLabel} batch ${batchIdx + 1}/${totalBatches}: scoring ${batchCards.length} companies...`);
       res.write(`: ${modelLabel} deep scoring batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(scoreMap).length} scored\n\n`);
+      updateProgress(`Deep scoring batch ${batchIdx + 1}/${totalBatches}`, "deepscore");
 
       const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
