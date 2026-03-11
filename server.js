@@ -3977,6 +3977,28 @@ app.post('/api/signals/twitter', async (req, res) => {
 // ==========================================
 // SUPER SEARCH - UNIFIED MULTI-SOURCE SIGNAL AGGREGATOR
 // ==========================================
+// Super Search status tracking
+if (!global._superSearchStatus) global._superSearchStatus = {};
+
+app.get('/api/signals/super/status', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const status = global._superSearchStatus || {};
+  // Auto-clear stale scans >15 min
+  const now = Date.now();
+  for (const [k, v] of Object.entries(status)) {
+    if (v.status === 'scanning' && v.startedAt && (now - v.startedAt) > 15 * 60 * 1000) {
+      status[k] = { status: 'idle' };
+    }
+  }
+  res.json(status);
+});
+
+app.post('/api/signals/super/clear-status', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  global._superSearchStatus = {};
+  res.json({ success: true });
+});
+
 app.post('/api/signals/super', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'text/event-stream');
@@ -3985,11 +4007,24 @@ app.post('/api/signals/super', async (req, res) => {
   res.flushHeaders();
 
   const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
+  const scanId = 'super_' + Date.now();
   const sendProgress = (msg, stage, meta) => { 
-    res.write(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`); 
+    res.write(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`);
+    // Also update global status for reconnection
+    if (!global._superSearchStatus) global._superSearchStatus = {};
+    global._superSearchStatus[scanId] = { status: 'scanning', progress: msg, stage: stage || null, startedAt: global._superSearchStatus[scanId]?.startedAt || Date.now() };
   };
-  const sendResult = (data) => { clearInterval(keepAlive); res.write(`data: ${JSON.stringify(data)}\n\n`); res.end(); };
+  const sendResult = (data) => { 
+    clearInterval(keepAlive); 
+    res.write(`data: ${JSON.stringify(data)}\n\n`); 
+    res.end();
+    // Store results in global status for reconnection
+    if (!global._superSearchStatus) global._superSearchStatus = {};
+    global._superSearchStatus[scanId] = { status: 'done', finishedAt: Date.now(), results: data };
+  };
   const startTime = Date.now();
+  if (!global._superSearchStatus) global._superSearchStatus = {};
+  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime };
 
   try {
     const _hdrKey = (req.headers['x-anthropic-key'] || '').trim();
