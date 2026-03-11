@@ -1539,6 +1539,23 @@ app.get('/api/vetting', (req, res) => {
   res.json({ companies: active, total: active.length });
 });
 
+// Remove all stealth companies from vetting pipeline
+app.post('/api/vetting/cleanup-stealth', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const data = loadVetting();
+  const before = data.companies.length;
+  const removed = data.companies.filter(c => (c.name || '').toLowerCase().startsWith('stealth company'));
+  data.companies = data.companies.filter(c => !(c.name || '').toLowerCase().startsWith('stealth company'));
+  saveVetting(data);
+  console.log(`[Vetting] Stealth cleanup: removed ${removed.length} stealth companies from ${before} total`);
+  res.json({ 
+    success: true, 
+    removed: removed.length, 
+    remaining: data.companies.length,
+    removedNames: removed.map(c => c.name)
+  });
+});
+
 // Add companies to vetting pipeline
 app.post('/api/vetting/add', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
