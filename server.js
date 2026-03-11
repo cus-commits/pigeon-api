@@ -4489,9 +4489,9 @@ BE STRICT. Most should be LOW. Only HIGH if clearly investable.
 STEALTH COMPANIES: Always rate LOW unless exceptional repeat founder.
 
 IMPORTANT: Respond ONLY with a JSON block. Numbers must match the signal numbers shown.
-```json
+${'```'}json
 {${batch.map((_, i) => `"${batchStart + i + 1}":{"signal":"LOW","company":null}`).join(',')}}
-```
+${'```'}
 
 SIGNALS:
 ${signalText}`;
@@ -4553,14 +4553,13 @@ ${signalText}`;
 
       let cleanAnalysis = allAnalyses.join('\n\n').trim() || '';
 
-
-          // OPTIONAL: Opus deep scoring on top signals
-          let opusAnalysis = '';
-          if (useOpus && anthropicKey) {
-            const topForOpus = rated.filter(s => s.signal === 'HIGH' || s.signal === 'MEDIUM').slice(0, opusTopN);
-            if (topForOpus.length > 0) {
-              sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
-              const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
+      // OPTIONAL: Opus deep scoring on top signals
+      let opusAnalysis = '';
+      if (useOpus && anthropicKey) {
+        const topForOpus = rated.filter(s => s.signal === 'HIGH' || s.signal === 'MEDIUM').slice(0, opusTopN);
+        if (topForOpus.length > 0) {
+          sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
+          const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
 
 Score each company/signal 1-10 based on investability. Consider: founder quality, product traction, market timing, uniqueness, funding stage fit.
 
@@ -4573,119 +4572,85 @@ SCORING GUIDE:
 STEALTH COMPANIES: Apply -90% score penalty. Only score above 5 if exceptional repeat founder.
 
 Respond with a JSON block then brief analysis per company:
-\`\`\`json
+${'`'.repeat(3)}json
 {"CompanyName": {"score": 8, "reason": "brief reason"}, ...}
-\`\`\`
+${'`'.repeat(3)}
 
 SIGNALS TO SCORE:
 ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) — ${s.text?.slice(0, 200)}`).join('\n')}`;
 
+          try {
+            const opusRes = await fetch('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+              body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 4096, messages: [{ role: 'user', content: opusPrompt }] }),
+            });
+            if (opusRes.ok) {
+              const opusData = await opusRes.json();
+              opusAnalysis = opusData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
               try {
-                const opusRes = await fetch('https://api.anthropic.com/v1/messages', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-                  body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 4096, messages: [{ role: 'user', content: opusPrompt }] }),
-                });
-                if (opusRes.ok) {
-                  const opusData = await opusRes.json();
-                  opusAnalysis = opusData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-                  
-                  // Parse Opus scores and merge into rated signals
-                  try {
-                    const jsonMatch = opusAnalysis.match(/```json\s*\n?([\s\S]*?)\n?```/);
-                    if (jsonMatch) {
-                      const opusScores = JSON.parse(jsonMatch[1]);
-                      for (const s of rated) {
-                        const name = s.companyName || s.title || '';
-                        const match = opusScores[name] || Object.values(opusScores).find((v, i) => Object.keys(opusScores)[i].toLowerCase() === name.toLowerCase());
-                        if (match?.score) {
-                          s._opusScore = match.score;
-                          s._opusReason = match.reason || '';
-                        }
-                      }
-                      console.log(`[Super] Opus scored ${Object.keys(opusScores).length} companies`);
-                    }
-                  } catch (e) { console.error('[Super] Opus JSON parse error:', e.message); }
-                  
-                  cleanAnalysis += '\n\n## Opus Deep Analysis\n' + opusAnalysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
-                  sendProgress(`Opus scored ${topForOpus.length} signals`, 'deepscore', {});
+                const jsonMatch = opusAnalysis.match(/```json\s*\n?([\s\S]*?)\n?```/);
+                if (jsonMatch) {
+                  const opusScores = JSON.parse(jsonMatch[1]);
+                  for (const s of rated) {
+                    const name = s.companyName || s.title || '';
+                    const match = opusScores[name] || Object.values(opusScores).find((v, i) => Object.keys(opusScores)[i].toLowerCase() === name.toLowerCase());
+                    if (match?.score) { s._opusScore = match.score; s._opusReason = match.reason || ''; }
+                  }
+                  console.log(`[Super] Opus scored ${Object.keys(opusScores).length} companies`);
                 }
-              } catch (e) { console.error('[Super] Opus error:', e.message); }
+              } catch (e) { console.error('[Super] Opus JSON parse error:', e.message); }
+              cleanAnalysis += '\n\n## Opus Deep Analysis\n' + opusAnalysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
+              sendProgress(`Opus scored ${topForOpus.length} signals`, 'deepscore', {});
             }
-          }
-
-          // Re-sort: Opus scores first (if available), then HIGH/MEDIUM/LOW
-          rated.sort((a, b) => {
-            if (a._opusScore && b._opusScore) return b._opusScore - a._opusScore;
-            if (a._opusScore && !b._opusScore) return -1;
-            if (!a._opusScore && b._opusScore) return 1;
-            const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
-            const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
-            if (sigDiff !== 0) return sigDiff;
-            return b.engagement - a.engagement;
-          });
-
-          // AUTO-PUSH HIGH signals to DD pipeline
-          // With Harmonic saved search: push up to 15 HIGH signals (3x multiplier)
-          // Without Harmonic: push up to 5 HIGH signals (strict mode)
-          const hasHarmonic = sources.includes('harmonic') && sourceStats.harmonic > 0;
-          const maxPush = hasHarmonic ? 15 : 5;
-          const highSignals = rated.filter(s => s.signal === 'HIGH' && s.companyName);
-          
-          if (highSignals.length > 0) {
-            try {
-              const vettingData = loadVetting();
-              const existingNames = new Set(vettingData.companies.map(c => (c.name || '').toLowerCase()));
-              let pushed = 0;
-              
-              for (const sig of highSignals.slice(0, maxPush)) {
-                const name = sig.companyName;
-                if (!name || existingNames.has(name.toLowerCase())) continue;
-                // Skip stealth
-                if (name.toLowerCase().startsWith('stealth company')) continue;
-                
-                existingNames.add(name.toLowerCase());
-                vettingData.companies.push({
-                  name,
-                  description: sig.text?.slice(0, 300) || '',
-                  website: sig.url || null,
-                  source: `super-search:${hasHarmonic ? 'harmonic' : 'signals'}`,
-                  sourceMeta: {
-                    superSearchSource: sig.source,
-                    signalType: sig.signal,
-                    engagement: sig.engagement,
-                    scanDate: new Date().toISOString(),
-                    hasHarmonic,
-                  },
-                  addedAt: Date.now(),
-                  votes: {},
-                  dismissed: false,
-                });
-                pushed++;
-              }
-              
-              if (pushed > 0) {
-                saveVetting(vettingData);
-                console.log(`[Super] Pushed ${pushed} HIGH signals to DD (max: ${maxPush}, harmonic: ${hasHarmonic})`);
-              }
-            } catch (e) {
-              console.error('[Super] DD push error:', e.message);
-            }
-          }
-
-          sendProgress('Done — preparing results...', 'done', {});
-          const elapsed = Math.round((Date.now() - startTime) / 1000);
-          const sonnetCost = forClaude.length * 0.001;
-          const opusCost = useOpus ? opusTopN * 0.015 : 0;
-          const estimatedCost = (sonnetCost + opusCost).toFixed(3);
-          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length, elapsed, estimatedCost, tier: superTier });
-        } else {
-          const errBody = await claudeRes.text().catch(() => '');
-          console.error('[Super] Claude API failed (' + claudeRes.status + '):', errBody.slice(0, 300));
+          } catch (e) { console.error('[Super] Opus error:', e.message); }
         }
-      } catch (e) {
-        console.error('[Super] Claude error:', e.message);
       }
+
+      // Re-sort: Opus scores first (if available), then HIGH/MEDIUM/LOW
+      rated.sort((a, b) => {
+        if (a._opusScore && b._opusScore) return b._opusScore - a._opusScore;
+        if (a._opusScore && !b._opusScore) return -1;
+        if (!a._opusScore && b._opusScore) return 1;
+        const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+        const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
+        if (sigDiff !== 0) return sigDiff;
+        return b.engagement - a.engagement;
+      });
+
+      // AUTO-PUSH HIGH signals to DD pipeline
+      const hasHarmonic = sources.includes('harmonic') && sourceStats.harmonic > 0;
+      const maxPush = hasHarmonic ? 15 : 5;
+      const highSignals = rated.filter(s => s.signal === 'HIGH' && s.companyName);
+      
+      if (highSignals.length > 0) {
+        try {
+          const vettingData = loadVetting();
+          const existingNames = new Set(vettingData.companies.map(c => (c.name || '').toLowerCase()));
+          let pushed = 0;
+          for (const sig of highSignals.slice(0, maxPush)) {
+            const name = sig.companyName;
+            if (!name || existingNames.has(name.toLowerCase())) continue;
+            if (name.toLowerCase().startsWith('stealth company')) continue;
+            existingNames.add(name.toLowerCase());
+            vettingData.companies.push({
+              name, description: sig.text?.slice(0, 300) || '', website: sig.url || null,
+              source: `super-search:${hasHarmonic ? 'harmonic' : 'signals'}`,
+              sourceMeta: { superSearchSource: sig.source, signalType: sig.signal, engagement: sig.engagement, scanDate: new Date().toISOString(), hasHarmonic },
+              addedAt: Date.now(), votes: {}, dismissed: false,
+            });
+            pushed++;
+          }
+          if (pushed > 0) { saveVetting(vettingData); console.log(`[Super] Pushed ${pushed} HIGH to DD`); }
+        } catch (e) { console.error('[Super] DD push error:', e.message); }
+      }
+
+      sendProgress('Done — preparing results...', 'done', {});
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      const sonnetCost = forClaude.length * 0.001;
+      const opusCost = useOpus ? Math.min(opusTopN, rated.filter(s => s._opusScore).length) * 0.015 : 0;
+      const estimatedCost = (sonnetCost + opusCost).toFixed(3);
+      return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length, elapsed, estimatedCost, tier: superTier });
     }
 
     // Fallback: no Claude
