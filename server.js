@@ -4444,105 +4444,115 @@ app.post('/api/signals/super', async (req, res) => {
       return true;
     });
 
-    // Sort by engagement and take top 80 for Claude
+    // Process ALL deduped signals through Sonnet in batches (no cap)
     sendProgress(`${deduped.length} unique signals — sorting by engagement...`, 'filter', { deduped: deduped.length });
     const sorted = [...deduped].sort((a, b) => b.engagement - a.engagement);
+    const forClaude = sorted; // Process ALL — no cap
     
-    // Cost guard: estimate cost and warn if >$5
-    const maxForClaude = useOpus && opusTopN >= 80 ? 160 : 80; // Allow more signals for opus80 tier
-    const forClaude = sorted.slice(0, maxForClaude);
     const estSonnetCost = forClaude.length * 0.001;
     const estOpusCost = useOpus ? Math.min(opusTopN, forClaude.length) * 0.015 : 0;
     const estTotalCost = estSonnetCost + estOpusCost;
-    
-    if (estTotalCost > 5) {
-      console.log(`[Super] COST WARNING: est $${estTotalCost.toFixed(2)} for ${forClaude.length} signals (tier: ${superTier})`);
-      sendProgress(`⚠️ High cost: ~$${estTotalCost.toFixed(2)} for ${forClaude.length} signals — proceeding with top 80 only`, 'filter', { costWarning: true, estCost: estTotalCost });
-      // Cap to 80 to control cost
-      forClaude.splice(80);
-    }
+    console.log(`[Super] Will score ${forClaude.length} signals (est: $${estTotalCost.toFixed(2)}, tier: ${superTier})`);
 
-    // Claude analysis
+    // Claude batched Sonnet screening
     if (anthropicKey && forClaude.length > 0) {
-      sendProgress(`Screening ${forClaude.length} signals with Sonnet...`, 'screen', { total: forClaude.length });
-      const signalText = forClaude.map((s, i) =>
-        `[${i + 1}] SOURCE:${s.source.toUpperCase()} | ${s.title} (${s.subtitle}) | Followers:${s.followers} Engagement:${s.engagement}\n${s.text}`
-      ).join('\n\n');
+      const BATCH_SIZE = 30;
+      const totalBatches = Math.ceil(forClaude.length / BATCH_SIZE);
+      const allRatings = {};
+      const allAnalyses = [];
+      let totalHigh = 0, totalMedium = 0, totalLow = 0;
 
-      const prompt = `You are a crypto deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
+      sendProgress(`Screening ${forClaude.length} signals with Sonnet (${totalBatches} batch${totalBatches > 1 ? 'es' : ''})...`, 'screen', { total: forClaude.length, batches: totalBatches });
 
-You're reviewing ${forClaude.length} signals from MULTIPLE sources: Twitter/X, Farcaster, GitHub repos, and Harmonic company database.
+      for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+        const batchStart = batchIdx * BATCH_SIZE;
+        const batch = forClaude.slice(batchStart, batchStart + BATCH_SIZE);
+        
+        sendProgress(`Sonnet batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(allRatings).length} rated, ${totalHigh} HIGH so far`, 'screen', { 
+          batch: batchIdx + 1, totalBatches, rated: Object.keys(allRatings).length, high: totalHigh 
+        });
+
+        const signalText = batch.map((s, i) =>
+          `[${batchStart + i + 1}] SOURCE:${s.source.toUpperCase()} | ${s.title} (${s.subtitle}) | Followers:${s.followers} Engagement:${s.engagement}\n${s.text}`
+        ).join('\n\n');
+
+        const prompt = `You are a crypto deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
+
+You're reviewing ${batch.length} signals from MULTIPLE sources: Twitter/X, Farcaster, GitHub repos, Product Hunt, and Harmonic company database.
 
 RATE EACH SIGNAL:
 - HIGH: Clearly investable — founder building something specific, raising a round, launching a product, early team with real traction
-- MEDIUM: Interesting but needs context — could be a lead worth following
+- MEDIUM: Interesting but needs context — could be a lead worth following  
 - LOW: Not relevant — commentary, memes, established projects, noise
 
 BE STRICT. Most should be LOW. Only HIGH if clearly investable.
+STEALTH COMPANIES: Always rate LOW unless exceptional repeat founder.
 
-IMPORTANT: Start your response with a JSON block:
-\`\`\`json
-{"1":{"signal":"HIGH","company":"ProjectName"},"2":{"signal":"LOW","company":null}}
-\`\`\`
-
-Then give a brief overview (3-4 sentences) of the most interesting finds across all sources.
+IMPORTANT: Respond ONLY with a JSON block. Numbers must match the signal numbers shown.
+```json
+{${batch.map((_, i) => `"${batchStart + i + 1}":{"signal":"LOW","company":null}`).join(',')}}
+```
 
 SIGNALS:
 ${signalText}`;
 
-      try {
-        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': anthropicKey,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 4096,
-            messages: [{ role: 'user', content: prompt }],
-          }),
-        });
-
-        if (claudeRes.ok) {
-          const data = await claudeRes.json();
-          const analysis = data.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-
-          let signals = {};
-          try {
-            const jsonMatch = analysis.match(/```json\s*\n?([\s\S]*?)\n?```/);
-            if (jsonMatch) {
-              const parsed = JSON.parse(jsonMatch[1]);
-              for (const [k, v] of Object.entries(parsed)) {
-                if (typeof v === 'string') signals[k] = { signal: v, company: null };
-                else signals[k] = { signal: v.signal || 'LOW', company: v.company || null };
-              }
-            } else {
-              console.log('[Super] No JSON block found in Claude response');
-            }
-          } catch (e) { console.error('[Super] JSON parse error:', e.message); }
-
-          console.log('[Super] Signals parsed:', Object.keys(signals).length, 'of', forClaude.length);
-          const signalCounts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
-          for (const v of Object.values(signals)) signalCounts[v.signal || 'LOW']++;
-          console.log('[Super] Signal breakdown:', JSON.stringify(signalCounts));
-
-          const rated = forClaude.map((s, i) => ({
-            ...s,
-            signal: signals[String(i + 1)]?.signal || 'LOW',
-            companyName: signals[String(i + 1)]?.company || null,
-          }));
-
-          const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
-          rated.sort((a, b) => {
-            const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
-            if (sigDiff !== 0) return sigDiff;
-            return b.engagement - a.engagement;
+        try {
+          const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
           });
 
-          // Clean analysis text
-          let cleanAnalysis = analysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
+          if (claudeRes.ok) {
+            const data = await claudeRes.json();
+            const text = data.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+            
+            try {
+              const jsonMatch = text.match(/```json\s*\n?([\s\S]*?)\n?```/);
+              if (jsonMatch) {
+                const parsed = JSON.parse(jsonMatch[1]);
+                for (const [k, v] of Object.entries(parsed)) {
+                  if (typeof v === 'string') allRatings[k] = { signal: v, company: null };
+                  else allRatings[k] = { signal: v.signal || 'LOW', company: v.company || null };
+                  const sig = (typeof v === 'string' ? v : v.signal) || 'LOW';
+                  if (sig === 'HIGH') totalHigh++;
+                  else if (sig === 'MEDIUM') totalMedium++;
+                  else totalLow++;
+                }
+              }
+              const analysisText = text.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
+              if (analysisText) allAnalyses.push(analysisText);
+            } catch (e) { console.error(`[Super] Batch ${batchIdx + 1} parse error:`, e.message); }
+            
+            console.log(`[Super] Batch ${batchIdx + 1}/${totalBatches}: ${Object.keys(allRatings).length} rated (H:${totalHigh} M:${totalMedium} L:${totalLow})`);
+          } else {
+            console.error(`[Super] Sonnet batch ${batchIdx + 1} failed: ${claudeRes.status}`);
+          }
+        } catch (e) {
+          console.error(`[Super] Sonnet batch ${batchIdx + 1} error:`, e.message);
+        }
+        if (batchIdx < totalBatches - 1) await sleep(500);
+      }
+
+      sendProgress(`Sonnet done — ${totalHigh} HIGH, ${totalMedium} MEDIUM out of ${forClaude.length}`, 'screen', { high: totalHigh, medium: totalMedium, low: totalLow });
+      console.log(`[Super] SONNET DONE: ${Object.keys(allRatings).length}/${forClaude.length} rated. H:${totalHigh} M:${totalMedium} L:${totalLow}`);
+
+      // Apply ratings
+      const rated = forClaude.map((s, i) => ({
+        ...s,
+        signal: allRatings[String(i + 1)]?.signal || 'LOW',
+        companyName: allRatings[String(i + 1)]?.company || null,
+      }));
+
+      const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+      rated.sort((a, b) => {
+        const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
+        if (sigDiff !== 0) return sigDiff;
+        return b.engagement - a.engagement;
+      });
+
+      let cleanAnalysis = allAnalyses.join('\n\n').trim() || '';
+
 
           // OPTIONAL: Opus deep scoring on top signals
           let opusAnalysis = '';
