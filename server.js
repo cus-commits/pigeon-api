@@ -4488,7 +4488,55 @@ ${signalText}`;
           // Clean analysis text
           const cleanAnalysis = analysis.replace(/```json[\s\S]*?```\s*\n?/, '').trim();
 
-          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals });
+          // AUTO-PUSH HIGH signals to DD pipeline
+          // With Harmonic saved search: push up to 15 HIGH signals (3x multiplier)
+          // Without Harmonic: push up to 5 HIGH signals (strict mode)
+          const hasHarmonic = sources.includes('harmonic') && sourceStats.harmonic > 0;
+          const maxPush = hasHarmonic ? 15 : 5;
+          const highSignals = rated.filter(s => s.signal === 'HIGH' && s.companyName);
+          
+          if (highSignals.length > 0) {
+            try {
+              const vettingData = loadVetting();
+              const existingNames = new Set(vettingData.companies.map(c => (c.name || '').toLowerCase()));
+              let pushed = 0;
+              
+              for (const sig of highSignals.slice(0, maxPush)) {
+                const name = sig.companyName;
+                if (!name || existingNames.has(name.toLowerCase())) continue;
+                // Skip stealth
+                if (name.toLowerCase().startsWith('stealth company')) continue;
+                
+                existingNames.add(name.toLowerCase());
+                vettingData.companies.push({
+                  name,
+                  description: sig.text?.slice(0, 300) || '',
+                  website: sig.url || null,
+                  source: `super-search:${hasHarmonic ? 'harmonic' : 'signals'}`,
+                  sourceMeta: {
+                    superSearchSource: sig.source,
+                    signalType: sig.signal,
+                    engagement: sig.engagement,
+                    scanDate: new Date().toISOString(),
+                    hasHarmonic,
+                  },
+                  addedAt: Date.now(),
+                  votes: {},
+                  dismissed: false,
+                });
+                pushed++;
+              }
+              
+              if (pushed > 0) {
+                saveVetting(vettingData);
+                console.log(`[Super] Pushed ${pushed} HIGH signals to DD (max: ${maxPush}, harmonic: ${hasHarmonic})`);
+              }
+            } catch (e) {
+              console.error('[Super] DD push error:', e.message);
+            }
+          }
+
+          return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length });
         } else {
           const errBody = await claudeRes.text().catch(() => '');
           console.error('[Super] Claude API failed (' + claudeRes.status + '):', errBody.slice(0, 300));
