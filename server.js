@@ -3018,7 +3018,17 @@ ${batchDataText}`;
     };
 
     // Attach scores to cards for downstream use
-    companyCards.forEach(c => { c._score = getScore(c.name); });
+    companyCards.forEach(c => { 
+      c._score = getScore(c.name);
+      // HARD stealth penalty — cap score at 3 regardless of what Claude gave
+      if (c._isStealth || (c.name || '').toLowerCase().startsWith('stealth company')) {
+        const original = c._score;
+        c._score = Math.min(c._score, 3);
+        if (original > 3) {
+          console.log(`[AutoScan] Stealth penalty: ${c.name} score ${original} → capped at ${c._score}`);
+        }
+      }
+    });
 
     // Sort: scored companies first (high to low), then PASS companies, then rest
     companyCards.sort((a, b) => {
@@ -3051,8 +3061,16 @@ ${batchDataText}`;
       };
 
       const scored = companyCards
-        .map(c => ({ ...c, _score: matchScore(c.name) }))
+        .map(c => {
+          let score = matchScore(c.name);
+          // Hard stealth penalty — stealth companies never go to DD
+          if ((c.name || '').toLowerCase().startsWith('stealth company') || c._isStealth) {
+            score = Math.min(score, 3);
+          }
+          return { ...c, _score: score };
+        })
         .filter(c => c._score >= 6)
+        .filter(c => !(c.name || '').toLowerCase().startsWith('stealth company'))
         .sort((a, b) => b._score - a._score);
 
       console.log(`[AutoScan] DD push: ${scored.length} companies scored ≥6 from ${companyCards.length} total`);
@@ -3150,6 +3168,7 @@ ${batchDataText}`;
 
       const maxPicks = scanMode === 'weekly' ? 10 : 7;
       const topPicks = companyCards
+        .filter(c => !(c.name || '').toLowerCase().startsWith('stealth company'))
         .filter(c => matchScoreKw(c.name) >= 7)
         .slice(0, maxPicks);
       console.log(`[AutoScan] Keyword DD push: ${topPicks.length} companies scored ≥7`);
