@@ -2155,6 +2155,14 @@ function profileToQueries(profile, mode = 'daily') {
 // Check scan status (is a scan running? what were the last results?)
 app.get('/api/autoscan/status/:personId?', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  // Auto-clear stale "scanning" statuses older than 30 min
+  const now = Date.now();
+  for (const [pid, s] of Object.entries(global._scanStatus || {})) {
+    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 30 * 60 * 1000) {
+      console.log(`[AutoScan] Clearing stale scanning status for ${pid} (started ${Math.round((now - s.startedAt)/60000)}min ago)`);
+      global._scanStatus[pid] = { status: 'idle' };
+    }
+  }
   if (req.params.personId) {
     const status = (global._scanStatus || {})[req.params.personId] || { status: 'idle' };
     res.json(status);
