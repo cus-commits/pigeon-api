@@ -4982,12 +4982,40 @@ app.get('/api/airtable/companies', async (req, res) => {
       total_funding: rec.fields['Total Funding'] || null,
       intro_call_notes: rec.fields['Intro Call Notes'] || '',
       notes: rec.fields['Original Notes + Ongoing Negotiation Notes'] || '',
+      reachout_notes: rec.fields['Initial Reachout Notes'] || '',
     }));
     console.log(`[Airtable] Got ${companies.length} companies`);
     res.json({ companies, total: companies.length });
   } catch (e) {
     console.error('[Airtable] Error:', e.message);
     res.json({ error: e.message, companies: [] });
+  }
+});
+
+// GET /api/airtable/reachout-notes?company=CompanyName
+app.get('/api/airtable/reachout-notes', async (req, res) => {
+  try {
+    const company = req.query.company;
+    if (!company) return res.status(400).json({ error: 'company required' });
+
+    const baseId = process.env.AIRTABLE_BASE_ID;
+    const tableName = encodeURIComponent(process.env.AIRTABLE_TABLE_NAME || 'All Companies');
+    const formula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
+
+    const resp = await fetch(
+      `https://api.airtable.com/v0/${baseId}/${tableName}?filterByFormula=${formula}&maxRecords=1`,
+      { headers: { 'Authorization': `Bearer ${process.env.AIRTABLE_TOKEN}` } }
+    );
+    const data = await resp.json();
+    const record = data.records?.[0];
+
+    res.json({
+      company: company,
+      reachoutNotes: record?.fields?.['Initial Reachout Notes'] || record?.fields?.['initial reachout notes'] || '',
+      airtable_id: record?.id || null
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
