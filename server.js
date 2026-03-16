@@ -6059,6 +6059,42 @@ app.get('/api/harmonic/cache-id', (req, res) => {
 });
 
 // Save a note on a company
+// POST /api/airtable/save-reachout-note — append timestamped note to Initial Reachout Notes
+app.post('/api/airtable/save-reachout-note', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const headers = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  if (!headers || !baseId) return res.json({ error: 'Airtable not configured' });
+
+  const company = (req.body.company || '').trim();
+  const { author, note } = req.body;
+  if (!company || !note) return res.status(400).json({ error: 'company and note required' });
+
+  try {
+    const formula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
+    const findRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=1`, { headers });
+    if (!findRes.ok) return res.json({ error: 'Airtable lookup failed' });
+    const findData = await findRes.json();
+    const record = findData.records?.[0];
+    if (!record) return res.json({ error: 'Company not found' });
+
+    const existing = record.fields['Initial Reachout Notes'] || '';
+    const timestamp = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const newNote = `[${author || 'Unknown'} · ${timestamp}] ${note.trim()}`;
+    const updated = existing ? `${existing}\n\n${newNote}` : newNote;
+
+    const patchRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${record.id}`, {
+      method: 'PATCH', headers,
+      body: JSON.stringify({ fields: { 'Initial Reachout Notes': updated } }),
+    });
+    if (!patchRes.ok) return res.json({ error: `Save failed: ${patchRes.status}` });
+    console.log(`[Airtable] Reachout note saved on "${company}" by ${author}`);
+    res.json({ success: true, notes: updated });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/airtable/save-note', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const headers = airtableHeaders();
