@@ -6013,6 +6013,23 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         const card = gqlToCard(gc);
         const { matchMethod } = idMap[name];
 
+        // Verify the returned company name isn't wildly different (prevent UseRocket → wrong company)
+        if (matchMethod !== 'domain' && matchMethod !== 'cache') {
+          const reqName = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const gotName = (card.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+          if (reqName && gotName && !reqName.includes(gotName) && !gotName.includes(reqName)) {
+            const rWords = name.toLowerCase().split(/\s+/);
+            const gWords = (card.name || '').toLowerCase().split(/\s+/);
+            const overlap = rWords.filter(w => gWords.some(g => g.includes(w) || w.includes(g))).length;
+            if (overlap / Math.max(rWords.length, 1) < 0.3) {
+              console.log(`[BatchFunding] REJECTED mismatch: "${name}" → "${card.name}" (${matchMethod}, ${(overlap/rWords.length*100).toFixed(0)}% overlap)`);
+              // Remove bad cache entry
+              delete idCache[name.toLowerCase().trim()];
+              continue;
+            }
+          }
+        }
+
         results[name] = {
           verified: true,
           matchMethod,
