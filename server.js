@@ -5938,44 +5938,33 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         } catch (e) {}
       }
 
-      // Strategy 3: search_agent NL search (catches unusual names)
+      // Strategy 3: search_agent — EXACT match only (no fuzzy for batch-funding)
       if (!harmonicId) {
         try {
-          const searchQuery = co.website
-            ? `${name} ${co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]}`
-            : name;
-          const sr = await fetch(`${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(searchQuery)}&size=5`, { headers: { apikey: harmonicKey } });
+          const sr = await fetch(`${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
           if (sr.ok) {
             const sd = await sr.json();
-            const results = sd.results || [];
             const coName = name.toLowerCase().trim();
-            for (const r of results) {
+            for (const r of (sd.results || [])) {
               const rid = r.id || (r.urn || r.entity_urn || '').split(':').pop();
               if (!rid) continue;
               const rName = (r.name || r.text || '').toLowerCase().trim();
-              // Exact match
               if (rName === coName) { harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent'; break; }
-              // Word overlap check (at least 40%)
-              const cWords = coName.split(/\s+/);
-              const rWords = rName.split(/\s+/);
-              const overlap = cWords.filter(w => rWords.some(rw => rw.includes(w) || w.includes(rw))).length;
-              if (overlap / Math.max(cWords.length, 1) >= 0.4) {
-                harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent-fuzzy'; break;
-              }
             }
           }
         } catch (e) {}
       }
 
-      // Strategy 4: Direct REST lookup by name
+      // Strategy 4: Direct REST — verify name matches
       if (!harmonicId) {
         try {
           const nr = await fetch(`${HARMONIC_BASE}/companies?name=${encodeURIComponent(name)}`, { headers: { apikey: harmonicKey } });
           if (nr.ok) {
             const nd = await nr.json();
             const company = Array.isArray(nd) ? nd[0] : (nd.results?.[0] || nd);
+            const foundName = (company?.name || '').toLowerCase().trim();
             const foundId = company?.id || (company?.entity_urn || company?.entityUrn || '').split(':').pop() || null;
-            if (foundId && parseInt(foundId)) {
+            if (foundId && parseInt(foundId) && foundName === name.toLowerCase().trim()) {
               harmonicId = parseInt(foundId);
               matchMethod = 'name-direct';
             }
