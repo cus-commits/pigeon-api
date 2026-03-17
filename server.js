@@ -5920,17 +5920,16 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
               const rid = (r.entity_urn || '').split(':').pop();
               if (!rid || !parseInt(rid)) continue;
               const rText = (r.text || '').toLowerCase().trim();
+              if (rText.length < 2) continue; // Skip empty/garbage results
 
               if (rText === coName) { harmonicId = parseInt(rid); matchMethod = 'name'; break; }
               if (coDomain && rText.includes(coDomain)) { harmonicId = parseInt(rid); matchMethod = 'domain+typeahead'; break; }
-              if (rText.includes(coName) || coName.includes(rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim())) {
+              // Fuzzy: only if the clean name has 3+ chars and real overlap
+              const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
+              if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
                 harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
               }
             }
-            // Fallback: all results point to same company → unanimous match
-            if (!harmonicId && raw.length > 0) {
-              const urns = new Set(raw.map(r => (r.entity_urn || '').split(':').pop()).filter(Boolean));
-              if (urns.size === 1) {
                 harmonicId = parseInt([...urns][0]); matchMethod = 'typeahead-unanimous';
               }
             }
