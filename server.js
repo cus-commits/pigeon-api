@@ -5953,13 +5953,15 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
               const rid = r.id || (r.urn || r.entity_urn || '').split(':').pop();
               if (!rid) continue;
               const rName = (r.name || r.text || '').toLowerCase().trim();
-              if (rName === coName || rName.includes(coName) || coName.includes(rName)) {
-                harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent'; break;
+              // Exact match
+              if (rName === coName) { harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent'; break; }
+              // Word overlap check (at least 40%)
+              const cWords = coName.split(/\s+/);
+              const rWords = rName.split(/\s+/);
+              const overlap = cWords.filter(w => rWords.some(rw => rw.includes(w) || w.includes(rw))).length;
+              if (overlap / Math.max(cWords.length, 1) >= 0.4) {
+                harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent-fuzzy'; break;
               }
-            }
-            if (!harmonicId && results.length >= 1 && name.length < 12) {
-              const rid = results[0].id || (results[0].urn || '').split(':').pop();
-              if (rid) { harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent-first'; }
             }
           }
         } catch (e) {}
