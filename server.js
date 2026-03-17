@@ -5062,8 +5062,17 @@ app.post('/api/airtable/add', async (req, res) => {
         if (tr.ok) {
           const td = await tr.json();
           const results = td.results || [];
-          const exact = results.find(r => (r.name || '').toLowerCase() === company.toLowerCase());
-          const target = exact || results[0];
+          const compLower2 = company.toLowerCase().trim();
+          const exact = results.find(r => (r.name || '').toLowerCase().trim() === compLower2);
+          let target = exact;
+          if (!target && results[0]) {
+            // Fuzzy: only use results[0] if name has significant word overlap
+            const cw = compLower2.split(/\s+/);
+            const rw = (results[0].name || '').toLowerCase().split(/\s+/);
+            const ov = cw.filter(w => rw.some(r2 => r2.includes(w) || w.includes(r2))).length;
+            if (ov / Math.max(cw.length, 1) >= 0.4) target = results[0];
+            else console.log(`[Add/Enrich] Rejected typeahead "${results[0].name}" for "${company}" — low overlap`);
+          }
           if (target) {
             const tid = target.id || (target.entity_urn || '').split(':').pop();
             if (tid) {
@@ -5354,11 +5363,27 @@ app.post('/api/airtable/enrich', async (req, res) => {
         const lookupData = await lookupRes.json();
         const results = lookupData.results || [];
         if (results.length > 0) {
-          // Try to find exact name match first
-          const exact = results.find(r => (r.name || '').toLowerCase() === company.toLowerCase());
-          const target = exact || results[0];
-          targetId = target.id || (target.entity_urn || '').split(':').pop();
-          console.log(`[Enrich] Found by typeahead: ${target.name} (ID: ${targetId})`);
+          // Try exact name match first
+          const compLower = company.toLowerCase().trim();
+          const exact = results.find(r => (r.name || '').toLowerCase().trim() === compLower);
+          if (exact) {
+            targetId = exact.id || (exact.entity_urn || '').split(':').pop();
+            console.log(`[Enrich] Found exact match: ${exact.name} (ID: ${targetId})`);
+          } else {
+            // Fuzzy check: only accept results[0] if the name shares significant overlap
+            const r0Name = (results[0].name || '').toLowerCase().trim();
+            const compWords = compLower.split(/\s+/);
+            const r0Words = r0Name.split(/\s+/);
+            const overlap = compWords.filter(w => r0Words.some(rw => rw.includes(w) || w.includes(rw))).length;
+            const similarity = overlap / Math.max(compWords.length, 1);
+            if (similarity >= 0.4) {
+              const target = results[0];
+              targetId = target.id || (target.entity_urn || '').split(':').pop();
+              console.log(`[Enrich] Fuzzy match (${(similarity*100).toFixed(0)}%): "${company}" → "${target.name}" (ID: ${targetId})`);
+            } else {
+              console.log(`[Enrich] No good match for "${company}". Best: "${results[0].name}" (${(similarity*100).toFixed(0)}% overlap — rejected)`);
+            }
+          }
         }
       }
     }
