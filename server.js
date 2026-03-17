@@ -6095,7 +6095,7 @@ app.post('/api/airtable/save-reachout-note', async (req, res) => {
     if (!record) return res.json({ error: 'Company not found' });
 
     let existing = record.fields['Initial Reachout Notes'] || '';
-    const timestamp = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const timestamp = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) + ' EST';
     const newNote = `[${author || 'Unknown'} · ${timestamp}] ${note.trim()}`;
     // If existing notes don't have timestamps, label them as legacy
     if (existing && !existing.includes('[') && !existing.startsWith('--- Legacy')) {
