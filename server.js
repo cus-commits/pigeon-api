@@ -5930,9 +5930,6 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
                 harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
               }
             }
-                harmonicId = parseInt([...urns][0]); matchMethod = 'typeahead-unanimous';
-              }
-            }
           }
         } catch (e) {}
       }
