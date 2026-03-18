@@ -3187,13 +3187,17 @@ ${batchDataText}`;
         .filter(c => c._score >= 6)
         .filter(c => !(c.name || '').toLowerCase().startsWith('stealth company'))
         .filter(c => {
-          // Hard exclude: funds, family offices, investment vehicles
+          // Smart exclude: actual investment vehicles, not companies in the finance industry
+          // Must match BOTH a fund-like name pattern AND a fund-like description
           const n = (c.name || '').toLowerCase();
-          const d = (c.description || '').toLowerCase();
-          const isFund = /(^|\s)(fund|capital|ventures|advisors|partners|holdings|asset management|family office|hedge fund|vc firm)\b/i.test(n) ||
-            /investment (fund|vehicle|platform)|fund of funds|asset management|family office|hedge fund/i.test(d);
-          if (isFund) console.log(`[AutoScan] EXCLUDED fund/vehicle: ${c.name}`);
-          return !isFund;
+          const d = (c.description || '').toLowerCase().slice(0, 500);
+          const fundNameSignals = /\b(fund|family office|vc firm|hedge fund)\b/i.test(n);
+          const fundDescSignals = /\b(investment (fund|vehicle)|fund of funds|family office|hedge fund|venture capital firm|limited partners?|LP interests?|capital allocation|portfolio of (investments|companies)|invest in (startups|companies|funds)|manage[ds]? (assets|capital|investments)|AUM|assets under management)\b/i.test(d);
+          // Only exclude if the company IS an investment vehicle, not just works in finance
+          const isVehicle = (fundNameSignals && fundDescSignals) ||
+            /\b(family office|hedge fund|venture capital firm|fund of funds)\b/i.test(d);
+          if (isVehicle) console.log(`[AutoScan] EXCLUDED investment vehicle: ${c.name} — "${d.slice(0, 100)}"`);
+          return !isVehicle;
         })
         .sort((a, b) => b._score - a._score);
 
