@@ -2205,6 +2205,39 @@ app.get('/api/autoscan/last-results/:personId', (req, res) => {
   }
 });
 
+// Scan history — server-side, persists across browser clears
+const SCAN_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'scan_history.json');
+
+function loadScanHistory() {
+  try { if (fs.existsSync(SCAN_HISTORY_FILE)) return JSON.parse(fs.readFileSync(SCAN_HISTORY_FILE, 'utf8')); } catch(e) {}
+  return [];
+}
+function saveScanHistory(history) {
+  try { fs.writeFileSync(SCAN_HISTORY_FILE, JSON.stringify(history.slice(0, 100))); } catch(e) {} // Keep last 100
+}
+
+app.get('/api/autoscan/history', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const history = loadScanHistory();
+  res.json({ history });
+});
+
+app.post('/api/autoscan/history/add', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { personId, profileName, funnel, topCompanies, timestamp } = req.body;
+  if (!personId) return res.status(400).json({ error: 'personId required' });
+  const history = loadScanHistory();
+  history.unshift({
+    personId,
+    profileName: profileName || 'Scan',
+    funnel: funnel || {},
+    topCompanies: (topCompanies || []).slice(0, 10).map(c => ({ name: c.name, score: c._score || c.score || 0 })),
+    timestamp: timestamp || Date.now(),
+  });
+  saveScanHistory(history);
+  res.json({ success: true });
+});
+
 // Force clear scan status for a person (or all)
 app.post('/api/autoscan/clear-status/:personId?', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -2259,6 +2292,21 @@ app.post('/api/autoscan', async (req, res) => {
         fs.writeFileSync(resultsFile, JSON.stringify(allResults));
       } catch (e) { console.error('[ScanResults] Save error:', e.message); }
       global._scanStatus[_personId] = { status: 'done', finishedAt: Date.now(), profileName: _profile?.name || 'Scan' };
+      // Auto-save to server-side scan history
+      try {
+        const hist = loadScanHistory();
+        const topCompanies = (data.results || []).filter(c => (c._score || c.score || 0) > 0).sort((a,b) => (b._score||b.score||0) - (a._score||a.score||0)).slice(0, 10);
+        hist.unshift({
+          personId: _personId,
+          profileName: _profile?.name || 'Scan',
+          funnel: data.funnel || {},
+          topCompanies: topCompanies.map(c => ({ name: c.name, score: c._score || c.score || 0 })),
+          totalResults: (data.results || []).length,
+          timestamp: Date.now(),
+        });
+        saveScanHistory(hist);
+        console.log(`[ScanHistory] Saved scan for ${_personId}: ${(data.results||[]).length} results, ${topCompanies.length} scored`);
+      } catch(e) { console.error('[ScanHistory] Save error:', e.message); }
     }
     res.write(`data: ${JSON.stringify(data)}\n\n`);
     res.end();
