@@ -3136,32 +3136,31 @@ ${batchDataText}`;
       allBatchAnalyses.push(totalBatches > 1 ? `## === OPUS BATCH ${batchIdx + 1}/${totalBatches} (${batchCards.length} companies) ===\n\n${batchAnalysis}` : batchAnalysis);
 
       // Parse scores from this batch
-      // Strategy 1: "**Name** — Score: N/10" (handles multiline bold with 🌐)
+      // Clean name helper — strip numbering, emojis, parens, whitespace
+      const cleanName = (raw) => raw.replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').replace(/^\d+[\.\)]\s*/, '').trim().toLowerCase();
+
+      // Strategy 1: "**Name** — Score: N/10"
       for (const m of batchAnalysis.matchAll(/\*\*(.{1,80}?)\*\*\s*[—\-–]\s*Score:\s*(\d+)\s*\/\s*10/gi)) {
-        const name = m[1].replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').trim().toLowerCase();
-        if (name.length >= 2 && name.length < 50) {
-          scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
-        }
+        const name = cleanName(m[1]);
+        if (name.length >= 2 && name.length < 50) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
       }
-      // Strategy 2: "Final Score: N/10" preceded by company header — look back for **Name**
+      // Strategy 2: "Final Score: N/10" preceded by company header
       for (const m of batchAnalysis.matchAll(/Final Score:\s*(\d+)\s*\/\s*10/gi)) {
         const before = batchAnalysis.slice(Math.max(0, m.index - 2000), m.index);
         const nameMatch = [...before.matchAll(/###?\s*\d+\.?\s*\*?\*?(.+?)\*?\*?\s*[—\-–]/gi)].pop();
         if (nameMatch) {
-          const name = nameMatch[1].replace(/\*\*/g, '').replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').trim().toLowerCase();
-          if (name.length >= 2 && name.length < 50) {
-            scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[1]) || 0);
-          }
+          const name = cleanName(nameMatch[1].replace(/\*\*/g, ''));
+          if (name.length >= 2 && name.length < 50) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[1]) || 0);
         }
       }
       // Strategy 3: Table format "| N | Name | Score/10 |"
       for (const m of batchAnalysis.matchAll(/\|\s*\d+\s*\|\s*([^|]+?)\s*\|\s*(\d+)\s*\/\s*10\s*\|/gi)) {
-        const name = m[1].replace(/\*\*/g, '').replace(/🌐/g, '').replace(/\[.*?\]/g, '').trim().toLowerCase();
-        if (name && name.length >= 2) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
+        const name = cleanName(m[1].replace(/\*\*/g, '').replace(/\[.*?\]/g, ''));
+        if (name.length >= 2) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
       }
-      // Strategy 4: "**Name** — N/10" (short format in final picks)
+      // Strategy 4: "**Name** — N/10" (final picks)
       for (const m of batchAnalysis.matchAll(/\*\*(.{1,60}?)\*\*\s*[—\-–]\s*(\d+)\s*\/\s*10/gi)) {
-        const name = m[1].replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').trim().toLowerCase();
+        const name = cleanName(m[1]);
         if (name.length >= 2 && name.length < 50 && !scoreMap[name]) {
           scoreMap[name] = parseInt(m[2]) || 0;
         }
