@@ -2238,6 +2238,72 @@ app.post('/api/autoscan/history/add', (req, res) => {
   res.json({ success: true });
 });
 
+// Funding round alerts — check CRM companies for recent funding rounds
+app.get('/api/alerts/funding-rounds', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const headers = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  const harmonicKey = process.env.HARMONIC_API_KEY;
+  if (!headers || !baseId) return res.json({ alerts: [] });
+
+  try {
+    // Fetch all pipeline companies
+    const stages = ['BO', 'BORO', 'BORO-SM'];
+    const allCompanies = [];
+    for (const stage of stages) {
+      const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
+      const r = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=200`, { headers });
+      if (r.ok) {
+        const data = await r.json();
+        (data.records || []).forEach(rec => {
+          allCompanies.push({
+            company: rec.fields['Company'] || '',
+            stage: rec.fields['CRM Stage'] || stage,
+            website: rec.fields['Company Link'] || '',
+            airtableFunding: rec.fields['Total Funding'] || '',
+          });
+        });
+      }
+    }
+
+    if (!harmonicKey || allCompanies.length === 0) return res.json({ alerts: [] });
+
+    // Batch lookup funding from Harmonic
+    const batchRes = await fetch(`https://pigeon-api.up.railway.app/api/harmonic/batch-funding`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ companies: allCompanies.map(c => ({ name: c.company, website: c.website })) }),
+    });
+    const batchData = batchRes.ok ? await batchRes.json() : { results: {} };
+
+    // Find companies with funding rounds in last 30 days
+    const alerts = [];
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+    for (const c of allCompanies) {
+      const hd = batchData.results?.[c.company];
+      if (!hd || !hd.last_round_date) continue;
+      if (hd.last_round_date >= thirtyDaysAgo) {
+        alerts.push({
+          company: c.company,
+          stage: c.stage,
+          round: hd.last_round || hd.stage || 'Unknown',
+          amount: hd.last_round_amount || null,
+          totalFunding: hd.funding_total || null,
+          date: hd.last_round_date,
+          logo: hd.logo_url || '',
+        });
+      }
+    }
+
+    alerts.sort((a, b) => b.date.localeCompare(a.date));
+    res.json({ alerts });
+  } catch (e) {
+    console.error('[FundingAlerts] Error:', e.message);
+    res.json({ alerts: [], error: e.message });
+  }
+});
+
 // Force clear scan status for a person (or all)
 app.post('/api/autoscan/clear-status/:personId?', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
