@@ -2238,8 +2238,20 @@ app.post('/api/autoscan/history/add', (req, res) => {
   res.json({ success: true });
 });
 
-// Funding round alerts — check CRM companies for recent funding rounds
+// Funding round alerts — cached, refreshes every 30 min
+const FUNDING_ALERTS_CACHE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'funding_alerts_cache.json');
+let fundingAlertsCache = { alerts: [], lastRefresh: 0 };
+try { if (fs.existsSync(FUNDING_ALERTS_CACHE_FILE)) fundingAlertsCache = JSON.parse(fs.readFileSync(FUNDING_ALERTS_CACHE_FILE, 'utf8')); } catch(e) {}
+
 app.get('/api/alerts/funding-rounds', async (req, res) => {
+  const forceRefresh = req.query.refresh === 'true';
+  const cacheAge = Date.now() - (fundingAlertsCache.lastRefresh || 0);
+  const CACHE_TTL = 30 * 60 * 1000; // 30 min
+
+  // Serve cache if fresh
+  if (!forceRefresh && cacheAge < CACHE_TTL && fundingAlertsCache.alerts.length >= 0) {
+    return res.json({ alerts: fundingAlertsCache.alerts, cached: true, cacheAge: Math.round(cacheAge / 60000) });
+  }
   res.setHeader('Access-Control-Allow-Origin', '*');
   const headers = airtableHeaders();
   const baseId = process.env.AIRTABLE_BASE_ID;
@@ -2299,9 +2311,15 @@ app.get('/api/alerts/funding-rounds', async (req, res) => {
     }
 
     alerts.sort((a, b) => b.date.localeCompare(a.date));
-    res.json({ alerts });
+    // Cache results
+    fundingAlertsCache = { alerts, lastRefresh: Date.now() };
+    try { fs.writeFileSync(FUNDING_ALERTS_CACHE_FILE, JSON.stringify(fundingAlertsCache)); } catch(e) {}
+    console.log(`[FundingAlerts] Refreshed: ${alerts.length} alerts`);
+    res.json({ alerts, cached: false });
   } catch (e) {
     console.error('[FundingAlerts] Error:', e.message);
+    // Serve stale cache on error
+    if (fundingAlertsCache.alerts.length > 0) return res.json({ alerts: fundingAlertsCache.alerts, cached: true, stale: true });
     res.json({ alerts: [], error: e.message });
   }
 });
