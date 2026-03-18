@@ -2279,7 +2279,7 @@ app.get('/api/alerts/funding-rounds', async (req, res) => {
 
     // Find companies with funding rounds in last 30 days
     const alerts = [];
-    const lookbackDays = parseInt(req.query.days) || 180; // Default 6 months
+    const lookbackDays = parseInt(req.query.days) || 45; // Default 45 days
     const cutoffDate = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
 
     for (const c of allCompanies) {
