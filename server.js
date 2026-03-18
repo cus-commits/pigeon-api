@@ -2498,7 +2498,7 @@ ${batchText}`;
 
     for (const q of queries) {
       try {
-        const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(q)}&size=20`;
+        const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(q)}&size=50`;
         const searchRes = await fetch(searchUrl, { headers: authHeaders });
         if (searchRes.ok) {
           const searchData = await searchRes.json();
