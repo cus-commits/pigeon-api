@@ -2268,8 +2268,9 @@ app.get('/api/alerts/funding-rounds', async (req, res) => {
 
     if (!harmonicKey || allCompanies.length === 0) return res.json({ alerts: [] });
 
-    // Batch lookup funding from Harmonic
-    const batchRes = await fetch(`https://pigeon-api.up.railway.app/api/harmonic/batch-funding`, {
+    // Batch lookup funding from Harmonic — call ourselves on localhost
+    const port = process.env.PORT || 3001;
+    const batchRes = await fetch(`http://localhost:${port}/api/harmonic/batch-funding`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ companies: allCompanies.map(c => ({ name: c.company, website: c.website })) }),
@@ -2278,12 +2279,13 @@ app.get('/api/alerts/funding-rounds', async (req, res) => {
 
     // Find companies with funding rounds in last 30 days
     const alerts = [];
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    const lookbackDays = parseInt(req.query.days) || 180; // Default 6 months
+    const cutoffDate = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
 
     for (const c of allCompanies) {
       const hd = batchData.results?.[c.company];
       if (!hd || !hd.last_round_date) continue;
-      if (hd.last_round_date >= thirtyDaysAgo) {
+      if (hd.last_round_date >= cutoffDate) {
         alerts.push({
           company: c.company,
           stage: c.stage,
