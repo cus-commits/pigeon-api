@@ -3049,23 +3049,40 @@ ${batchDataText}`;
       const batchAnalysis = claudeData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
       allBatchAnalyses.push(totalBatches > 1 ? `## === OPUS BATCH ${batchIdx + 1}/${totalBatches} (${batchCards.length} companies) ===\n\n${batchAnalysis}` : batchAnalysis);
 
-      // Parse scores from this batch — company names are short (< 60 chars)
-      for (const m of batchAnalysis.matchAll(/\*\*([^*\n]{1,60})\*\*[\s\S]*?Score:\s*(\d+)/gi)) {
-        const name = m[1].trim().replace(/🌐/g, '').replace(/\(.*?\)/g, '').trim().toLowerCase();
-        if (name.length > 0 && name.length < 50 && !name.includes('—') && !name.includes('.')) {
+      // Parse scores from this batch
+      // Strategy 1: "**Name** — Score: N/10" (handles multiline bold with 🌐)
+      for (const m of batchAnalysis.matchAll(/\*\*(.{1,80}?)\*\*\s*[—\-–]\s*Score:\s*(\d+)\s*\/\s*10/gi)) {
+        const name = m[1].replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').trim().toLowerCase();
+        if (name.length >= 2 && name.length < 50) {
+          scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
+        }
+      }
+      // Strategy 2: "Final Score: N/10" preceded by company header — look back for **Name**
+      for (const m of batchAnalysis.matchAll(/Final Score:\s*(\d+)\s*\/\s*10/gi)) {
+        const before = batchAnalysis.slice(Math.max(0, m.index - 2000), m.index);
+        const nameMatch = [...before.matchAll(/###?\s*\d+\.?\s*\*?\*?(.+?)\*?\*?\s*[—\-–]/gi)].pop();
+        if (nameMatch) {
+          const name = nameMatch[1].replace(/\*\*/g, '').replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').trim().toLowerCase();
+          if (name.length >= 2 && name.length < 50) {
+            scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[1]) || 0);
+          }
+        }
+      }
+      // Strategy 3: Table format "| N | Name | Score/10 |"
+      for (const m of batchAnalysis.matchAll(/\|\s*\d+\s*\|\s*([^|]+?)\s*\|\s*(\d+)\s*\/\s*10\s*\|/gi)) {
+        const name = m[1].replace(/\*\*/g, '').replace(/🌐/g, '').replace(/\[.*?\]/g, '').trim().toLowerCase();
+        if (name && name.length >= 2) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
+      }
+      // Strategy 4: "**Name** — N/10" (short format in final picks)
+      for (const m of batchAnalysis.matchAll(/\*\*(.{1,60}?)\*\*\s*[—\-–]\s*(\d+)\s*\/\s*10/gi)) {
+        const name = m[1].replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').trim().toLowerCase();
+        if (name.length >= 2 && name.length < 50 && !scoreMap[name]) {
           scoreMap[name] = parseInt(m[2]) || 0;
         }
       }
-      for (const m of batchAnalysis.matchAll(/\|\s*\d+\s*\|\s*([^|]+?)\s*\|\s*(\d+)\/10\s*\|/gi)) {
-        const name = m[1].trim().replace(/\*\*/g, '').replace(/🌐/g, '').replace(/\[.*?\]/g, '').trim().toLowerCase();
-        if (name && !scoreMap[name]) scoreMap[name] = parseInt(m[2]) || 0;
-      }
-      for (const m of batchAnalysis.matchAll(/\*\*([^*]+)\*\*\s*[—\-–]\s*(\d+)\/10/gi)) {
-        const name = m[1].trim().replace(/🌐/g, '').toLowerCase();
-        if (name && !scoreMap[name]) scoreMap[name] = parseInt(m[2]) || 0;
-      }
+      // PASS detection
       for (const m of batchAnalysis.matchAll(/\*?\*?([^*—\n]+?)\*?\*?\s*—\s*PASS/gi)) {
-        passSet.add(m[1].trim().toLowerCase());
+        passSet.add(m[1].trim().replace(/🌐/g, '').toLowerCase());
       }
 
       console.log(`[AutoScan] Opus batch ${batchIdx + 1} done. Scores: ${Object.keys(scoreMap).length}`);
@@ -3169,6 +3186,15 @@ ${batchDataText}`;
         })
         .filter(c => c._score >= 6)
         .filter(c => !(c.name || '').toLowerCase().startsWith('stealth company'))
+        .filter(c => {
+          // Hard exclude: funds, family offices, investment vehicles
+          const n = (c.name || '').toLowerCase();
+          const d = (c.description || '').toLowerCase();
+          const isFund = /(^|\s)(fund|capital|ventures|advisors|partners|holdings|asset management|family office|hedge fund|vc firm)\b/i.test(n) ||
+            /investment (fund|vehicle|platform)|fund of funds|asset management|family office|hedge fund/i.test(d);
+          if (isFund) console.log(`[AutoScan] EXCLUDED fund/vehicle: ${c.name}`);
+          return !isFund;
+        })
         .sort((a, b) => b._score - a._score);
 
       console.log(`[AutoScan] DD push: ${scored.length} companies scored ≥6 from ${companyCards.length} total`);
