@@ -3001,9 +3001,12 @@ ${batchDataText}`;
       const batchAnalysis = claudeData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
       allBatchAnalyses.push(totalBatches > 1 ? `## === OPUS BATCH ${batchIdx + 1}/${totalBatches} (${batchCards.length} companies) ===\n\n${batchAnalysis}` : batchAnalysis);
 
-      // Parse scores from this batch
-      for (const m of batchAnalysis.matchAll(/\*\*([^*]+)\*\*[^]*?Score:\s*(\d+)/gi)) {
-        scoreMap[m[1].trim().replace(/🌐/g, '').toLowerCase()] = parseInt(m[2]) || 0;
+      // Parse scores from this batch — company names are short (< 60 chars)
+      for (const m of batchAnalysis.matchAll(/\*\*([^*\n]{1,60})\*\*[\s\S]*?Score:\s*(\d+)/gi)) {
+        const name = m[1].trim().replace(/🌐/g, '').replace(/\(.*?\)/g, '').trim().toLowerCase();
+        if (name.length > 0 && name.length < 50 && !name.includes('—') && !name.includes('.')) {
+          scoreMap[name] = parseInt(m[2]) || 0;
+        }
       }
       for (const m of batchAnalysis.matchAll(/\|\s*\d+\s*\|\s*([^|]+?)\s*\|\s*(\d+)\/10\s*\|/gi)) {
         const name = m[1].trim().replace(/\*\*/g, '').replace(/🌐/g, '').replace(/\[.*?\]/g, '').trim().toLowerCase();
