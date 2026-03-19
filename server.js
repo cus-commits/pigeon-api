@@ -7110,14 +7110,14 @@ app.post('/api/apply', async (req, res) => {
       } else {
         const err = await createRes.text();
         console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 200));
-        // If "Website Applications" stage doesn't exist, Airtable will reject it
-        // Try creating with Warm as fallback
-        // already Warm
+        // If "Website Applications" stage doesn't exist, try with "Warm" as fallback
+        const fallbackFields = { ...fields, 'CRM Stage': 'Warm' };
         const fallbackRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
           method: 'POST', headers,
-          body: JSON.stringify({ fields })
+          body: JSON.stringify({ fields: fallbackFields })
         });
-        if (fallbackRes.ok) console.log('[Apply] Fallback: added as Warm (Website Applications stage may not exist yet)');
+        if (fallbackRes.ok) console.log('[Apply] Fallback: added as Warm (Website Applications stage not available yet)');
+        else console.error('[Apply] Fallback also failed:', (await fallbackRes.text()).slice(0, 200));
       }
     } catch(e) {
       console.error('[Apply] Airtable error:', e.message);
