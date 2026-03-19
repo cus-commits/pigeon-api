@@ -7094,10 +7094,11 @@ app.post('/api/apply', async (req, res) => {
         'Original Notes + Ongoing Negotiation Notes': noteLines,
       };
 
-      // Add Twitter Link if telegram looks like a twitter handle
-      if (telegram && telegram.startsWith('@')) {
-        // Store telegram in notes — it's already there
-      }
+      // Map form fields to Airtable columns
+      // Email stored in Initial Reachout Notes for easy access
+      if (email) fields['Initial Reachout Notes'] = 'Email: ' + email + (telegram ? '\nTelegram: ' + telegram : '');
+      // Description goes into Intro Call Notes
+      if (description) fields['Intro Call Notes'] = description;
 
       const createRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
         method: 'POST', headers,
