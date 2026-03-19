@@ -7052,3 +7052,63 @@ function extractSearchTerms(message) {
   const finalWords = query.split(/\s+/).slice(0, 8);
   return finalWords.join(' ').slice(0, 80);
 }
+
+// Apply form submissions — stores in Airtable and logs
+app.post('/api/apply', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { company_name, website, description, telegram, email, additional_info } = req.body;
+  if (!company_name || !email) return res.status(400).json({ error: 'company_name and email required' });
+
+  console.log(`[Apply] New application: ${company_name} (${email})`);
+
+  // Store in a local JSON file
+  const APPLY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'applications.json');
+  let apps = [];
+  try { if (fs.existsSync(APPLY_FILE)) apps = JSON.parse(fs.readFileSync(APPLY_FILE, 'utf8')); } catch(e) {}
+  apps.push({
+    company_name, website, description, telegram, email, additional_info,
+    submitted_at: new Date().toISOString()
+  });
+  try { fs.writeFileSync(APPLY_FILE, JSON.stringify(apps, null, 2)); } catch(e) {}
+
+  // Also add to Airtable if configured (as a new record in a separate table or notes)
+  const headers = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  if (headers && baseId) {
+    try {
+      // Add as a note to a "Applications" record or create in the main table
+      const tableName = encodeURIComponent(process.env.AIRTABLE_TABLE_NAME || 'All Companies');
+      const noteText = `[APPLICATION · ${new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })} EST]\nCompany: ${company_name}\nWebsite: ${website || 'N/A'}\nDescription: ${description || 'N/A'}\nTelegram: ${telegram || 'N/A'}\nEmail: ${email}\nAdditional: ${additional_info || 'N/A'}`;
+      
+      await fetch(`${AIRTABLE_API}/${baseId}/${tableName}`, {
+        method: 'POST', headers,
+        body: JSON.stringify({
+          fields: {
+            'Company': company_name,
+            'CRM Stage': 'Warm',
+            'Source': 'Website Apply Form',
+            'Original Notes + Ongoing Negotiation Notes': noteText,
+            'Company Link': website || '',
+          }
+        })
+      });
+      console.log(`[Apply] Added ${company_name} to Airtable as Warm lead`);
+    } catch(e) {
+      console.error(`[Apply] Airtable error: ${e.message}`);
+    }
+  }
+
+  res.json({ success: true, message: 'Application received' });
+});
+
+// Get all applications
+app.get('/api/applications', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const APPLY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'applications.json');
+  try {
+    const apps = JSON.parse(fs.readFileSync(APPLY_FILE, 'utf8'));
+    res.json({ applications: apps });
+  } catch(e) {
+    res.json({ applications: [] });
+  }
+});
