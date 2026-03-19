@@ -7053,48 +7053,73 @@ function extractSearchTerms(message) {
   return finalWords.join(' ').slice(0, 80);
 }
 
-// Apply form submissions — stores in Airtable and logs
+// Apply form submissions — stores in Airtable under "Website Applications" stage
 app.post('/api/apply', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { company_name, website, description, telegram, email, additional_info } = req.body;
+  const { company_name, website, description, telegram, email, additional_info, pitch_deck_link } = req.body;
   if (!company_name || !email) return res.status(400).json({ error: 'company_name and email required' });
 
-  console.log(`[Apply] New application: ${company_name} (${email})`);
+  const timestamp = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) + ' EST';
+  console.log(`[Apply] New application: ${company_name} (${email}) at ${timestamp}`);
 
-  // Store in a local JSON file
+  // Store in a local JSON file (backup)
   const APPLY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'applications.json');
   let apps = [];
   try { if (fs.existsSync(APPLY_FILE)) apps = JSON.parse(fs.readFileSync(APPLY_FILE, 'utf8')); } catch(e) {}
-  apps.push({
-    company_name, website, description, telegram, email, additional_info,
-    submitted_at: new Date().toISOString()
-  });
+  apps.push({ company_name, website, description, telegram, email, additional_info, pitch_deck_link, submitted_at: new Date().toISOString() });
   try { fs.writeFileSync(APPLY_FILE, JSON.stringify(apps, null, 2)); } catch(e) {}
 
-  // Also add to Airtable if configured (as a new record in a separate table or notes)
+  // Add to Airtable as "Website Applications" stage
   const headers = airtableHeaders();
   const baseId = process.env.AIRTABLE_BASE_ID;
   if (headers && baseId) {
     try {
-      // Add as a note to a "Applications" record or create in the main table
       const tableName = encodeURIComponent(process.env.AIRTABLE_TABLE_NAME || 'All Companies');
-      const noteText = `[APPLICATION · ${new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })} EST]\nCompany: ${company_name}\nWebsite: ${website || 'N/A'}\nDescription: ${description || 'N/A'}\nTelegram: ${telegram || 'N/A'}\nEmail: ${email}\nAdditional: ${additional_info || 'N/A'}`;
-      
-      await fetch(`${AIRTABLE_API}/${baseId}/${tableName}`, {
+
+      // Build notes with all application details
+      const noteLines = [
+        '[Website Application · ' + timestamp + ']',
+        'Description: ' + (description || 'N/A'),
+        'Pitch Deck: ' + (pitch_deck_link || 'N/A'),
+        'Telegram: ' + (telegram || 'N/A'),
+        'Email: ' + email,
+        additional_info ? 'Additional: ' + additional_info : ''
+      ].filter(Boolean).join('\n');
+
+      const fields = {
+        'Company': company_name,
+        'CRM Stage': 'Website Applications',
+        'Source': 'Website Apply Form',
+        'Company Link': website || '',
+        'Original Notes + Ongoing Negotiation Notes': noteLines,
+      };
+
+      // Add Twitter Link if telegram looks like a twitter handle
+      if (telegram && telegram.startsWith('@')) {
+        // Store telegram in notes — it's already there
+      }
+
+      const createRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
         method: 'POST', headers,
-        body: JSON.stringify({
-          fields: {
-            'Company': company_name,
-            'CRM Stage': 'Warm',
-            'Source': 'Website Apply Form',
-            'Original Notes + Ongoing Negotiation Notes': noteText,
-            'Company Link': website || '',
-          }
-        })
+        body: JSON.stringify({ fields })
       });
-      console.log(`[Apply] Added ${company_name} to Airtable as Warm lead`);
+
+      if (createRes.ok) {
+        console.log('[Apply] Added ' + company_name + ' to Airtable as Website Application');
+      } else {
+        const err = await createRes.text();
+        console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 200));
+        // If "Website Applications" stage doesn't exist, Airtable will reject it
+        // Try creating with Warm as fallback
+        fields['CRM Stage'] = 'Warm';
+        const fallbackRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
+          method: 'POST', headers,
+          body: JSON.stringify({ fields })
+        });
+        if (fallbackRes.ok) console.log('[Apply] Fallback: added as Warm (Website Applications stage may not exist yet)');
+      }
     } catch(e) {
-      console.error(`[Apply] Airtable error: ${e.message}`);
+      console.error('[Apply] Airtable error:', e.message);
     }
   }
 
