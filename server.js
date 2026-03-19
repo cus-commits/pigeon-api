@@ -7088,7 +7088,7 @@ app.post('/api/apply', async (req, res) => {
 
       const fields = {
         'Company': company_name,
-        'CRM Stage': 'Warm',
+        'CRM Stage': 'Website Applications',
         'Source': 'Website Apply Form',
         'Company Link': website || '',
         'Original Notes + Ongoing Negotiation Notes': noteLines,
