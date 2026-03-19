@@ -7106,25 +7106,34 @@ app.post('/api/apply', async (req, res) => {
       });
 
       if (createRes.ok) {
-        console.log('[Apply] Added ' + company_name + ' to Airtable as Website Application');
+        const record = await createRes.json();
+        console.log('[Apply] Added ' + company_name + ' to Airtable as Website Application, id:', record.id);
+        return res.json({ success: true, message: 'Application received', airtable: 'created', stage: 'Website Applications' });
       } else {
         const err = await createRes.text();
-        console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 200));
+        console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 500));
         // If "Website Applications" stage doesn't exist, try with "Warm" as fallback
         const fallbackFields = { ...fields, 'CRM Stage': 'Warm' };
         const fallbackRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
           method: 'POST', headers,
           body: JSON.stringify({ fields: fallbackFields })
         });
-        if (fallbackRes.ok) console.log('[Apply] Fallback: added as Warm (Website Applications stage not available yet)');
-        else console.error('[Apply] Fallback also failed:', (await fallbackRes.text()).slice(0, 200));
+        if (fallbackRes.ok) {
+          console.log('[Apply] Fallback: added as Warm');
+          return res.json({ success: true, message: 'Application received', airtable: 'fallback_warm', error_detail: err.slice(0, 300) });
+        } else {
+          const err2 = await fallbackRes.text();
+          console.error('[Apply] Fallback also failed:', err2.slice(0, 300));
+          return res.json({ success: true, message: 'Application saved locally but Airtable failed', airtable: 'failed', error_detail: err.slice(0, 300) });
+        }
       }
     } catch(e) {
       console.error('[Apply] Airtable error:', e.message);
+      return res.json({ success: true, message: 'Application saved locally but Airtable errored', airtable: 'error', error_detail: e.message });
     }
   }
 
-  res.json({ success: true, message: 'Application received' });
+  res.json({ success: true, message: 'Application received (no Airtable config)' });
 });
 
 // Get all applications
