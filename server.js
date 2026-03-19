@@ -7088,7 +7088,7 @@ app.post('/api/apply', async (req, res) => {
 
       const fields = {
         'Company': company_name,
-        'CRM Stage': 'Website Applications',
+        'CRM Stage': 'Warm',
         'Source': 'Website Apply Form',
         'Company Link': website || '',
         'Original Notes + Ongoing Negotiation Notes': noteLines,
@@ -7111,7 +7111,7 @@ app.post('/api/apply', async (req, res) => {
         console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 200));
         // If "Website Applications" stage doesn't exist, Airtable will reject it
         // Try creating with Warm as fallback
-        fields['CRM Stage'] = 'Warm';
+        // already Warm
         const fallbackRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
           method: 'POST', headers,
           body: JSON.stringify({ fields })
