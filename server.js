@@ -2381,17 +2381,17 @@ app.post('/api/autoscan', async (req, res) => {
       // Auto-save to server-side scan history
       try {
         const hist = loadScanHistory();
-        const topCompanies = (data.results || []).filter(c => (c._score || c.score || 0) > 0).sort((a,b) => (b._score||b.score||0) - (a._score||a.score||0)).slice(0, 10);
+        const allScored = (data.results || []).filter(c => (c._score || c.score || 0) > 0).sort((a,b) => (b._score||b.score||0) - (a._score||a.score||0));
         hist.unshift({
           personId: _personId,
           profileName: _profile?.name || 'Scan',
           funnel: data.funnel || {},
-          topCompanies: topCompanies.map(c => ({ name: c.name, score: c._score || c.score || 0 })),
+          topCompanies: allScored.map(c => ({ name: c.name, score: c._score || c.score || 0, logo_url: c.logo_url || null, description: (c.description || '').slice(0, 200), id: c.id || null, website: c.website || null, funding_total: c.funding_total || 0, funding_stage: c.funding_stage || null })),
           totalResults: (data.results || []).length,
           timestamp: Date.now(),
         });
         saveScanHistory(hist);
-        console.log(`[ScanHistory] Saved scan for ${_personId}: ${(data.results||[]).length} results, ${topCompanies.length} scored`);
+        console.log(`[ScanHistory] Saved scan for ${_personId}: ${(data.results||[]).length} results, ${allScored.length} scored`);
       } catch(e) { console.error('[ScanHistory] Save error:', e.message); }
     }
     res.write(`data: ${JSON.stringify(data)}\n\n`);
