@@ -2349,9 +2349,16 @@ app.post('/api/autoscan', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders(); // CRITICAL: sends headers immediately to establish CORS
 
+  // Track client connection state — scan continues even if client disconnects
+  let clientConnected = true;
+  req.on('close', () => { clientConnected = false; console.log(`[AutoScan] Client disconnected — scan continues server-side`); });
+
+  // Safe write — ignores errors if client disconnected
+  const safeWrite = (data) => { if (clientConnected) try { res.write(data); } catch (e) {} };
+
   // Helper to send keepalive pings
   const keepAlive = setInterval(() => {
-    res.write(': keepalive\n\n');
+    safeWrite(': keepalive\n\n');
   }, 5000);
 
   // Track active scan status in memory (survives tab close)
@@ -2363,7 +2370,7 @@ app.post('/api/autoscan', async (req, res) => {
 
   const sendResult = (data) => {
     clearInterval(keepAlive);
-    // Save result server-side so it persists even if client disconnects
+    // Save result server-side FIRST — persists even if client disconnected
     if (_personId) {
       try {
         const resultsFile = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'last_scan_results.json');
@@ -2371,7 +2378,7 @@ app.post('/api/autoscan', async (req, res) => {
         try { allResults = JSON.parse(fs.readFileSync(resultsFile, 'utf8')); } catch (e) {}
         allResults[_personId] = {
           ...data,
-          results: (data.results || []).slice(0, 100),
+          results: (data.results || []).slice(0, 300),
           timestamp: Date.now(),
           profileName: _profile?.name || 'Scan',
         };
@@ -2394,8 +2401,8 @@ app.post('/api/autoscan', async (req, res) => {
         console.log(`[ScanHistory] Saved scan for ${_personId}: ${(data.results||[]).length} results, ${allScored.length} scored`);
       } catch(e) { console.error('[ScanHistory] Save error:', e.message); }
     }
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-    res.end();
+    safeWrite(`data: ${JSON.stringify(data)}\n\n`);
+    if (clientConnected) try { res.end(); } catch (e) {}
   };
 
   try {
@@ -2513,11 +2520,11 @@ app.post('/api/autoscan', async (req, res) => {
     if (prescreenCap && rawCards.length > prescreenCap) {
       prescreenCards = rawCards.slice(0, prescreenCap);
       console.log(`[AutoScan] Tier ${profile.scanTier}: pre-screen capped at ${prescreenCap} (skipping ${rawCards.length - prescreenCap})`);
-      res.write(`: Tier ${profile.scanTier}: screening ${prescreenCap} of ${rawCards.length} companies (${rawCards.length - prescreenCap} skipped)\n\n`);
+      safeWrite(`: Tier ${profile.scanTier}: screening ${prescreenCap} of ${rawCards.length} companies (${rawCards.length - prescreenCap} skipped)\n\n`);
     }
     
     console.log(`[AutoScan] PRE-ENRICH SONNET: Screening ${prescreenCards.length} raw companies...`);
-    res.write(`: Screening ${prescreenCards.length} companies with Sonnet (before enrichment)...\n\n`);
+    safeWrite(`: Screening ${prescreenCards.length} companies with Sonnet (before enrichment)...\n\n`);
     updateProgress(`Screening ${prescreenCards.length} companies with Sonnet`, "prescreen");
 
     // Build category map for all companies
@@ -2564,7 +2571,7 @@ COMPANIES:
 ${batchText}`;
 
       try {
-        res.write(`: Sonnet pre-screen batch ${si + 1}/${Math.ceil(prescreenCards.length / SONNET_PRESCREEN_BATCH)} — ${prescreenPassIds.size} passed so far\n\n`);
+        safeWrite(`: Sonnet pre-screen batch ${si + 1}/${Math.ceil(prescreenCards.length / SONNET_PRESCREEN_BATCH)} — ${prescreenPassIds.size} passed so far\n\n`);
         const sRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
@@ -2595,7 +2602,7 @@ ${batchText}`;
             const compName = line.split(/\s*[—\-–]\s*/)[0].replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').trim().slice(0, 30);
             const reason = line.split(/\s*[—\-–]\s*/).slice(2).join(' ').trim().slice(0, 50);
             const fun = isPASS ? funPasses[Math.floor(Math.random() * funPasses.length)] : funCuts[Math.floor(Math.random() * funCuts.length)];
-            if (compName.length > 2) res.write(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
+            if (compName.length > 2) safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
           }
           
           console.log(`[AutoScan] Pre-screen batch ${si + 1}: ${batch.length} screened, ${prescreenPassIds.size} total passed`);
@@ -2613,7 +2620,7 @@ ${batchText}`;
     }
     
     console.log(`[AutoScan] PRE-SCREEN COMPLETE: ${prescreenCards.length} → ${prescreenPassIds.size} passed (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%)`);
-    res.write(`: Pre-screen done — ${prescreenPassIds.size} of ${prescreenCards.length} survived (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%) — enriching ${companyIds.length} companies...\n\n`);
+    safeWrite(`: Pre-screen done — ${prescreenPassIds.size} of ${prescreenCards.length} survived (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%) — enriching ${companyIds.length} companies...\n\n`);
     updateProgress(`Enriching ${companyIds.length} companies via Harmonic`, "enrich");
     
     // Only enrich the Sonnet survivors
@@ -2676,7 +2683,7 @@ ${batchText}`;
       const gqlBatch = await gqlEnrichCompanies(batch, authHeaders.apikey);
       fullCompanies.push(...gqlBatch.map(c => gqlToCard(c)));
       console.log(`[AutoScan] GQL batch ${Math.floor(i/GQL_BATCH_SIZE)+1}: enriched ${gqlBatch.length} (total: ${fullCompanies.length})`);
-      res.write(`: Enriching ${fullCompanies.length}/${companyIds.length} companies...\n\n`);
+      safeWrite(`: Enriching ${fullCompanies.length}/${companyIds.length} companies...\n\n`);
     } catch (e) {
       console.error(`[AutoScan] GQL batch error:`, e.message);
     }
@@ -2798,7 +2805,7 @@ ${batchText}`;
     const isVCFund = VC_FUND_KEYWORDS.some(kw => text.includes(kw));
     if (isVCFund) {
       console.log(`[AutoScan] VC/Fund filter: CUT "${c.name}" — matches fund keyword`);
-      res.write(`: 🏦 CUT "${c.name}" — this is a fund, not a startup\n\n`);
+      safeWrite(`: 🏦 CUT "${c.name}" — this is a fund, not a startup\n\n`);
     }
     return !isVCFund;
   });
@@ -2835,7 +2842,7 @@ ${batchText}`;
   });
 
   console.log(`[AutoScan] Pre-filtered to ${preFiltered.length} companies (stealth companies pushed to back)`);
-  res.write(`: Filtering ${preFiltered.length} enriched companies (removed ${fullCompanies.length - preFiltered.length})...\n\n`);
+  safeWrite(`: Filtering ${preFiltered.length} enriched companies (removed ${fullCompanies.length - preFiltered.length})...\n\n`);
 
   const companyCards = preFiltered;
 
@@ -2961,7 +2968,7 @@ COMPANIES:
 ${batchText}`;
 
     try {
-      res.write(`: Sonnet screening batch ${si + 1}/${sonnetBatches} — ${sonnetPassNames.size} passed so far\n\n`);
+      safeWrite(`: Sonnet screening batch ${si + 1}/${sonnetBatches} — ${sonnetPassNames.size} passed so far\n\n`);
       const sRes = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
@@ -2994,7 +3001,7 @@ ${batchText}`;
           const reason = line.split(/\s*[—\-–]\s*/).slice(2).join(' ').trim().slice(0, 50);
           const fun = isPASS ? funPasses[Math.floor(Math.random() * funPasses.length)] : funCuts[Math.floor(Math.random() * funCuts.length)];
           if (compName.length > 2) {
-            res.write(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
+            safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
           }
         }
         
@@ -3033,7 +3040,7 @@ ${batchText}`;
   };
   const tierCfg = TIER_CONFIG[scanTier] || TIER_CONFIG.full;
   console.log(`[AutoScan] Scan tier: ${scanTier} — Opus cap: ${tierCfg.opusCap}, Sonnet rerank: ${tierCfg.sonnetRerank}`);
-  res.write(`: Sonnet complete — ${opusCandidates.length} passed (${((opusCandidates.length / companyCards.length) * 100).toFixed(0)}%) — ${tierCfg.useOpus ? 'starting Opus...' : 'Sonnet deep scoring...'}\n\n`);
+  safeWrite(`: Sonnet complete — ${opusCandidates.length} passed (${((opusCandidates.length / companyCards.length) * 100).toFixed(0)}%) — ${tierCfg.useOpus ? 'starting Opus...' : 'Sonnet deep scoring...'}\n\n`);
     updateProgress(`Sonnet done — ${opusCandidates.length} passed — starting deep scoring`, "deepscore");
   
   // Cap Opus candidates based on tier
@@ -3115,7 +3122,7 @@ ${batchDataText}`;
     try {
       const modelLabel = tierCfg.useOpus ? 'Opus' : 'Sonnet';
       console.log(`[AutoScan] ${modelLabel} batch ${batchIdx + 1}/${totalBatches}: scoring ${batchCards.length} companies...`);
-      res.write(`: ${modelLabel} deep scoring batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(scoreMap).length} scored\n\n`);
+      safeWrite(`: ${modelLabel} deep scoring batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(scoreMap).length} scored\n\n`);
       updateProgress(`Deep scoring batch ${batchIdx + 1}/${totalBatches}`, "deepscore");
 
       const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -3182,7 +3189,7 @@ ${batchDataText}`;
       for (const [name, score] of scoredEntries) {
         const emoji = scoreEmojis[Math.min(score, 10)] || '🤔';
         const displayName = name.charAt(0).toUpperCase() + name.slice(1);
-        res.write(`: ${emoji} ${displayName} — scored ${score}/10\n\n`);
+        safeWrite(`: ${emoji} ${displayName} — scored ${score}/10\n\n`);
       }
     } catch (e) {
       console.error(`[AutoScan] Opus batch ${batchIdx + 1} exception:`, e.message);
