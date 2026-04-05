@@ -3431,8 +3431,20 @@ ${batchDataText}`;
     // This way the same search re-ranks the full pool every time,
     // minus companies already in DD or manually dismissed (✕)
 
+    // Merge remaining raw cards into results so ALL companies are browsable
+    // Enriched/scored companies come first, then remaining raw cards sorted by funding
+    let allResults = [...companyCards];
+    if (isSavedSearchMode && typeof rawCards !== 'undefined' && rawCards.length > 0) {
+      const enrichedNames = new Set(companyCards.map(c => (c.name || '').toLowerCase().trim()));
+      const remaining = rawCards
+        .filter(c => !enrichedNames.has((c.name || '').toLowerCase().trim()))
+        .map(c => ({ ...c, _score: 0, _raw: true }));
+      allResults = [...companyCards, ...remaining];
+      console.log(`[AutoScan] Merged results: ${companyCards.length} enriched + ${remaining.length} raw = ${allResults.length} total`);
+    }
+
     return sendResult({
-      results: companyCards,
+      results: allResults,
       analysis,
       queriesUsed: isSavedSearchMode ? profile.savedSearchIds.map(s => s.name) : queries,
       savedSearchMeta: savedSearchMeta || null,
