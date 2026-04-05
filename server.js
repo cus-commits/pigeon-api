@@ -2447,6 +2447,7 @@ app.post('/api/autoscan', async (req, res) => {
   let queries = [];
   let categoryMap = {}; // company ID → source category (for savedSearch mode)
   let savedSearchMeta = null; // metadata about saved search scan
+  let allRawCards = []; // ALL raw companies from saved search (for progressive browsing)
 
   if (profile.scanMode === 'savedSearch' && profile.savedSearchIds?.length > 0) {
     // === SAVED SEARCH MODE ===
@@ -2491,6 +2492,9 @@ app.post('/api/autoscan', async (req, res) => {
       _isStealth: (c.name || '').toLowerCase().startsWith('stealth company'),
     }));
     
+    // Save all raw cards for progressive browsing (before any filtering)
+    allRawCards = [...rawCards];
+
     // Sort: $10M+ funding to the back, stealth to the back, lowest funding first
     rawCards.sort((a, b) => {
       const aOver10M = (a.funding_total || 0) > 10000000;
@@ -3434,9 +3438,9 @@ ${batchDataText}`;
     // Merge remaining raw cards into results so ALL companies are browsable
     // Enriched/scored companies come first, then remaining raw cards sorted by funding
     let allResults = [...companyCards];
-    if (isSavedSearchMode && typeof rawCards !== 'undefined' && rawCards.length > 0) {
+    if (isSavedSearchMode && allRawCards.length > 0) {
       const enrichedNames = new Set(companyCards.map(c => (c.name || '').toLowerCase().trim()));
-      const remaining = rawCards
+      const remaining = allRawCards
         .filter(c => !enrichedNames.has((c.name || '').toLowerCase().trim()))
         .map(c => ({ ...c, _score: 0, _raw: true }));
       allResults = [...companyCards, ...remaining];
