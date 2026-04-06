@@ -2394,7 +2394,7 @@ app.post('/api/autoscan', async (req, res) => {
           profileName: _profile?.name || 'Scan',
           funnel: data.funnel || {},
           topCompanies: allScored.map(c => ({ name: c.name, score: c._score || c.score || 0, logo_url: c.logo_url || null, description: (c.description || '').slice(0, 200), id: c.id || null, website: c.website || null, funding_total: c.funding_total || 0, funding_stage: c.funding_stage || null })),
-          analysis: (data.analysis || '').slice(0, 5000),
+          analysis: (data.analysis || '').slice(0, 20000),
           savedSearchMeta: data.savedSearchMeta || null,
           totalResults: (data.results || []).length,
           timestamp: Date.now(),
