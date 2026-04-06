@@ -1642,16 +1642,28 @@ app.post('/api/vetting/backburn', (req, res) => {
   if (!companyName) return res.status(400).json({ error: 'companyName required' });
 
   const data = loadVetting();
-  const company = data.companies.find(c => (c.name || '').toLowerCase() === companyName.toLowerCase());
-  if (!company) return res.status(404).json({ error: 'Company not found' });
+  const companyIdx = data.companies.findIndex(c => (c.name || '').toLowerCase() === companyName.toLowerCase());
+  if (companyIdx === -1) return res.status(404).json({ error: 'Company not found' });
 
-  company.dismissed = true;
-  company.backburned = true;
-  company.backburnedAt = Date.now();
-  company.backburnedBy = personId || 'unknown';
+  // Fully remove from DD pipeline — backburn means gone for everyone
+  const removed = data.companies.splice(companyIdx, 1)[0];
   saveVetting(data);
-  console.log(`[Vetting] "${companyName}" backburned by ${personId || 'unknown'}`);
-  res.json({ success: true });
+
+  // Also mark as seen/dismissed so it doesn't re-import on future scans
+  try {
+    const seenData = loadSeen();
+    const companyId = String(removed.id || removed.name);
+    const PARTNERS = ['mark', 'joe', 'liam', 'carlo', 'jake'];
+    PARTNERS.forEach(p => {
+      const existing = new Set(seenData[p] || []);
+      existing.add(companyId);
+      seenData[p] = [...existing].slice(-5000);
+    });
+    saveSeen(seenData);
+  } catch (e) {}
+
+  console.log(`[Vetting] "${companyName}" backburned + removed from DD by ${personId || 'unknown'}`);
+  res.json({ success: true, removed: true });
 });
 
 // Hide a company for a specific user only (doesn't affect others)
@@ -3062,8 +3074,15 @@ ${batchText}`;
   const scoreMap = {};
   const passSet = new Set();
 
-  if (opusCandidates.length === 0) {
-    console.log('[AutoScan] No companies passed Sonnet filter — skipping deep scoring');
+  if (opusCandidates.length === 0 && companyCards.length > 0) {
+    // Sonnet filtered everyone out — force top enriched companies through to Opus for scoring
+    // This ensures DD always gets candidates from scans that have enriched results
+    const forceCount = Math.min(companyCards.length, 10);
+    console.log(`[AutoScan] Sonnet passed 0 — forcing top ${forceCount} enriched companies to Opus for scoring`);
+    safeWrite(`: Sonnet filtered all — forcing top ${forceCount} to deep scoring\n\n`);
+    opusCandidates.push(...companyCards.slice(0, forceCount));
+  } else if (opusCandidates.length === 0) {
+    console.log('[AutoScan] No companies passed Sonnet filter and no enriched cards — skipping deep scoring');
   }
 
   for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
