@@ -2184,11 +2184,21 @@ function profileToQueries(profile, mode = 'daily') {
 // Check scan status (is a scan running? what were the last results?)
 app.get('/api/autoscan/status/:personId?', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  // Auto-clear stale "scanning" statuses older than 30 min
+  // Auto-clear stale "scanning" statuses older than 15 min
   const now = Date.now();
   for (const [pid, s] of Object.entries(global._scanStatus || {})) {
-    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 10 * 60 * 1000) {
+    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 15 * 60 * 1000) {
       console.log(`[AutoScan] Clearing stale scanning status for ${pid} (started ${Math.round((now - s.startedAt)/60000)}min ago)`);
+      // Check if results exist on disk before clearing — scan may have finished but status wasn't updated
+      try {
+        const resultsFile = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'last_scan_results.json');
+        const allResults = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
+        if (allResults[pid] && allResults[pid].timestamp > s.startedAt) {
+          console.log(`[AutoScan] Found results on disk for ${pid}, marking as done instead of idle`);
+          global._scanStatus[pid] = { status: 'done', finishedAt: allResults[pid].timestamp, profileName: allResults[pid].profileName || 'Scan' };
+          continue;
+        }
+      } catch (e) { /* no results file */ }
       global._scanStatus[pid] = { status: 'idle' };
     }
   }
