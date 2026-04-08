@@ -7198,12 +7198,14 @@ ${batchText}`;
             }
           }
 
-          // Stream some verdicts
-          const lines = sText.split('\n').filter(l => l.includes('PASS') || l.includes('CUT')).slice(0, 6);
+          // Stream all verdicts with reasons
+          const lines = sText.split('\n').filter(l => l.includes('PASS') || l.includes('CUT'));
           for (const line of lines) {
             const isPASS = line.includes('PASS');
-            const compName = line.split(/\s*[—\-–]\s*/)[0].replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').trim().slice(0, 30);
-            if (compName.length > 2) safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName}\n\n`);
+            const parts = line.split(/\s*[—\-–]\s*/);
+            const compName = (parts[0] || '').replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').trim().slice(0, 35);
+            const reason = (parts[2] || '').trim().slice(0, 60);
+            if (compName.length > 2) safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName}${reason ? ' — ' + reason : ''}\n\n`);
           }
         }
       } catch (e) {
@@ -7376,12 +7378,19 @@ ${batchText}`;
             if (score >= 7) screenPassNames.add(name.toLowerCase());
           }
 
-          // Stream top scores
-          const highScores = sText.split('\n').filter(l => /Score:\s*[789]|Score:\s*10/i.test(l)).slice(0, 4);
-          for (const line of highScores) {
+          // Stream all scored companies
+          const scoreLines = sText.split(/\n/).filter(l => /Score:\s*\d+/i.test(l));
+          for (const line of scoreLines) {
             const cn = (line.match(/\*\*([^*]+)\*\*/) || [])[1] || '';
-            const sc = (line.match(/Score:\s*(\d+)/i) || [])[1] || '';
-            if (cn) safeWrite(`: 🏆 ${cn} — ${sc}/10\n\n`);
+            const sc = parseInt((line.match(/Score:\s*(\d+)/i) || [])[1] || '0');
+            if (!cn) continue;
+            // Find the reason line (next line after score)
+            const reasonIdx = sText.indexOf(line);
+            const afterScore = sText.slice(reasonIdx + line.length, reasonIdx + line.length + 200);
+            const reasonMatch = afterScore.match(/Reason:\s*([^\n]+)/i);
+            const reason = reasonMatch ? reasonMatch[1].trim().slice(0, 80) : '';
+            const emoji = sc >= 9 ? '🌟' : sc >= 7 ? '🏆' : sc >= 5 ? '📊' : '📉';
+            safeWrite(`: ${emoji} ${cn} — ${sc}/10${reason ? ' — ' + reason : ''}\n\n`);
           }
         }
       } catch (e) {
@@ -7496,7 +7505,16 @@ ${batchText}`;
                 _sourceSearch: card?._sourceSearch || '',
               });
 
-              safeWrite(`: ${score >= 9 ? '🌟' : score >= 7 ? '⭐' : '📋'} ${companyName} — ${score}/10 (${confidence})\n\n`);
+              // Extract key signal for streaming
+              const keySignal = (section.match(/\*\*Key Signal\*\*:\s*([^\n]+)/i) || [])[1] || '';
+              const riskFlag = (section.match(/\*\*Risk\*\*:\s*([^\n]+)/i) || [])[1] || '';
+              const emoji = score >= 9 ? '🌟' : score >= 7 ? '⭐' : '📋';
+              let detail = `${emoji} ${companyName} — ${score}/10 (${confidence})`;
+              if (card?.funding_stage) detail += ` · ${card.funding_stage}`;
+              if (card?.funding_total) detail += ` · $${card.funding_total >= 1e6 ? (card.funding_total/1e6).toFixed(1)+'M' : (card.funding_total/1e3).toFixed(0)+'K'}`;
+              if (keySignal) detail += `\n:    💡 ${keySignal.slice(0, 100)}`;
+              if (riskFlag && score >= 7) detail += `\n:    ⚠️ ${riskFlag.slice(0, 80)}`;
+              safeWrite(`: ${detail}\n\n`);
             }
           }
         }
