@@ -7056,9 +7056,37 @@ app.post('/api/recurring-scan', async (req, res) => {
   const includePortcos = bodyData.includePortcos || false;
   const crmStages = bodyData.crmStages || [];
   const keywords = bodyData.keywords || '';
+  const excludeKeywords = bodyData.excludeKeywords || '';
+  const filterSectors = bodyData.sectors || [];
+  const filterStages = bodyData.stages || [];
+  const filterGeos = bodyData.geos || [];
+  const filterModels = bodyData.models || [];
+  const filterSignals = bodyData.signals || [];
+  const filterMaxRaised = bodyData.maxRaised || '';
+  const filterMaxValuation = bodyData.maxValuation || '';
+  const filterFoundedAfter = bodyData.foundedAfter || '';
+  const filterMinTeam = bodyData.minTeam || '';
+  const filterMaxTeam = bodyData.maxTeam || '';
+  const filterNotes = bodyData.notes || '';
   const selectedSearchIds = (bodyData.selectedSearches || []).map(String);
   const selectedPortcos = bodyData.selectedPortcos || null; // null = all, [] = none
   const scanUser = bodyData.user || 'Mark';
+
+  // Build filter context string for AI prompts
+  const filterParts = [];
+  if (filterSectors.length > 0) filterParts.push(`TARGET SECTORS: ${filterSectors.join(', ')}`);
+  if (filterStages.length > 0) filterParts.push(`TARGET STAGES: ${filterStages.join(', ')}`);
+  if (filterGeos.length > 0) filterParts.push(`TARGET GEOGRAPHY: ${filterGeos.join(', ')}`);
+  if (filterModels.length > 0) filterParts.push(`BUSINESS MODELS: ${filterModels.join(', ')}`);
+  if (filterSignals.length > 0) filterParts.push(`LOOK FOR SIGNALS: ${filterSignals.join(', ')}`);
+  if (filterMaxRaised) filterParts.push(`MAX RAISED: ${filterMaxRaised}`);
+  if (filterMaxValuation) filterParts.push(`MAX VALUATION: ${filterMaxValuation}`);
+  if (filterFoundedAfter) filterParts.push(`FOUNDED AFTER: ${filterFoundedAfter}`);
+  if (filterMinTeam) filterParts.push(`MIN TEAM SIZE: ${filterMinTeam}`);
+  if (filterMaxTeam) filterParts.push(`MAX TEAM SIZE: ${filterMaxTeam}`);
+  if (excludeKeywords) filterParts.push(`EXCLUDE companies matching: ${excludeKeywords}`);
+  if (filterNotes) filterParts.push(`SPECIAL INSTRUCTIONS: ${filterNotes}`);
+  const filterContext = filterParts.length > 0 ? '\n\nUSER SEARCH CRITERIA:\n' + filterParts.join('\n') : '';
 
   if (!anthropicKey) {
     safeWrite(`data: ${JSON.stringify({ error: 'Anthropic API key required' })}\n\n`);
@@ -7177,10 +7205,18 @@ app.post('/api/recurring-scan', async (req, res) => {
     const seenIds = new Set();
     const seenSet = new Set();
 
+    // Only filter companies dismissed by THIS user, not all users
     try {
       const SEEN_FILE = path.join(SCAN_VOLUME, 'autoscan_seen.json');
       const seenData = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
-      Object.values(seenData).forEach(arr => { if (Array.isArray(arr)) arr.forEach(id => seenSet.add(String(id))); });
+      const userKey = (scanUser || 'Mark').toLowerCase();
+      // Find this user's dismissed list (check exact match and lowercase)
+      for (const [k, arr] of Object.entries(seenData)) {
+        if (k === '_version') continue;
+        if (k.toLowerCase() === userKey && Array.isArray(arr)) {
+          arr.forEach(id => seenSet.add(String(id)));
+        }
+      }
     } catch (e) {}
 
     for (let si = 0; si < searchesToProcess.length; si++) {
@@ -7241,6 +7277,51 @@ app.post('/api/recurring-scan', async (req, res) => {
     scan.stats.seenFiltered = seenSet.size;
     safeWrite(`: 📊 Total unique companies: ${allCompanies.length} from ${searchesToProcess.length} searches (${seenSet.size} previously seen excluded)\n\n`);
     console.log(`[DeepScan ${scanId}] Total unique companies: ${allCompanies.length} (${seenSet.size} seen excluded)`);
+
+    // ═══════════════════════════════════════════════
+    // PHASE 2b: Pre-filter by numeric criteria (saves AI tokens)
+    // ═══════════════════════════════════════════════
+    const preFilterCount = allCompanies.length;
+    function parseAmount(str) {
+      if (!str) return null;
+      const cleaned = str.replace(/[,$\s]/g, '').toUpperCase();
+      const m = cleaned.match(/^(\d+(?:\.\d+)?)(M|K|B)?$/);
+      if (!m) return null;
+      const n = parseFloat(m[1]);
+      if (m[2] === 'B') return n * 1e9;
+      if (m[2] === 'M') return n * 1e6;
+      if (m[2] === 'K') return n * 1e3;
+      return n;
+    }
+    const maxRaisedNum = parseAmount(filterMaxRaised);
+    const foundedAfterNum = filterFoundedAfter ? parseInt(filterFoundedAfter) : null;
+    const minTeamNum = filterMinTeam ? parseInt(filterMinTeam) : null;
+    const maxTeamNum = filterMaxTeam ? parseInt(filterMaxTeam) : null;
+
+    if (maxRaisedNum || foundedAfterNum || minTeamNum || maxTeamNum || excludeKeywords) {
+      const exKw = excludeKeywords ? excludeKeywords.split(',').map(k => k.trim().toLowerCase()).filter(Boolean) : [];
+      for (let i = allCompanies.length - 1; i >= 0; i--) {
+        const c = allCompanies[i];
+        let cut = false;
+        if (maxRaisedNum && c.funding_total && c.funding_total > maxRaisedNum) cut = true;
+        if (foundedAfterNum) {
+          const yr = parseInt(c.founded_date || c.founded || '0');
+          if (yr > 0 && yr < foundedAfterNum) cut = true;
+        }
+        if (minTeamNum && c.headcount && c.headcount < minTeamNum) cut = true;
+        if (maxTeamNum && c.headcount && c.headcount > maxTeamNum) cut = true;
+        if (exKw.length > 0) {
+          const txt = ((c.name || '') + ' ' + (c.description || '')).toLowerCase();
+          if (exKw.some(k => txt.includes(k))) cut = true;
+        }
+        if (cut) allCompanies.splice(i, 1);
+      }
+      const removed = preFilterCount - allCompanies.length;
+      if (removed > 0) {
+        scan.stats.preFiltered = removed;
+        safeWrite(`: 🔢 Pre-filtered ${removed} companies by numeric/keyword criteria (${allCompanies.length} remaining)\n\n`);
+      }
+    }
 
     if (scan._cancelled) throw new Error('Cancelled');
 
@@ -7323,6 +7404,7 @@ AUTO-CUT:
 - No website and no traction signals
 
 TARGET: Pass ~8-12% ONLY. Be extremely selective. Wrong sector = CUT even if great company.
+${filterContext}
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
@@ -7532,6 +7614,7 @@ FORMAT (one per company):
 Reason: [2-3 sentences — focus on: sector fit, traction evidence, founder signal, stage fit]
 
 BE HARSH. Most companies should score 3-6. A 7+ is genuinely exciting for Daxos.
+${filterContext}
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
@@ -7658,6 +7741,7 @@ FORMAT:
 **Risk**: [primary concern]
 
 DO NOT inflate scores. We are a THESIS-DRIVEN fund, not a generalist. Non-thesis companies USUALLY score 5-6, BUT can score 7-8 if they show genuinely exceptional signals: explosive traction metrics (10x growth, thousands of users at minimal funding), elite founders (ex-CTO of unicorn, serial exiter), or measurable revenue growth that speaks for itself. The quality bar for a non-thesis 7+ is much higher than for thesis-fit companies.
+${filterContext}
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
@@ -7781,7 +7865,7 @@ ${batchText}`;
       timestamp: new Date().toISOString(),
       duration: Math.round((Date.now() - scan.startedAt) / 1000),
       tier: { key: tierKey, name: tier.name, cost: tier.cost, ddPush: tier.ddPush },
-      options: { includePortcos, crmStages, keywords },
+      options: { includePortcos, crmStages, keywords, excludeKeywords, sectors: filterSectors, stages: filterStages, geos: filterGeos, models: filterModels, signals: filterSignals, maxRaised: filterMaxRaised, foundedAfter: filterFoundedAfter, notes: filterNotes },
     };
 
     const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
