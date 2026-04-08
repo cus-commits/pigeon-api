@@ -385,7 +385,7 @@ Keep responses mobile-friendly — short paragraphs, no walls of text. Lead with
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-harmonic-key', 'x-anthropic-key', 'x-scan-tier'],
+  allowedHeaders: ['Content-Type', 'x-harmonic-key', 'x-anthropic-key'],
 }));
 app.use(express.json({ limit: '5mb' }));
 
@@ -436,7 +436,7 @@ app.post('/api/validate-key', async (req, res) => {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
+          model: 'claude-sonnet-4-20250514',
           max_tokens: 10,
           messages: [{ role: 'user', content: 'hi' }],
         }),
@@ -1642,28 +1642,16 @@ app.post('/api/vetting/backburn', (req, res) => {
   if (!companyName) return res.status(400).json({ error: 'companyName required' });
 
   const data = loadVetting();
-  const companyIdx = data.companies.findIndex(c => (c.name || '').toLowerCase() === companyName.toLowerCase());
-  if (companyIdx === -1) return res.status(404).json({ error: 'Company not found' });
+  const company = data.companies.find(c => (c.name || '').toLowerCase() === companyName.toLowerCase());
+  if (!company) return res.status(404).json({ error: 'Company not found' });
 
-  // Fully remove from DD pipeline — backburn means gone for everyone
-  const removed = data.companies.splice(companyIdx, 1)[0];
+  company.dismissed = true;
+  company.backburned = true;
+  company.backburnedAt = Date.now();
+  company.backburnedBy = personId || 'unknown';
   saveVetting(data);
-
-  // Also mark as seen/dismissed so it doesn't re-import on future scans
-  try {
-    const seenData = loadSeen();
-    const companyId = String(removed.id || removed.name);
-    const PARTNERS = ['mark', 'joe', 'liam', 'carlo', 'jake'];
-    PARTNERS.forEach(p => {
-      const existing = new Set(seenData[p] || []);
-      existing.add(companyId);
-      seenData[p] = [...existing].slice(-5000);
-    });
-    saveSeen(seenData);
-  } catch (e) {}
-
-  console.log(`[Vetting] "${companyName}" backburned + removed from DD by ${personId || 'unknown'}`);
-  res.json({ success: true, removed: true });
+  console.log(`[Vetting] "${companyName}" backburned by ${personId || 'unknown'}`);
+  res.json({ success: true });
 });
 
 // Hide a company for a specific user only (doesn't affect others)
@@ -2184,21 +2172,11 @@ function profileToQueries(profile, mode = 'daily') {
 // Check scan status (is a scan running? what were the last results?)
 app.get('/api/autoscan/status/:personId?', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  // Auto-clear stale "scanning" statuses older than 15 min
+  // Auto-clear stale "scanning" statuses older than 30 min
   const now = Date.now();
   for (const [pid, s] of Object.entries(global._scanStatus || {})) {
-    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 15 * 60 * 1000) {
+    if (s.status === 'scanning' && s.startedAt && (now - s.startedAt) > 10 * 60 * 1000) {
       console.log(`[AutoScan] Clearing stale scanning status for ${pid} (started ${Math.round((now - s.startedAt)/60000)}min ago)`);
-      // Check if results exist on disk before clearing — scan may have finished but status wasn't updated
-      try {
-        const resultsFile = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'last_scan_results.json');
-        const allResults = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
-        if (allResults[pid] && allResults[pid].timestamp > s.startedAt) {
-          console.log(`[AutoScan] Found results on disk for ${pid}, marking as done instead of idle`);
-          global._scanStatus[pid] = { status: 'done', finishedAt: allResults[pid].timestamp, profileName: allResults[pid].profileName || 'Scan' };
-          continue;
-        }
-      } catch (e) { /* no results file */ }
       global._scanStatus[pid] = { status: 'idle' };
     }
   }
@@ -2371,16 +2349,9 @@ app.post('/api/autoscan', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders(); // CRITICAL: sends headers immediately to establish CORS
 
-  // Track client connection state — scan continues even if client disconnects
-  let clientConnected = true;
-  req.on('close', () => { clientConnected = false; console.log(`[AutoScan] Client disconnected — scan continues server-side`); });
-
-  // Safe write — ignores errors if client disconnected
-  const safeWrite = (data) => { if (clientConnected) try { res.write(data); } catch (e) {} };
-
   // Helper to send keepalive pings
   const keepAlive = setInterval(() => {
-    safeWrite(': keepalive\n\n');
+    res.write(': keepalive\n\n');
   }, 5000);
 
   // Track active scan status in memory (survives tab close)
@@ -2392,7 +2363,7 @@ app.post('/api/autoscan', async (req, res) => {
 
   const sendResult = (data) => {
     clearInterval(keepAlive);
-    // Save result server-side FIRST — persists even if client disconnected
+    // Save result server-side so it persists even if client disconnects
     if (_personId) {
       try {
         const resultsFile = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'last_scan_results.json');
@@ -2400,7 +2371,7 @@ app.post('/api/autoscan', async (req, res) => {
         try { allResults = JSON.parse(fs.readFileSync(resultsFile, 'utf8')); } catch (e) {}
         allResults[_personId] = {
           ...data,
-          results: (data.results || []).slice(0, 300),
+          results: (data.results || []).slice(0, 100),
           timestamp: Date.now(),
           profileName: _profile?.name || 'Scan',
         };
@@ -2410,23 +2381,21 @@ app.post('/api/autoscan', async (req, res) => {
       // Auto-save to server-side scan history
       try {
         const hist = loadScanHistory();
-        const allScored = (data.results || []).filter(c => (c._score || c.score || 0) > 0).sort((a,b) => (b._score||b.score||0) - (a._score||a.score||0));
+        const topCompanies = (data.results || []).filter(c => (c._score || c.score || 0) > 0).sort((a,b) => (b._score||b.score||0) - (a._score||a.score||0)).slice(0, 10);
         hist.unshift({
           personId: _personId,
           profileName: _profile?.name || 'Scan',
           funnel: data.funnel || {},
-          topCompanies: allScored.map(c => ({ name: c.name, score: c._score || c.score || 0, logo_url: c.logo_url || null, description: (c.description || '').slice(0, 200), id: c.id || null, website: c.website || null, funding_total: c.funding_total || 0, funding_stage: c.funding_stage || null })),
-          analysis: (data.analysis || '').slice(0, 20000),
-          savedSearchMeta: data.savedSearchMeta || null,
+          topCompanies: topCompanies.map(c => ({ name: c.name, score: c._score || c.score || 0 })),
           totalResults: (data.results || []).length,
           timestamp: Date.now(),
         });
         saveScanHistory(hist);
-        console.log(`[ScanHistory] Saved scan for ${_personId}: ${(data.results||[]).length} results, ${allScored.length} scored`);
+        console.log(`[ScanHistory] Saved scan for ${_personId}: ${(data.results||[]).length} results, ${topCompanies.length} scored`);
       } catch(e) { console.error('[ScanHistory] Save error:', e.message); }
     }
-    safeWrite(`data: ${JSON.stringify(data)}\n\n`);
-    if (clientConnected) try { res.end(); } catch (e) {}
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    res.end();
   };
 
   try {
@@ -2478,7 +2447,6 @@ app.post('/api/autoscan', async (req, res) => {
   let queries = [];
   let categoryMap = {}; // company ID → source category (for savedSearch mode)
   let savedSearchMeta = null; // metadata about saved search scan
-  let allRawCards = []; // ALL raw companies from saved search (for progressive browsing)
 
   if (profile.scanMode === 'savedSearch' && profile.savedSearchIds?.length > 0) {
     // === SAVED SEARCH MODE ===
@@ -2523,9 +2491,6 @@ app.post('/api/autoscan', async (req, res) => {
       _isStealth: (c.name || '').toLowerCase().startsWith('stealth company'),
     }));
     
-    // Save all raw cards for progressive browsing (before any filtering)
-    allRawCards = [...rawCards];
-
     // Sort: $10M+ funding to the back, stealth to the back, lowest funding first
     rawCards.sort((a, b) => {
       const aOver10M = (a.funding_total || 0) > 10000000;
@@ -2544,11 +2509,11 @@ app.post('/api/autoscan', async (req, res) => {
     if (prescreenCap && rawCards.length > prescreenCap) {
       prescreenCards = rawCards.slice(0, prescreenCap);
       console.log(`[AutoScan] Tier ${profile.scanTier}: pre-screen capped at ${prescreenCap} (skipping ${rawCards.length - prescreenCap})`);
-      safeWrite(`: Tier ${profile.scanTier}: screening ${prescreenCap} of ${rawCards.length} companies (${rawCards.length - prescreenCap} skipped)\n\n`);
+      res.write(`: Tier ${profile.scanTier}: screening ${prescreenCap} of ${rawCards.length} companies (${rawCards.length - prescreenCap} skipped)\n\n`);
     }
     
     console.log(`[AutoScan] PRE-ENRICH SONNET: Screening ${prescreenCards.length} raw companies...`);
-    safeWrite(`: Screening ${prescreenCards.length} companies with Sonnet (before enrichment)...\n\n`);
+    res.write(`: Screening ${prescreenCards.length} companies with Sonnet (before enrichment)...\n\n`);
     updateProgress(`Screening ${prescreenCards.length} companies with Sonnet`, "prescreen");
 
     // Build category map for all companies
@@ -2595,7 +2560,7 @@ COMPANIES:
 ${batchText}`;
 
       try {
-        safeWrite(`: Sonnet pre-screen batch ${si + 1}/${Math.ceil(prescreenCards.length / SONNET_PRESCREEN_BATCH)} — ${prescreenPassIds.size} passed so far\n\n`);
+        res.write(`: Sonnet pre-screen batch ${si + 1}/${Math.ceil(prescreenCards.length / SONNET_PRESCREEN_BATCH)} — ${prescreenPassIds.size} passed so far\n\n`);
         const sRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
@@ -2626,7 +2591,7 @@ ${batchText}`;
             const compName = line.split(/\s*[—\-–]\s*/)[0].replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').trim().slice(0, 30);
             const reason = line.split(/\s*[—\-–]\s*/).slice(2).join(' ').trim().slice(0, 50);
             const fun = isPASS ? funPasses[Math.floor(Math.random() * funPasses.length)] : funCuts[Math.floor(Math.random() * funCuts.length)];
-            if (compName.length > 2) safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
+            if (compName.length > 2) res.write(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
           }
           
           console.log(`[AutoScan] Pre-screen batch ${si + 1}: ${batch.length} screened, ${prescreenPassIds.size} total passed`);
@@ -2644,7 +2609,7 @@ ${batchText}`;
     }
     
     console.log(`[AutoScan] PRE-SCREEN COMPLETE: ${prescreenCards.length} → ${prescreenPassIds.size} passed (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%)`);
-    safeWrite(`: Pre-screen done — ${prescreenPassIds.size} of ${prescreenCards.length} survived (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%) — enriching ${companyIds.length} companies...\n\n`);
+    res.write(`: Pre-screen done — ${prescreenPassIds.size} of ${prescreenCards.length} survived (${((prescreenPassIds.size / prescreenCards.length) * 100).toFixed(0)}%) — enriching ${companyIds.length} companies...\n\n`);
     updateProgress(`Enriching ${companyIds.length} companies via Harmonic`, "enrich");
     
     // Only enrich the Sonnet survivors
@@ -2707,7 +2672,7 @@ ${batchText}`;
       const gqlBatch = await gqlEnrichCompanies(batch, authHeaders.apikey);
       fullCompanies.push(...gqlBatch.map(c => gqlToCard(c)));
       console.log(`[AutoScan] GQL batch ${Math.floor(i/GQL_BATCH_SIZE)+1}: enriched ${gqlBatch.length} (total: ${fullCompanies.length})`);
-      safeWrite(`: Enriching ${fullCompanies.length}/${companyIds.length} companies...\n\n`);
+      res.write(`: Enriching ${fullCompanies.length}/${companyIds.length} companies...\n\n`);
     } catch (e) {
       console.error(`[AutoScan] GQL batch error:`, e.message);
     }
@@ -2829,7 +2794,7 @@ ${batchText}`;
     const isVCFund = VC_FUND_KEYWORDS.some(kw => text.includes(kw));
     if (isVCFund) {
       console.log(`[AutoScan] VC/Fund filter: CUT "${c.name}" — matches fund keyword`);
-      safeWrite(`: 🏦 CUT "${c.name}" — this is a fund, not a startup\n\n`);
+      res.write(`: 🏦 CUT "${c.name}" — this is a fund, not a startup\n\n`);
     }
     return !isVCFund;
   });
@@ -2866,7 +2831,7 @@ ${batchText}`;
   });
 
   console.log(`[AutoScan] Pre-filtered to ${preFiltered.length} companies (stealth companies pushed to back)`);
-  safeWrite(`: Filtering ${preFiltered.length} enriched companies (removed ${fullCompanies.length - preFiltered.length})...\n\n`);
+  res.write(`: Filtering ${preFiltered.length} enriched companies (removed ${fullCompanies.length - preFiltered.length})...\n\n`);
 
   const companyCards = preFiltered;
 
@@ -2992,7 +2957,7 @@ COMPANIES:
 ${batchText}`;
 
     try {
-      safeWrite(`: Sonnet screening batch ${si + 1}/${sonnetBatches} — ${sonnetPassNames.size} passed so far\n\n`);
+      res.write(`: Sonnet screening batch ${si + 1}/${sonnetBatches} — ${sonnetPassNames.size} passed so far\n\n`);
       const sRes = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
@@ -3025,7 +2990,7 @@ ${batchText}`;
           const reason = line.split(/\s*[—\-–]\s*/).slice(2).join(' ').trim().slice(0, 50);
           const fun = isPASS ? funPasses[Math.floor(Math.random() * funPasses.length)] : funCuts[Math.floor(Math.random() * funCuts.length)];
           if (compName.length > 2) {
-            safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
+            res.write(`: ${isPASS ? '✅' : '❌'} ${compName} — ${reason || fun}\n\n`);
           }
         }
         
@@ -3064,7 +3029,7 @@ ${batchText}`;
   };
   const tierCfg = TIER_CONFIG[scanTier] || TIER_CONFIG.full;
   console.log(`[AutoScan] Scan tier: ${scanTier} — Opus cap: ${tierCfg.opusCap}, Sonnet rerank: ${tierCfg.sonnetRerank}`);
-  safeWrite(`: Sonnet complete — ${opusCandidates.length} passed (${((opusCandidates.length / companyCards.length) * 100).toFixed(0)}%) — ${tierCfg.useOpus ? 'starting Opus...' : 'Sonnet deep scoring...'}\n\n`);
+  res.write(`: Sonnet complete — ${opusCandidates.length} passed (${((opusCandidates.length / companyCards.length) * 100).toFixed(0)}%) — ${tierCfg.useOpus ? 'starting Opus...' : 'Sonnet deep scoring...'}\n\n`);
     updateProgress(`Sonnet done — ${opusCandidates.length} passed — starting deep scoring`, "deepscore");
   
   // Cap Opus candidates based on tier
@@ -3084,15 +3049,8 @@ ${batchText}`;
   const scoreMap = {};
   const passSet = new Set();
 
-  if (opusCandidates.length === 0 && companyCards.length > 0) {
-    // Sonnet filtered everyone out — force top enriched companies through to Opus for scoring
-    // This ensures DD always gets candidates from scans that have enriched results
-    const forceCount = Math.min(companyCards.length, 10);
-    console.log(`[AutoScan] Sonnet passed 0 — forcing top ${forceCount} enriched companies to Opus for scoring`);
-    safeWrite(`: Sonnet filtered all — forcing top ${forceCount} to deep scoring\n\n`);
-    opusCandidates.push(...companyCards.slice(0, forceCount));
-  } else if (opusCandidates.length === 0) {
-    console.log('[AutoScan] No companies passed Sonnet filter and no enriched cards — skipping deep scoring');
+  if (opusCandidates.length === 0) {
+    console.log('[AutoScan] No companies passed Sonnet filter — skipping deep scoring');
   }
 
   for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
@@ -3153,7 +3111,7 @@ ${batchDataText}`;
     try {
       const modelLabel = tierCfg.useOpus ? 'Opus' : 'Sonnet';
       console.log(`[AutoScan] ${modelLabel} batch ${batchIdx + 1}/${totalBatches}: scoring ${batchCards.length} companies...`);
-      safeWrite(`: ${modelLabel} deep scoring batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(scoreMap).length} scored\n\n`);
+      res.write(`: ${modelLabel} deep scoring batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(scoreMap).length} scored\n\n`);
       updateProgress(`Deep scoring batch ${batchIdx + 1}/${totalBatches}`, "deepscore");
 
       const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -3220,7 +3178,7 @@ ${batchDataText}`;
       for (const [name, score] of scoredEntries) {
         const emoji = scoreEmojis[Math.min(score, 10)] || '🤔';
         const displayName = name.charAt(0).toUpperCase() + name.slice(1);
-        safeWrite(`: ${emoji} ${displayName} — scored ${score}/10\n\n`);
+        res.write(`: ${emoji} ${displayName} — scored ${score}/10\n\n`);
       }
     } catch (e) {
       console.error(`[AutoScan] Opus batch ${batchIdx + 1} exception:`, e.message);
@@ -3473,20 +3431,8 @@ ${batchDataText}`;
     // This way the same search re-ranks the full pool every time,
     // minus companies already in DD or manually dismissed (✕)
 
-    // Merge remaining raw cards into results so ALL companies are browsable
-    // Enriched/scored companies come first, then remaining raw cards sorted by funding
-    let allResults = [...companyCards];
-    if (isSavedSearchMode && allRawCards.length > 0) {
-      const enrichedNames = new Set(companyCards.map(c => (c.name || '').toLowerCase().trim()));
-      const remaining = allRawCards
-        .filter(c => !enrichedNames.has((c.name || '').toLowerCase().trim()))
-        .map(c => ({ ...c, _score: 0, _raw: true }));
-      allResults = [...companyCards, ...remaining];
-      console.log(`[AutoScan] Merged results: ${companyCards.length} enriched + ${remaining.length} raw = ${allResults.length} total`);
-    }
-
     return sendResult({
-      results: allResults,
+      results: companyCards,
       analysis,
       queriesUsed: isSavedSearchMode ? profile.savedSearchIds.map(s => s.name) : queries,
       savedSearchMeta: savedSearchMeta || null,
@@ -6843,954 +6789,6 @@ app.post('/api/twitter/check-activity', async (req, res) => {
   res.json({ results });
 });
 
-// ==========================================
-// DEEP SCAN AGENT — Concurrent deep scans
-// ==========================================
-
-const SCAN_VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp';
-const SCANS_STATE_FILE = path.join(SCAN_VOLUME, 'deep_scans_state.json');
-
-function loadScansState() {
-  try {
-    const data = JSON.parse(fs.readFileSync(SCANS_STATE_FILE, 'utf8'));
-    for (const id of Object.keys(data)) {
-      if (data[id].status === 'scanning') {
-        data[id].status = 'interrupted';
-        data[id].progress = `Interrupted (server restarted) — was at: ${data[id].progress || 'unknown phase'}`;
-      }
-    }
-    return data;
-  } catch {
-    // Migrate from old single-scan format
-    try {
-      const old = JSON.parse(fs.readFileSync(path.join(SCAN_VOLUME, 'recurring_scan_state.json'), 'utf8'));
-      if (old && old.status && old.status !== 'idle') {
-        const id = (old.startedAt || Date.now()).toString(36);
-        if (old.status === 'scanning') { old.status = 'interrupted'; old.progress = `Interrupted — was at: ${old.progress || 'unknown'}`; }
-        old.id = id; old.user = old.user || 'Mark';
-        return { [id]: old };
-      }
-    } catch {}
-    return {};
-  }
-}
-
-function saveScansState() {
-  try {
-    const toSave = {};
-    for (const [id, s] of Object.entries(global._deepScans || {})) {
-      toSave[id] = { id: s.id, status: s.status, progress: s.progress, stats: { ...(s.stats || {}) }, startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark', options: s.options };
-    }
-    fs.writeFileSync(SCANS_STATE_FILE, JSON.stringify(toSave));
-  } catch (e) {}
-}
-
-if (!global._deepScans) {
-  global._deepScans = loadScansState();
-  if (Object.keys(global._deepScans).length > 0) saveScansState();
-}
-
-function cleanupOldScans() {
-  const completed = Object.values(global._deepScans).filter(s => s.status !== 'scanning').sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
-  for (const s of completed.slice(8)) delete global._deepScans[s.id];
-  saveScansState();
-}
-
-const SCAN_TIERS = {
-  scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   ddPush: 2,  preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 10,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet top 200 → Sonnet deep 10 → top 2 to DD' },
-  standard: { name: 'Standard',      cost: '$12', budget: 12,  ddPush: 5,  preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 15,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet top 200 → Opus deep 15 → top 5 to DD' },
-  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 8,  preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 40,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet top 500 → Opus deep 40 → top 8 to DD' },
-  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 12, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 60,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet full scoring → Opus deep 60 → top 12 to DD' },
-  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 20, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 100, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep 100 → top 20 to DD' },
-};
-
-const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
-function loadScanHistory() { try { return JSON.parse(fs.readFileSync(RECURRING_HISTORY_FILE, 'utf8')); } catch { return []; } }
-function saveScanHistory(history) { try { fs.writeFileSync(RECURRING_HISTORY_FILE, JSON.stringify(history.slice(0, 20), null, 2)); } catch (e) {} }
-
-app.get('/api/recurring-scan/tiers', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(SCAN_TIERS);
-});
-
-app.get('/api/recurring-scan/status', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const scans = Object.values(global._deepScans).map(s => ({
-    id: s.id, status: s.status, progress: s.progress, stats: s.stats || {},
-    startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark',
-  }));
-  res.json({ scans });
-});
-
-const PORTCO_LIST = ['steel.dev','bubblemaps.io','pump.fun','xverse.app','trendex.vip','haloo.ai','hirechain.io','botanixlabs.xyz','pear.garden','lagoon.finance','aura.fun','ord.io','kinddesigns.com','raze.finance','bound.money','worm.wtf','vest.markets'];
-
-app.get('/api/recurring-scan/portcos', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(PORTCO_LIST);
-});
-
-// Search counts cached monthly to disk for cost estimation
-const SEARCH_COUNTS_FILE = path.join(SCAN_VOLUME, 'search_counts.json');
-const COUNTS_CACHE_DAYS = 30;
-function loadSearchCounts() { try { return JSON.parse(fs.readFileSync(SEARCH_COUNTS_FILE, 'utf8')); } catch { return { counts: {}, updatedAt: 0 }; } }
-function saveSearchCounts(data) { try { fs.writeFileSync(SEARCH_COUNTS_FILE, JSON.stringify(data)); } catch {} }
-
-async function refreshSearchCounts(searches, harmonicKey) {
-  const counts = {};
-  const authH = { apikey: harmonicKey, Accept: 'application/json' };
-  for (const s of searches) {
-    try {
-      const r = await fetch(`${HARMONIC_BASE}/savedSearches:results/${s.id}?size=1`, { headers: authH });
-      if (r.ok) {
-        const data = await r.json();
-        const pi = data.page_info || data.pageInfo || {};
-        counts[s.id] = pi.total_count || pi.total || pi.count || (pi.has_next ? 500 : (data.results || data.data || []).length);
-      }
-    } catch {}
-    await sleep(200);
-  }
-  const result = { counts, updatedAt: Date.now() };
-  saveSearchCounts(result);
-  return result;
-}
-
-let _cachedSearches = null;
-let _cachedSearchesAt = 0;
-app.get('/api/recurring-scan/searches', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const harmonicKey = process.env.HARMONIC_API_KEY;
-  if (!harmonicKey) return res.json([]);
-  if (_cachedSearches && Date.now() - _cachedSearchesAt < 300000) return res.json(_cachedSearches);
-  try {
-    const authH = { apikey: harmonicKey, Accept: 'application/json' };
-    const r = await fetch(`${HARMONIC_BASE}/savedSearches`, { headers: authH });
-    if (!r.ok) return res.json([]);
-    const data = await r.json();
-    const searches = (Array.isArray(data) ? data : (data.results || [])).filter(s => {
-      const type = (s.type || '').toUpperCase();
-      return type !== 'PERSONS_LIST' && type !== 'PERSONS' && type !== 'PERSON' && type !== 'PEOPLE';
-    }).map(s => ({ id: String(s.id), name: s.name || s.title || `Search ${s.id}`, type: s.type }));
-
-    // Attach cached counts (refresh in background if stale)
-    const countData = loadSearchCounts();
-    const isStale = !countData.updatedAt || (Date.now() - countData.updatedAt > COUNTS_CACHE_DAYS * 24 * 60 * 60 * 1000);
-    const countsMap = countData.counts || {};
-
-    const result = searches.map(s => ({ ...s, resultCount: countsMap[s.id] || null }));
-    _cachedSearches = result;
-    _cachedSearchesAt = Date.now();
-
-    if (isStale) {
-      // Refresh counts in background (don't block response)
-      refreshSearchCounts(searches, harmonicKey).then(newCounts => {
-        _cachedSearches = searches.map(s => ({ ...s, resultCount: newCounts.counts[s.id] || null }));
-        console.log('[DeepScan] Search counts refreshed:', newCounts.counts);
-      }).catch(e => console.error('[DeepScan] Count refresh error:', e.message));
-    }
-
-    res.json(result);
-  } catch (e) { res.json([]); }
-});
-
-// Batch inspection endpoint — returns batch-level data for a running/completed scan
-app.get('/api/recurring-scan/batches/:scanId', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const scan = global._deepScans[req.params.scanId];
-  if (!scan) return res.json({ batches: [] });
-  res.json({ batches: scan._batches || [] });
-});
-
-app.get('/api/recurring-scan/results', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
-  try {
-    const data = JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf8'));
-    res.json(data);
-  } catch (e) {
-    res.json({ results: [], timestamp: null });
-  }
-});
-
-app.get('/api/recurring-scan/history', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(loadScanHistory());
-});
-
-app.post('/api/recurring-scan/cancel', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const { id } = req.body || {};
-  if (id && global._deepScans[id] && global._deepScans[id].status === 'scanning') {
-    global._deepScans[id]._cancelled = true;
-    global._deepScans[id].status = 'cancelled';
-    global._deepScans[id].progress = 'Cancelled by user';
-  } else if (!id) {
-    for (const s of Object.values(global._deepScans)) {
-      if (s.status === 'scanning') { s._cancelled = true; s.status = 'cancelled'; s.progress = 'Cancelled by user'; }
-    }
-  }
-  saveScansState();
-  res.json({ ok: true });
-});
-
-app.post('/api/recurring-scan', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  let clientConnected = true;
-  req.on('close', () => { clientConnected = false; });
-
-  const safeWrite = (msg) => { try { if (clientConnected) res.write(msg); } catch (e) {} };
-
-  const anthropicKey = req.headers['x-anthropic-key'] || req.body?.anthropicKey;
-  const harmonicKey = process.env.HARMONIC_API_KEY;
-  const tierKey = req.headers['x-scan-tier'] || req.body?.tier || 'standard';
-
-  let bodyData = {};
-  try { if (req.body && typeof req.body === 'object') bodyData = req.body; } catch (e) {}
-  const includePortcos = bodyData.includePortcos || false;
-  const crmStages = bodyData.crmStages || [];
-  const keywords = bodyData.keywords || '';
-  const selectedSearchIds = (bodyData.selectedSearches || []).map(String);
-  const selectedPortcos = bodyData.selectedPortcos || null; // null = all, [] = none
-  const scanUser = bodyData.user || 'Mark';
-
-  if (!anthropicKey) {
-    safeWrite(`data: ${JSON.stringify({ error: 'Anthropic API key required' })}\n\n`);
-    return res.end();
-  }
-
-  const tier = SCAN_TIERS[tierKey] || SCAN_TIERS.standard;
-  const scanId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-
-  const scan = {
-    id: scanId, status: 'scanning', startedAt: Date.now(), _cancelled: false,
-    tier: { key: tierKey, ...tier },
-    stats: { savedSearches: 0, totalCompanies: 0, sonnetPassed: 0, enriched: 0, deepScored: 0, topResults: 0, ddPushed: 0 },
-    progress: `Starting ${tier.name} scan ($${tier.budget} budget)...`,
-    results: null, _batches: [], user: scanUser,
-    options: { includePortcos, crmStages, keywords, selectedSearches: selectedSearchIds },
-  };
-  global._deepScans[scanId] = scan;
-
-  const keepalive = setInterval(() => { safeWrite(': keepalive\n\n'); try { saveScansState(); } catch(e){} }, 5000);
-  safeWrite(`data: ${JSON.stringify({ scanId })}\n\n`);
-
-  const persistState = () => { try { saveScansState(); } catch (e) {} };
-
-  const BUDGET_MAX = tier.budget;
-  let budgetUsed = 0;
-  const SONNET_COST_PER_BATCH = 0.12;
-  const OPUS_COST_PER_COMPANY = 0.03;
-  const HAIKU_COST_PER_BATCH = 0.02;
-
-  const authHeaders = { apikey: harmonicKey, Accept: 'application/json' };
-
-  // Build context from portcos and CRM companies for similarity scoring
-  let similarityContext = '';
-  try {
-    const contextParts = [];
-
-    if (includePortcos) {
-      safeWrite(`: 📂 Loading portfolio companies for similarity context...\n\n`);
-      const portcos = selectedPortcos && selectedPortcos.length > 0 ? selectedPortcos : PORTCO_LIST;
-      safeWrite(`: 📂 Using ${portcos.length} portfolio companies\n\n`);
-      contextParts.push(`PORTFOLIO COMPANIES (find similar to these):\n${portcos.map(d => `- ${d}`).join('\n')}`);
-    }
-
-    if (crmStages.length > 0) {
-      safeWrite(`: 📋 Loading CRM companies from ${crmStages.join(', ')}...\n\n`);
-      const airtableBase = process.env.AIRTABLE_BASE_ID;
-      const airtableTable = process.env.AIRTABLE_TABLE || 'All Companies';
-      const airtableToken = process.env.AIRTABLE_TOKEN;
-      const crmCompanies = [];
-      for (const stage of crmStages) {
-        try {
-          const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
-          const url = `https://api.airtable.com/v0/${airtableBase}/${encodeURIComponent(airtableTable)}?filterByFormula=${formula}&maxRecords=50&fields[]=Company&fields[]=Sector&fields[]=Company Link`;
-          const r = await fetch(url, { headers: { Authorization: `Bearer ${airtableToken}` } });
-          if (r.ok) {
-            const data = await r.json();
-            const names = (data.records || []).map(rec => {
-              const f = rec.fields || {};
-              return `${f.Company || '?'}${f.Sector ? ` (${f.Sector})` : ''}`;
-            });
-            if (names.length > 0) crmCompanies.push(`${stage}: ${names.join(', ')}`);
-          }
-        } catch (e) {}
-      }
-      if (crmCompanies.length > 0) {
-        contextParts.push(`CRM PIPELINE COMPANIES (find similar to these):\n${crmCompanies.join('\n')}`);
-      }
-    }
-
-    if (keywords) {
-      contextParts.push(`PRIORITY KEYWORDS/CONCEPTS:\n${keywords}`);
-    }
-
-    if (contextParts.length > 0) {
-      similarityContext = '\n\nADDITIONAL SEARCH CONTEXT:\n' + contextParts.join('\n\n') + '\n\nUse the above context to BOOST companies that are similar to our portfolio/pipeline or match our keywords. Companies resembling our existing interests should score higher.\n';
-    }
-  } catch (e) {
-    console.error('[RecurringScan] Context building error:', e.message);
-  }
-
-  try {
-    // ═══════════════════════════════════════════════
-    // PHASE 1: Fetch ALL saved searches
-    // ═══════════════════════════════════════════════
-    scan.progress = 'Fetching saved searches from Harmonic...';
-    safeWrite(`: 🔍 Fetching all saved searches...\n\n`);
-
-    const searchesRes = await fetch(`${HARMONIC_BASE}/savedSearches`, { headers: authHeaders });
-    if (!searchesRes.ok) throw new Error(`Harmonic saved searches failed: ${searchesRes.status}`);
-    const searchesData = await searchesRes.json();
-    const allSearches = (Array.isArray(searchesData) ? searchesData : (searchesData.results || [])).filter(s => {
-      const type = (s.type || '').toUpperCase();
-      return type !== 'PERSONS_LIST' && type !== 'PERSONS' && type !== 'PERSON' && type !== 'PEOPLE';
-    });
-
-    // Filter to selected searches if user chose specific ones
-    let searchesToProcess = allSearches;
-    if (selectedSearchIds.length > 0) {
-      searchesToProcess = allSearches.filter(s => selectedSearchIds.includes(String(s.id)));
-      safeWrite(`: 📋 Using ${searchesToProcess.length} of ${allSearches.length} searches (${allSearches.length - searchesToProcess.length} excluded by user)\n\n`);
-      if (searchesToProcess.length === 0) {
-        safeWrite(`: ⚠️ No matching searches — using all ${allSearches.length}\n\n`);
-        searchesToProcess = allSearches;
-      }
-    }
-
-    scan.stats.savedSearches = searchesToProcess.length;
-    safeWrite(`: 📋 Processing ${searchesToProcess.length} saved searches...\n\n`);
-    console.log(`[DeepScan ${scanId}] Processing ${searchesToProcess.length} of ${allSearches.length} saved searches`);
-
-    // ═══════════════════════════════════════════════
-    // PHASE 2: Fetch companies from saved searches
-    // ═══════════════════════════════════════════════
-    const allCompanies = [];
-    const seenIds = new Set();
-    const seenSet = new Set();
-
-    try {
-      const SEEN_FILE = path.join(SCAN_VOLUME, 'autoscan_seen.json');
-      const seenData = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
-      Object.values(seenData).forEach(arr => { if (Array.isArray(arr)) arr.forEach(id => seenSet.add(String(id))); });
-    } catch (e) {}
-
-    for (let si = 0; si < searchesToProcess.length; si++) {
-      if (scan._cancelled) break;
-      const search = searchesToProcess[si];
-      const searchName = search.name || search.title || `Search ${search.id}`;
-      scan.progress = `Fetching search ${si + 1}/${searchesToProcess.length}: "${searchName}"`;
-      safeWrite(`: 📡 [${si + 1}/${searchesToProcess.length}] Fetching "${searchName}"...\n\n`);
-
-      try {
-        let afterCursor = null;
-        let page = 0;
-        do {
-          let url = `${HARMONIC_BASE}/savedSearches:results/${search.id}?size=500`;
-          if (afterCursor) url += `&cursor=${encodeURIComponent(afterCursor)}`;
-
-          let fetchRes = null;
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            try {
-              const controller = new AbortController();
-              const timeout = setTimeout(() => controller.abort(), 120000);
-              fetchRes = await fetch(url, { headers: authHeaders, signal: controller.signal });
-              clearTimeout(timeout);
-              if (fetchRes.ok) break;
-              fetchRes = null;
-            } catch (e) { fetchRes = null; }
-            if (attempt < 2) await sleep(2000);
-          }
-          if (!fetchRes || !fetchRes.ok) break;
-
-          const data = await fetchRes.json();
-          const batch = extractCompaniesFromSavedSearch(data);
-          let newCount = 0;
-          for (const c of batch) {
-            const cid = String(c.id || c.entity_id || (c.entity_urn || '').split(':').pop());
-            if (cid && !seenIds.has(cid) && !seenSet.has(cid)) {
-              seenIds.add(cid);
-              c._sourceSearch = searchName;
-              allCompanies.push(c);
-              newCount++;
-            }
-          }
-          page++;
-          safeWrite(`: 📡 [${si + 1}/${searchesToProcess.length}] "${searchName}" page ${page}: ${batch.length} fetched, ${newCount} new (${allCompanies.length} total)\n\n`);
-          const pi = data.page_info || data.pageInfo || {};
-          const hasNext = pi.has_next || pi.has_next_page || false;
-          const nextCursor = pi.next || pi.end_cursor || null;
-          if (batch.length === 0 || !hasNext || !nextCursor) break;
-          afterCursor = nextCursor;
-          await sleep(100);
-        } while (page < 50);
-      } catch (e) {
-        console.error(`[RecurringScan] Search "${searchName}" error:`, e.message);
-      }
-    }
-
-    scan.stats.totalCompanies = allCompanies.length;
-    safeWrite(`: 📊 Total unique companies: ${allCompanies.length} from ${searchesToProcess.length} searches\n\n`);
-    console.log(`[DeepScan ${scanId}] Total unique companies: ${allCompanies.length}`);
-
-    if (scan._cancelled) throw new Error('Cancelled');
-
-    // ═══════════════════════════════════════════════
-    // PHASE 3: Sonnet rapid pre-screen (traction-focused)
-    // ═══════════════════════════════════════════════
-    const preModelName = tier.preModel.includes('haiku') ? 'Haiku' : 'Sonnet';
-    scan.progress = `${preModelName} pre-screening ${allCompanies.length} companies...`;
-    safeWrite(`: 🧠 Starting ${preModelName} pre-screen on ${allCompanies.length} companies...\n\n`);
-
-    // Sort: lowest funding first, stealth to back
-    allCompanies.sort((a, b) => {
-      const aS = (a.name || '').toLowerCase().includes('stealth') ? 1 : 0;
-      const bS = (b.name || '').toLowerCase().includes('stealth') ? 1 : 0;
-      if (aS !== bS) return aS - bS;
-      return (a.funding_total || 0) - (b.funding_total || 0);
-    });
-
-    const PRE_BATCH = tier.preBatch;
-    const preBatches = Math.ceil(allCompanies.length / PRE_BATCH);
-    const sonnetPassIds = new Set();
-
-    // Build minimal company text for pre-screen
-    function miniCompanyText(companies) {
-      return companies.map((c, i) => {
-        const parts = [`${i + 1}. **${c.name || 'Unknown'}**`];
-        if (c.description) parts.push(`   ${(c.description || '').slice(0, 200)}`);
-        if (c.website || c.domain) parts.push(`   Web: ${c.website || c.domain}`);
-        if (c.funding_total) parts.push(`   Raised: $${c.funding_total >= 1e6 ? (c.funding_total/1e6).toFixed(1)+'M' : (c.funding_total/1e3).toFixed(0)+'K'}`);
-        if (c.funding_stage) parts.push(`   Stage: ${c.funding_stage}`);
-        if (c.headcount) parts.push(`   Team: ${c.headcount}`);
-        if (c.founded_date || c.founded) parts.push(`   Founded: ${c.founded_date || c.founded}`);
-        if (c._sourceSearch) parts.push(`   Source: ${c._sourceSearch}`);
-        return parts.join('\n');
-      }).join('\n\n');
-    }
-
-    for (let bi = 0; bi < preBatches; bi++) {
-      if (scan._cancelled) break;
-      if (budgetUsed >= BUDGET_MAX * 0.6) {
-        safeWrite(`: ⚠️ Budget guard: ${budgetUsed.toFixed(2)}/${BUDGET_MAX} — stopping pre-screen, keeping ${sonnetPassIds.size} passes\n\n`);
-        break;
-      }
-
-      const batch = allCompanies.slice(bi * PRE_BATCH, (bi + 1) * PRE_BATCH);
-      const batchText = miniCompanyText(batch);
-
-      // Track which saved searches are in this batch
-      const batchSources = [...new Set(batch.map(c => c._sourceSearch).filter(Boolean))];
-      const sourceLabel = batchSources.length <= 2 ? batchSources.join(', ') : `${batchSources[0]} +${batchSources.length - 1} more`;
-      scan.progress = `Pre-screen batch ${bi + 1}/${preBatches} — ${sonnetPassIds.size} passed — ${sourceLabel}`;
-      safeWrite(`: 🔬 Pre-screen batch ${bi + 1}/${preBatches} (${batch.length} companies, ${sonnetPassIds.size} passed) — from: ${sourceLabel}\n\n`);
-
-      try {
-        const prePrompt = `You are a rapid deal screener for Daxos Capital ($100K-$250K, Pre-Seed/Seed).
-
-TASK: For each company, output ONE line: CompanyName — PASS or CUT — [3-5 word reason]
-
-PASS criteria (must meet 2+):
-- Post-revenue or clear user traction (web traffic, users, growth signals)
-- Recently launched and gaining momentum (hockey stick potential)
-- Low funding (<$5M raised) but real product success — NOT vaporware
-- Novel/disruptive product that solves a real problem
-- Strong founder pedigree (ex-Tesla, Citadel, YC, Erebor, top-tier companies)
-- Genuine product-market fit signals
-
-AUTO-CUT:
-- Stealth/pre-launch with no product
-- VC funds, accelerators, consulting firms
-- >$20M raised (too late for us)
-- Vibe-coded/no-substance projects
-- Carbon/climate/charity
-- Companies with no website and no traction
-
-TARGET: Pass ~10-15% ONLY. Be extremely selective. We want REAL traction + NOVEL products.
-${similarityContext}
-COMPANIES:
-${batchText}`;
-
-        const sRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: tier.preModel, max_tokens: 4000, messages: [{ role: 'user', content: prePrompt }] }),
-        });
-
-        budgetUsed += tier.preModel.includes('haiku') ? HAIKU_COST_PER_BATCH : SONNET_COST_PER_BATCH;
-
-        if (sRes.ok) {
-          const sData = await sRes.json();
-          const sText = sData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-
-          const passMatches = sText.matchAll(/([^\n—\-]+?)\s*[—\-–]\s*PASS/gi);
-          for (const m of passMatches) {
-            const name = m[1].trim().replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').toLowerCase().trim();
-            if (name.length > 1) {
-              // Find matching company index to track
-              const matchIdx = batch.findIndex(c => (c.name || '').toLowerCase().trim() === name ||
-                (c.name || '').toLowerCase().replace(/\s*\(.*?\)/g, '').trim() === name);
-              if (matchIdx >= 0) sonnetPassIds.add(bi * PRE_BATCH + matchIdx);
-              else {
-                // Fuzzy match
-                const fuzzyIdx = batch.findIndex(c => {
-                  const cn = (c.name || '').toLowerCase().trim();
-                  return cn.includes(name) || name.includes(cn);
-                });
-                if (fuzzyIdx >= 0) sonnetPassIds.add(bi * PRE_BATCH + fuzzyIdx);
-              }
-            }
-          }
-
-          // Stream all verdicts with reasons + collect batch data
-          const batchCompanies = [];
-          const lines = sText.split('\n').filter(l => l.includes('PASS') || l.includes('CUT'));
-          for (const line of lines) {
-            const isPASS = line.includes('PASS');
-            const parts = line.split(/\s*[—\-–]\s*/);
-            const compName = (parts[0] || '').replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').trim().slice(0, 35);
-            const reason = (parts[2] || '').trim().slice(0, 60);
-            if (compName.length > 2) {
-              safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName}${reason ? ' — ' + reason : ''}\n\n`);
-              const origCard = batch.find(c => (c.name || '').toLowerCase().includes(compName.toLowerCase()) || compName.toLowerCase().includes((c.name || '').toLowerCase()));
-              batchCompanies.push({ name: compName, verdict: isPASS ? 'PASS' : 'CUT', reason, website: origCard?.website || origCard?.domain || '', logo_url: origCard?.logo_url || '', funding_stage: origCard?.funding_stage || '' });
-            }
-          }
-          scan._batches.push({ phase: 'prescreen', batchNum: bi + 1, totalBatches: preBatches, sources: batchSources, companies: batchCompanies, passCount: batchCompanies.filter(c => c.verdict === 'PASS').length, timestamp: Date.now() });
-        }
-      } catch (e) {
-        console.error(`[RecurringScan] Pre-screen batch ${bi + 1} error:`, e.message);
-      }
-      await sleep(300);
-    }
-
-    const survivors = [...sonnetPassIds].map(idx => allCompanies[idx]).filter(Boolean);
-    scan.stats.sonnetPassed = survivors.length;
-    safeWrite(`: ✅ Pre-screen complete: ${survivors.length} of ${allCompanies.length} passed (${((survivors.length / allCompanies.length) * 100).toFixed(1)}%)\n\n`);
-    console.log(`[RecurringScan] Pre-screen: ${survivors.length}/${allCompanies.length} passed`);
-
-    if (scan._cancelled) throw new Error('Cancelled');
-
-    // ═══════════════════════════════════════════════
-    // PHASE 4: GQL enrichment of survivors
-    // ═══════════════════════════════════════════════
-    scan.progress = `Enriching ${survivors.length} companies with full data...`;
-    safeWrite(`: 📥 Enriching ${survivors.length} companies via Harmonic GQL...\n\n`);
-
-    const companyIds = survivors.map(c => parseInt(c.id || c.entity_id || (c.entity_urn || '').split(':').pop())).filter(id => !isNaN(id) && id > 0);
-    let enrichedCards = [];
-    if (companyIds.length > 0 && harmonicKey) {
-      enrichedCards = (await gqlEnrichCompanies(companyIds, harmonicKey)).map(c => gqlToCard(c));
-      // Merge source search info
-      enrichedCards.forEach(card => {
-        const orig = survivors.find(s => {
-          const sid = String(s.id || s.entity_id || (s.entity_urn || '').split(':').pop());
-          return sid === String(card.id);
-        });
-        if (orig) card._sourceSearch = orig._sourceSearch;
-      });
-    }
-
-    scan.stats.enriched = enrichedCards.length;
-    safeWrite(`: 📊 Enriched ${enrichedCards.length} companies\n\n`);
-
-    if (scan._cancelled) throw new Error('Cancelled');
-
-    // ═══════════════════════════════════════════════
-    // PHASE 5: Sonnet traction-focused scoring (post-enrichment)
-    // ═══════════════════════════════════════════════
-    // Filter out VCs, wrong-stage, etc
-    const filtered = enrichedCards.filter(c => {
-      const desc = ((c.description || '') + ' ' + (c.tags || []).join(' ')).toLowerCase();
-      if (/\b(venture capital|vc firm|private equity|hedge fund|asset management|family office|accelerator|incubator)\b/.test(desc)) return false;
-      if ((c.funding_total || 0) > 20000000) return false;
-      if ((c.name || '').toLowerCase().includes('stealth')) return false;
-      return true;
-    });
-
-    scan.stats.filtered = filtered.length;
-    safeWrite(`: 🔽 Filtered to ${filtered.length} (removed ${enrichedCards.length - filtered.length} VCs/late-stage/stealth)\n\n`);
-
-    // Sort by traction signals — web traffic first
-    filtered.sort((a, b) => {
-      const aWeb = a.traction?.webTraffic || 0;
-      const bWeb = b.traction?.webTraffic || 0;
-      const aGrowth = a.traction?.webGrowth30d || 0;
-      const bGrowth = b.traction?.webGrowth30d || 0;
-      return (bWeb + bGrowth * 1000) - (aWeb + aGrowth * 1000);
-    });
-
-    // Sonnet deep screen with full enriched data
-    const portfolioContext = await fetchPortfolioContext();
-    const SCREEN_BATCH = tier.screenBatch;
-    const screenBatches = Math.ceil(filtered.length / SCREEN_BATCH);
-    const screenPassNames = new Set();
-    let screenAnalysis = '';
-
-    scan.progress = `Sonnet scoring ${filtered.length} enriched companies...`;
-
-    function buildCompanyTextRecurring(cards, startIdx) {
-      return cards.map((c, i) => {
-        const parts = [`${startIdx + i + 1}. **${c.name}**`];
-        if (c._sourceSearch) parts.push(`   Source Search: ${c._sourceSearch}`);
-        if (c.description) parts.push(`   Desc: ${c.description.slice(0, 300)}`);
-        if (c.website) parts.push(`   Web: ${c.website}`);
-        if (c.funding_stage) parts.push(`   Stage: ${c.funding_stage}`);
-        if (c.funding_total) parts.push(`   Raised: $${c.funding_total >= 1e6 ? (c.funding_total/1e6).toFixed(1)+'M' : (c.funding_total/1e3).toFixed(0)+'K'}`);
-        if (c.funding_date) parts.push(`   Last Funding: ${c.funding_date}`);
-        if (c.headcount) parts.push(`   Team: ${c.headcount}`);
-        if (c.location) parts.push(`   Location: ${c.location}`);
-        if (c.founded) parts.push(`   Founded: ${c.founded}`);
-        if (c.investors?.length) parts.push(`   Investors: ${c.investors.join(', ')}`);
-        if (c.founders?.length) {
-          c.founders.forEach(f => {
-            const fl = [`   👤 ${f.name}`];
-            if (f.headline) fl.push(`      ${f.headline}`);
-            if (f.careerPath) fl.push(`      Career: ${f.careerPath}`);
-            if (f.education?.length) fl.push(`      Edu: ${f.education.map(e => `${e.degree || ''} @ ${e.school}`.trim()).join(', ')}`);
-            if (f.highlights?.length) fl.push(`      Notable: ${f.highlights.join('; ')}`);
-            parts.push(fl.join('\n'));
-          });
-        }
-        if (c.founder_prior_companies?.length) parts.push(`   Founder alumni: ${c.founder_prior_companies.join(', ')}`);
-        if (c.highlights?.length) parts.push(`   Highlights: ${c.highlights.slice(0, 3).join('; ')}`);
-        const t = c.traction || {};
-        const tm = [];
-        if (t.webTraffic) tm.push(`Web: ${t.webTraffic}/mo`);
-        if (t.webGrowth30d) tm.push(`Web30d: ${t.webGrowth30d > 0 ? '+' : ''}${t.webGrowth30d}%`);
-        if (t.webGrowth90d) tm.push(`Web90d: ${t.webGrowth90d > 0 ? '+' : ''}${t.webGrowth90d}%`);
-        if (t.hcGrowth30d) tm.push(`HC30d: ${t.hcGrowth30d > 0 ? '+' : ''}${t.hcGrowth30d}%`);
-        if (tm.length) parts.push(`   📈 Traction: ${tm.join(', ')}`);
-        return parts.join('\n');
-      }).join('\n\n');
-    }
-
-    for (let si = 0; si < screenBatches; si++) {
-      if (scan._cancelled) break;
-      if (budgetUsed >= BUDGET_MAX * 0.75) {
-        safeWrite(`: ⚠️ Budget ${budgetUsed.toFixed(2)}/${BUDGET_MAX} — stopping Sonnet screen\n\n`);
-        break;
-      }
-
-      const batch = filtered.slice(si * SCREEN_BATCH, (si + 1) * SCREEN_BATCH);
-      const batchText = buildCompanyTextRecurring(batch, si * SCREEN_BATCH);
-
-      const scoreSources = [...new Set(batch.map(c => c._sourceSearch).filter(Boolean))];
-      const scoreSourceLabel = scoreSources.length <= 2 ? scoreSources.join(', ') : `${scoreSources[0]} +${scoreSources.length - 1} more`;
-      scan.progress = `Scoring batch ${si + 1}/${screenBatches} — ${screenPassNames.size} winners — ${scoreSourceLabel}`;
-      safeWrite(`: 🎯 Scoring batch ${si + 1}/${screenBatches} (${screenPassNames.size} winners) — from: ${scoreSourceLabel}\n\n`);
-
-      try {
-        const screenPrompt = `You are a senior deal analyst for Daxos Capital ($100K-$250K, Pre-Seed/Seed).
-
-${portfolioContext ? portfolioContext : ''}
-
-MISSION: Find companies showing REAL TRACTION with GENUINELY NOVEL products. Score 1-10.
-
-HIGH SCORES (8-10):
-- Post-revenue with growing web traffic (hockey stick trajectory)
-- Recently launched, low funding, but real users/customers
-- Ex-Tesla/Citadel/YC/Erebor/top-tier founders building something novel
-- Clear product-market fit: users love it, organic growth
-- $0-5M raised but significant traction (we invest BEFORE the hype)
-
-LOW SCORES (1-4):
-- No traction, no users, no revenue, just an idea
-- Vibe-coded/AI-wrapper nonsense with no moat
-- >$10M raised without proportional traction
-- Consulting/services disguised as a startup
-- Me-too product in crowded market
-
-FORMAT (one per company):
-**CompanyName** — Score: X/10
-Reason: [2-3 sentences on traction signals, product novelty, founder quality]
-
-Only companies scoring 7+ should be considered PASS.
-${similarityContext}
-COMPANIES:
-${batchText}`;
-
-        const sRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: tier.screenModel, max_tokens: 4000, messages: [{ role: 'user', content: screenPrompt }] }),
-        });
-        budgetUsed += SONNET_COST_PER_BATCH;
-
-        if (sRes.ok) {
-          const sData = await sRes.json();
-          const sText = sData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-          screenAnalysis += sText + '\n\n';
-
-          // Parse scores — find companies scoring 7+
-          const scoreRegex = /\*\*([^*]+)\*\*\s*[—\-–]\s*Score:\s*(\d+)/gi;
-          let match;
-          while ((match = scoreRegex.exec(sText)) !== null) {
-            const name = match[1].trim();
-            const score = parseInt(match[2]);
-            if (score >= 7) screenPassNames.add(name.toLowerCase());
-          }
-
-          // Stream all scored companies + collect batch data
-          const scoreBatchCompanies = [];
-          const scoreLines = sText.split(/\n/).filter(l => /Score:\s*\d+/i.test(l));
-          for (const line of scoreLines) {
-            const cn = (line.match(/\*\*([^*]+)\*\*/) || [])[1] || '';
-            const sc = parseInt((line.match(/Score:\s*(\d+)/i) || [])[1] || '0');
-            if (!cn) continue;
-            const reasonIdx = sText.indexOf(line);
-            const afterScore = sText.slice(reasonIdx + line.length, reasonIdx + line.length + 200);
-            const reasonMatch = afterScore.match(/Reason:\s*([^\n]+)/i);
-            const reason = reasonMatch ? reasonMatch[1].trim().slice(0, 80) : '';
-            const emoji = sc >= 9 ? '🌟' : sc >= 7 ? '🏆' : sc >= 5 ? '📊' : '📉';
-            safeWrite(`: ${emoji} ${cn} — ${sc}/10${reason ? ' — ' + reason : ''}\n\n`);
-            const origCard = batch.find(c => { const n = (c.name || '').toLowerCase(); return n === cn.toLowerCase() || n.includes(cn.toLowerCase()) || cn.toLowerCase().includes(n); });
-            scoreBatchCompanies.push({ name: cn, score: sc, reason, website: origCard?.website || '', logo_url: origCard?.logo_url || '', funding_stage: origCard?.funding_stage || '', funding_total: origCard?.funding_total || 0, description: (origCard?.description || '').slice(0, 150) });
-          }
-          scan._batches.push({ phase: 'scoring', batchNum: si + 1, totalBatches: screenBatches, sources: scoreSources, companies: scoreBatchCompanies, winnerCount: scoreBatchCompanies.filter(c => c.score >= 7).length, timestamp: Date.now() });
-        }
-      } catch (e) {
-        console.error(`[RecurringScan] Screen batch ${si + 1} error:`, e.message);
-      }
-      await sleep(300);
-    }
-
-    // Match screen passes to enriched cards
-    const topCandidates = filtered.filter(c => {
-      const n = (c.name || '').toLowerCase().trim();
-      return screenPassNames.has(n) || [...screenPassNames].some(p => p.includes(n) || n.includes(p));
-    });
-
-    scan.stats.scored = topCandidates.length;
-    safeWrite(`: 🎖️ Sonnet scoring complete: ${topCandidates.length} companies scored 7+ out of ${filtered.length}\n\n`);
-    console.log(`[RecurringScan] Sonnet screen: ${topCandidates.length} scored 7+ from ${filtered.length}`);
-
-    if (scan._cancelled) throw new Error('Cancelled');
-
-    // ═══════════════════════════════════════════════
-    // PHASE 6: Opus deep analysis — top ~100 companies
-    // ═══════════════════════════════════════════════
-    const deepModelName = tier.deepModel.includes('opus') ? 'Opus' : 'Sonnet';
-    const opusCap = Math.min(topCandidates.length, tier.deepMax);
-    const opusBatch = topCandidates.slice(0, opusCap);
-    const remainingBudget = BUDGET_MAX - budgetUsed;
-    const costPerDeep = tier.deepModel.includes('opus') ? OPUS_COST_PER_COMPANY : SONNET_COST_PER_BATCH / 15;
-    const maxOpusCompanies = Math.min(opusCap, Math.floor(remainingBudget / costPerDeep));
-
-    scan.progress = `${deepModelName} deep analysis on top ${maxOpusCompanies} companies...`;
-    safeWrite(`: 🧠 Starting ${deepModelName} deep analysis on ${maxOpusCompanies} companies (budget remaining: $${remainingBudget.toFixed(2)})\n\n`);
-
-    const OPUS_DEEP_BATCH = tier.deepBatch;
-    const opusDeepBatches = Math.ceil(maxOpusCompanies / OPUS_DEEP_BATCH);
-    const deepResults = [];
-
-    for (let oi = 0; oi < opusDeepBatches; oi++) {
-      if (scan._cancelled) break;
-      if (budgetUsed >= BUDGET_MAX) {
-        safeWrite(`: 💰 Budget cap reached ($${budgetUsed.toFixed(2)}/${BUDGET_MAX})\n\n`);
-        break;
-      }
-
-      const batch = opusBatch.slice(oi * OPUS_DEEP_BATCH, (oi + 1) * OPUS_DEEP_BATCH);
-      const batchText = buildCompanyTextRecurring(batch, oi * OPUS_DEEP_BATCH);
-
-      scan.progress = `Opus batch ${oi + 1}/${opusDeepBatches} — ${deepResults.length} deep-scored`;
-      safeWrite(`: 🔬 Opus deep batch ${oi + 1}/${opusDeepBatches} (${batch.length} companies)\n\n`);
-
-      try {
-        const deepPrompt = `You are Daxos Capital's top deal analyst performing DEEP due diligence.
-
-CONTEXT: These ${batch.length} companies survived screening of ${allCompanies.length} total companies. They represent the top ~1% from across all our Harmonic saved searches. Your job is to provide conviction-level analysis.
-
-${portfolioContext ? portfolioContext : ''}
-
-For EACH company, write a thorough investment paragraph covering:
-1. **Product & Market**: What they build, why it matters, market size signal
-2. **Traction Evidence**: Web traffic, user signals, revenue indicators, growth trajectory
-3. **Founder Quality**: Background, prior companies, education, why they're credible
-4. **Why Now**: Timing thesis — why this company at this stage
-5. **Risk Flags**: What could go wrong, competition, execution risk
-6. **Daxos Fit**: How it maps to our thesis (fintech, crypto, AI, exchanges, betting, etc.)
-
-FINAL SCORE: 1-10 with confidence level (High/Medium/Low)
-
-FORMAT:
-### CompanyName — Final Score: X/10 (Confidence: High/Medium/Low)
-[Full investment paragraph — 150-250 words]
-**Key Signal**: [single most compelling data point]
-**Risk**: [primary concern]
-
-Be brutally honest. A 9-10 means "call the founder tomorrow." A 7-8 means "worth a meeting." Below 7 means it shouldn't have made it this far.
-${similarityContext}
-COMPANIES:
-${batchText}`;
-
-        const oRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: tier.deepModel, max_tokens: 8000, messages: [{ role: 'user', content: deepPrompt }] }),
-        });
-        budgetUsed += batch.length * costPerDeep;
-
-        if (oRes.ok) {
-          const oData = await oRes.json();
-          const oText = oData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-
-          // Parse each company's deep analysis
-          const sections = oText.split(/###\s+/).filter(s => s.trim());
-          for (const section of sections) {
-            const nameMatch = section.match(/^([^—\n]+?)\s*[—\-–]\s*Final Score:\s*(\d+)\/10/i);
-            if (nameMatch) {
-              const companyName = nameMatch[1].trim().replace(/\*\*/g, '');
-              const score = parseInt(nameMatch[2]);
-              const confMatch = section.match(/Confidence:\s*(High|Medium|Low)/i);
-              const confidence = confMatch ? confMatch[1] : 'Medium';
-
-              // Find matching card
-              const card = batch.find(c => {
-                const cn = (c.name || '').toLowerCase();
-                const pn = companyName.toLowerCase();
-                return cn === pn || cn.includes(pn) || pn.includes(cn);
-              });
-
-              deepResults.push({
-                name: companyName,
-                score,
-                confidence,
-                analysis: section.trim(),
-                card: card || null,
-                _sourceSearch: card?._sourceSearch || '',
-              });
-
-              // Extract key signal for streaming
-              const keySignal = (section.match(/\*\*Key Signal\*\*:\s*([^\n]+)/i) || [])[1] || '';
-              const riskFlag = (section.match(/\*\*Risk\*\*:\s*([^\n]+)/i) || [])[1] || '';
-              const emoji = score >= 9 ? '🌟' : score >= 7 ? '⭐' : '📋';
-              let detail = `${emoji} ${companyName} — ${score}/10 (${confidence})`;
-              if (card?.funding_stage) detail += ` · ${card.funding_stage}`;
-              if (card?.funding_total) detail += ` · $${card.funding_total >= 1e6 ? (card.funding_total/1e6).toFixed(1)+'M' : (card.funding_total/1e3).toFixed(0)+'K'}`;
-              if (keySignal) detail += `\n:    💡 ${keySignal.slice(0, 100)}`;
-              if (riskFlag && score >= 7) detail += `\n:    ⚠️ ${riskFlag.slice(0, 80)}`;
-              safeWrite(`: ${detail}\n\n`);
-            }
-          }
-          // Store deep batch data
-          const deepBatchCompanies = deepResults.slice(-batch.length).map(r => ({
-            name: r.name, score: r.score, confidence: r.confidence, website: r.card?.website || '', logo_url: r.card?.logo_url || '',
-            funding_stage: r.card?.funding_stage || '', funding_total: r.card?.funding_total || 0, description: (r.card?.description || '').slice(0, 150),
-            keySignal: (r.analysis?.match(/\*\*Key Signal\*\*:\s*([^\n]+)/i) || [])[1]?.slice(0, 100) || '',
-          }));
-          scan._batches.push({ phase: 'deep', batchNum: oi + 1, totalBatches: opusDeepBatches, companies: deepBatchCompanies, timestamp: Date.now() });
-        }
-      } catch (e) {
-        console.error(`[RecurringScan] Opus batch ${oi + 1} error:`, e.message);
-      }
-      await sleep(500);
-    }
-
-    // Sort deep results by score
-    deepResults.sort((a, b) => b.score - a.score || (a.confidence === 'High' ? -1 : 1));
-    scan.stats.deepScored = deepResults.length;
-    scan.stats.topResults = deepResults.filter(r => r.score >= 7).length;
-
-    // ═══════════════════════════════════════════════
-    // PHASE 7: Save results
-    // ═══════════════════════════════════════════════
-    // Push top N results to DD/vetting pipeline
-    const ddCount = Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
-    const ddCompanies = deepResults.slice(0, ddCount).map(r => ({
-      id: r.card?.id || 0,
-      name: r.name,
-      website: r.card?.website || '',
-      description: r.card?.description || '',
-      logo_url: r.card?.logo_url || '',
-      funding_total: r.card?.funding_total || 0,
-      funding_stage: r.card?.funding_stage || '',
-      headcount: r.card?.headcount || 0,
-      location: r.card?.location || '',
-      _score: r.score,
-      _confidence: r.confidence,
-      _analysis: (r.analysis || '').slice(0, 500),
-      _sourceSearch: r._sourceSearch || '',
-    }));
-
-    let ddPushed = 0;
-    if (ddCompanies.length > 0) {
-      try {
-        const VETTING_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'vetting.json');
-        let vetting = [];
-        try { vetting = JSON.parse(fs.readFileSync(VETTING_FILE, 'utf8')); } catch (e) {}
-        const existingNames = new Set(vetting.map(v => (v.name || '').toLowerCase()));
-        for (const co of ddCompanies) {
-          if (!existingNames.has(co.name.toLowerCase())) {
-            vetting.push({ ...co, addedAt: Date.now(), source: 'scan-agent', votes: {}, dismissed: false, hiddenBy: [] });
-            ddPushed++;
-          }
-        }
-        fs.writeFileSync(VETTING_FILE, JSON.stringify(vetting, null, 2));
-        safeWrite(`: 📤 Pushed ${ddPushed} companies to DD pipeline\n\n`);
-      } catch (e) {
-        console.error('[RecurringScan] DD push error:', e.message);
-      }
-    }
-
-    scan.stats.ddPushed = ddPushed;
-
-    const finalResults = {
-      results: deepResults,
-      screenAnalysis,
-      stats: scan.stats,
-      budgetUsed: budgetUsed.toFixed(2),
-      timestamp: new Date().toISOString(),
-      duration: Math.round((Date.now() - scan.startedAt) / 1000),
-      tier: { key: tierKey, name: tier.name, cost: tier.cost, ddPush: tier.ddPush },
-      options: { includePortcos, crmStages, keywords },
-    };
-
-    const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
-    try { fs.writeFileSync(RESULTS_FILE, JSON.stringify(finalResults, null, 2)); } catch (e) {}
-
-    // Append to history (keep last 20)
-    try {
-      const history = loadScanHistory();
-      history.unshift(finalResults);
-      saveScanHistory(history);
-    } catch (e) {}
-
-    scan.status = 'done';
-    scan.progress = `Complete — ${deepResults.length} deep-scored, ${scan.stats.topResults} rated 7+, ${ddPushed} pushed to DD`;
-    scan.results = finalResults;
-    persistState();
-    cleanupOldScans();
-
-    safeWrite(`: 🏁 SCAN COMPLETE\n\n`);
-    safeWrite(`: 📊 ${allCompanies.length} sourced → ${survivors.length} pre-screened → ${topCandidates.length} scored 7+ → ${deepResults.length} deep-analyzed\n\n`);
-    safeWrite(`: 📤 ${ddPushed} top companies pushed to DD pipeline\n\n`);
-    safeWrite(`: 💰 Budget used: $${budgetUsed.toFixed(2)} / $${BUDGET_MAX}\n\n`);
-    safeWrite(`: ⏱️ Duration: ${Math.round((Date.now() - scan.startedAt) / 60000)} minutes\n\n`);
-    safeWrite(`data: ${JSON.stringify(finalResults)}\n\n`);
-
-  } catch (e) {
-    if (e.message === 'Cancelled') {
-      scan.status = 'cancelled';
-      scan.progress = 'Cancelled by user';
-      safeWrite(`data: ${JSON.stringify({ error: 'Scan cancelled' })}\n\n`);
-    } else {
-      console.error('[RecurringScan] Fatal error:', e.message);
-      scan.status = 'error';
-      scan.progress = `Error: ${e.message}`;
-      safeWrite(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-    }
-  } finally {
-    clearInterval(keepalive);
-    res.end();
-  }
-});
-
 app.listen(PORT, () => {
   console.log(`Pigeon Finder API running on port ${PORT}`);
 });
@@ -8090,17 +7088,16 @@ app.post('/api/apply', async (req, res) => {
 
       const fields = {
         'Company': company_name,
-        'CRM Stage': 'Website Applications',
+        'CRM Stage': 'Warm',
         'Source': 'Website Apply Form',
         'Company Link': website || '',
         'Original Notes + Ongoing Negotiation Notes': noteLines,
       };
 
-      // Map form fields to Airtable columns
-      // Email stored in Initial Reachout Notes for easy access
-      if (email) fields['Initial Reachout Notes'] = 'Email: ' + email + (telegram ? '\nTelegram: ' + telegram : '');
-      // Description goes into Intro Call Notes
-      if (description) fields['Intro Call Notes'] = description;
+      // Add Twitter Link if telegram looks like a twitter handle
+      if (telegram && telegram.startsWith('@')) {
+        // Store telegram in notes — it's already there
+      }
 
       const createRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
         method: 'POST', headers,
@@ -8108,34 +7105,25 @@ app.post('/api/apply', async (req, res) => {
       });
 
       if (createRes.ok) {
-        const record = await createRes.json();
-        console.log('[Apply] Added ' + company_name + ' to Airtable as Website Application, id:', record.id);
-        return res.json({ success: true, message: 'Application received', airtable: 'created', stage: 'Website Applications' });
+        console.log('[Apply] Added ' + company_name + ' to Airtable as Website Application');
       } else {
         const err = await createRes.text();
-        console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 500));
-        // If "Website Applications" stage doesn't exist, try with "Warm" as fallback
-        const fallbackFields = { ...fields, 'CRM Stage': 'Warm' };
+        console.error('[Apply] Airtable create error:', createRes.status, err.slice(0, 200));
+        // If "Website Applications" stage doesn't exist, Airtable will reject it
+        // Try creating with Warm as fallback
+        // already Warm
         const fallbackRes = await fetch(AIRTABLE_API + '/' + baseId + '/' + tableName, {
           method: 'POST', headers,
-          body: JSON.stringify({ fields: fallbackFields })
+          body: JSON.stringify({ fields })
         });
-        if (fallbackRes.ok) {
-          console.log('[Apply] Fallback: added as Warm');
-          return res.json({ success: true, message: 'Application received', airtable: 'fallback_warm', error_detail: err.slice(0, 300) });
-        } else {
-          const err2 = await fallbackRes.text();
-          console.error('[Apply] Fallback also failed:', err2.slice(0, 300));
-          return res.json({ success: true, message: 'Application saved locally but Airtable failed', airtable: 'failed', error_detail: err.slice(0, 300) });
-        }
+        if (fallbackRes.ok) console.log('[Apply] Fallback: added as Warm (Website Applications stage may not exist yet)');
       }
     } catch(e) {
       console.error('[Apply] Airtable error:', e.message);
-      return res.json({ success: true, message: 'Application saved locally but Airtable errored', airtable: 'error', error_detail: e.message });
     }
   }
 
-  res.json({ success: true, message: 'Application received (no Airtable config)' });
+  res.json({ success: true, message: 'Application received' });
 });
 
 // Get all applications

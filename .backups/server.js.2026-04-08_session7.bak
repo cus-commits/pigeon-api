@@ -7384,7 +7384,7 @@ ${batchText}`;
     const companyIds = survivors.map(c => parseInt(c.id || c.entity_id || (c.entity_urn || '').split(':').pop())).filter(id => !isNaN(id) && id > 0);
     let enrichedCards = [];
     if (companyIds.length > 0 && harmonicKey) {
-      enrichedCards = (await gqlEnrichCompanies(companyIds, harmonicKey)).map(c => gqlToCard(c));
+      enrichedCards = await gqlEnrichCompanies(companyIds, harmonicKey);
       // Merge source search info
       enrichedCards.forEach(card => {
         const orig = survivors.find(s => {
@@ -7412,7 +7412,6 @@ ${batchText}`;
       return true;
     });
 
-    scan.stats.filtered = filtered.length;
     safeWrite(`: 🔽 Filtered to ${filtered.length} (removed ${enrichedCards.length - filtered.length} VCs/late-stage/stealth)\n\n`);
 
     // Sort by traction signals — web traffic first
@@ -7565,7 +7564,6 @@ ${batchText}`;
       return screenPassNames.has(n) || [...screenPassNames].some(p => p.includes(n) || n.includes(p));
     });
 
-    scan.stats.scored = topCandidates.length;
     safeWrite(`: 🎖️ Sonnet scoring complete: ${topCandidates.length} companies scored 7+ out of ${filtered.length}\n\n`);
     console.log(`[RecurringScan] Sonnet screen: ${topCandidates.length} scored 7+ from ${filtered.length}`);
 
@@ -7727,7 +7725,7 @@ ${batchText}`;
         const existingNames = new Set(vetting.map(v => (v.name || '').toLowerCase()));
         for (const co of ddCompanies) {
           if (!existingNames.has(co.name.toLowerCase())) {
-            vetting.push({ ...co, addedAt: Date.now(), source: 'scan-agent', votes: {}, dismissed: false, hiddenBy: [] });
+            vetting.push({ ...co, addedAt: Date.now(), source: `recurring-scan-${tierKey}`, votes: {}, dismissed: false, hiddenBy: [] });
             ddPushed++;
           }
         }
