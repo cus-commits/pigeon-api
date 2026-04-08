@@ -7290,27 +7290,34 @@ app.post('/api/recurring-scan', async (req, res) => {
       safeWrite(`: 🔬 Pre-screen batch ${bi + 1}/${preBatches} (${batch.length} companies, ${sonnetPassIds.size} passed) — from: ${sourceLabel}\n\n`);
 
       try {
-        const prePrompt = `You are a rapid deal screener for Daxos Capital ($100K-$250K, Pre-Seed/Seed).
+        const prePrompt = `You are a rapid deal screener for Daxos Capital, a seed-stage angel fund ($100K-$250K checks).
 
 TASK: For each company, output ONE line: CompanyName — PASS or CUT — [3-5 word reason]
 
+DAXOS SECTORS (strong bias toward these):
+• Crypto, DeFi, blockchain infrastructure, exchanges
+• AI tools, AI infrastructure, developer platforms
+• Fintech, payments, lending, financial data
+• Prediction markets, betting, gaming platforms
+
 PASS criteria (must meet 2+):
-- Post-revenue or clear user traction (web traffic, users, growth signals)
-- Recently launched and gaining momentum (hockey stick potential)
-- Low funding (<$5M raised) but real product success — NOT vaporware
-- Novel/disruptive product that solves a real problem
-- Strong founder pedigree (ex-Tesla, Citadel, YC, Erebor, top-tier companies)
-- Genuine product-market fit signals
+- In or adjacent to a Daxos sector above
+- Post-revenue or measurable user traction (web traffic, users, growth)
+- Low funding (<$5M raised) with real product, not vaporware
+- Novel/disruptive product with clear differentiation
+- Strong founder signal (ex-FAANG, YC, top-tier, domain expert)
 
 AUTO-CUT:
+- NOT in any Daxos sector and no clear adjacency
 - Stealth/pre-launch with no product
-- VC funds, accelerators, consulting firms
-- >$20M raised (too late for us)
-- Vibe-coded/no-substance projects
-- Carbon/climate/charity
-- Companies with no website and no traction
+- VC funds, accelerators, consulting/services firms
+- >$20M raised (too late for seed)
+- AI wrapper with no proprietary tech or data
+- Enterprise SaaS with long sales cycles
+- Biotech, cleantech, hardware-only needing $50M+
+- No website and no traction signals
 
-TARGET: Pass ~10-15% ONLY. Be extremely selective. We want REAL traction + NOVEL products.
+TARGET: Pass ~8-12% ONLY. Be extremely selective. Wrong sector = CUT even if great company.
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
@@ -7425,7 +7432,8 @@ ${batchText}`;
     });
 
     // Sonnet deep screen with full enriched data
-    const portfolioContext = await fetchPortfolioContext();
+    // Only fetch portfolio context if user selected CRM stages — otherwise it biases scoring
+    const portfolioContext = (crmStages && crmStages.length > 0) ? await fetchPortfolioContext() : '';
     const SCREEN_BATCH = tier.screenBatch;
     const screenBatches = Math.ceil(filtered.length / SCREEN_BATCH);
     const screenPassNames = new Set();
@@ -7485,31 +7493,39 @@ ${batchText}`;
       safeWrite(`: 🎯 Scoring batch ${si + 1}/${screenBatches} (${screenPassNames.size} winners) — from: ${scoreSourceLabel}\n\n`);
 
       try {
-        const screenPrompt = `You are a senior deal analyst for Daxos Capital ($100K-$250K, Pre-Seed/Seed).
+        const screenPrompt = `You are a senior deal analyst for Daxos Capital, a seed-stage angel fund ($100K-$250K checks, Pre-Seed/Seed only).
 
 ${portfolioContext ? portfolioContext : ''}
 
-MISSION: Find companies showing REAL TRACTION with GENUINELY NOVEL products. Score 1-10.
+MISSION: Score each company 1-10 based on investability RIGHT NOW at seed stage.
 
-HIGH SCORES (8-10):
-- Post-revenue with growing web traffic (hockey stick trajectory)
-- Recently launched, low funding, but real users/customers
-- Ex-Tesla/Citadel/YC/Erebor/top-tier founders building something novel
-- Clear product-market fit: users love it, organic growth
-- $0-5M raised but significant traction (we invest BEFORE the hype)
+DAXOS THESIS — We invest in:
+• Crypto/blockchain infrastructure, DeFi, exchanges, prediction markets
+• AI infrastructure, developer tools, applied AI with real users
+• Fintech, payments, lending, financial data
+• Betting/gaming platforms with traction
+• Companies with REAL measurable traction (web traffic, users, revenue) at low funding (<$5M raised)
 
-LOW SCORES (1-4):
-- No traction, no users, no revenue, just an idea
-- Vibe-coded/AI-wrapper nonsense with no moat
-- >$10M raised without proportional traction
-- Consulting/services disguised as a startup
-- Me-too product in crowded market
+SCORING GUIDE:
+9-10: PERFECT FIT — Daxos thesis sector + strong traction + great team + low funding. Call founder today.
+7-8: STRONG — Good sector fit, promising traction signals, worth investigating.
+5-6: INTERESTING — Decent company but wrong stage, wrong sector, or weak traction for our thesis.
+3-4: PASS — Not Daxos material. Wrong sector, too much funding, no traction, or boring product.
+1-2: HARD PASS — Services company, dead product, or completely wrong for angel/seed.
+
+CRITICAL FILTERS — Auto-score 3 or below:
+• Company raised >$10M (too late for us)
+• Pure consulting/services/agency
+• AI wrapper with no proprietary tech or data moat
+• No product launched, no users, just a landing page
+• Enterprise SaaS with long sales cycles (not our style)
+• Biotech, hardware-only, or deep science requiring $50M+ to reach market
 
 FORMAT (one per company):
 **CompanyName** — Score: X/10
-Reason: [2-3 sentences on traction signals, product novelty, founder quality]
+Reason: [2-3 sentences — focus on: sector fit, traction evidence, founder signal, stage fit]
 
-Only companies scoring 7+ should be considered PASS.
+BE HARSH. Most companies should score 3-6. A 7+ is genuinely exciting for Daxos.
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
@@ -7602,29 +7618,40 @@ ${batchText}`;
       safeWrite(`: 🔬 Opus deep batch ${oi + 1}/${opusDeepBatches} (${batch.length} companies)\n\n`);
 
       try {
-        const deepPrompt = `You are Daxos Capital's top deal analyst performing DEEP due diligence.
+        const deepPrompt = `You are Daxos Capital's top deal analyst performing DEEP due diligence on seed-stage companies.
 
-CONTEXT: These ${batch.length} companies survived screening of ${allCompanies.length} total companies. They represent the top ~1% from across all our Harmonic saved searches. Your job is to provide conviction-level analysis.
+CONTEXT: These ${batch.length} companies scored 7+ from screening ${allCompanies.length} total companies. They are the top ~1%.
 
 ${portfolioContext ? portfolioContext : ''}
 
-For EACH company, write a thorough investment paragraph covering:
-1. **Product & Market**: What they build, why it matters, market size signal
-2. **Traction Evidence**: Web traffic, user signals, revenue indicators, growth trajectory
-3. **Founder Quality**: Background, prior companies, education, why they're credible
-4. **Why Now**: Timing thesis — why this company at this stage
-5. **Risk Flags**: What could go wrong, competition, execution risk
-6. **Daxos Fit**: How it maps to our thesis (fintech, crypto, AI, exchanges, betting, etc.)
+DAXOS PROFILE:
+- Seed-stage angel fund, $100K-$250K checks
+- Core sectors: Crypto/DeFi, AI tools, fintech, prediction markets, betting/gaming
+- We want: real traction at low funding, novel products, strong founders
+- We pass on: enterprise SaaS, services, hardware-only, companies that raised $10M+
 
-FINAL SCORE: 1-10 with confidence level (High/Medium/Low)
+For EACH company, provide conviction-level analysis:
+
+1. **Product & Moat**: What they build, what's genuinely novel, defensibility
+2. **Traction**: Web traffic growth, user count signals, revenue indicators — BE SPECIFIC with numbers from the data
+3. **Founders**: Prior companies, background quality, domain expertise
+4. **Market Timing**: Why this product now, what macro trend enables it
+5. **Daxos Fit**: HONEST assessment — does this match crypto/AI/fintech/betting thesis? Or is it a stretch?
+6. **Risk**: Primary concern that could kill this investment
+
+SCORING:
+9-10 = "I'd wire money today" — perfect thesis fit + explosive traction + elite team
+7-8 = "Take the meeting" — strong on 2+ dimensions, worth investigating
+5-6 = "Interesting but not for us" — good company, wrong fit for Daxos
+Below 5 = "How did this get here?" — should have been filtered earlier
 
 FORMAT:
 ### CompanyName — Final Score: X/10 (Confidence: High/Medium/Low)
-[Full investment paragraph — 150-250 words]
-**Key Signal**: [single most compelling data point]
+[150-250 word investment memo]
+**Key Signal**: [single most compelling data point with specific numbers]
 **Risk**: [primary concern]
 
-Be brutally honest. A 9-10 means "call the founder tomorrow." A 7-8 means "worth a meeting." Below 7 means it shouldn't have made it this far.
+DO NOT inflate scores. If a company doesn't fit our crypto/AI/fintech/betting thesis, it caps at 6 regardless of quality. We are a THESIS-DRIVEN fund, not a generalist.
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
