@@ -6944,7 +6944,7 @@ async function refreshSearchCounts(searches, harmonicKey) {
       if (r.ok) {
         const data = await r.json();
         const pi = data.page_info || data.pageInfo || {};
-        counts[s.id] = pi.total_count || pi.total || pi.count || (pi.has_next ? 500 : (data.results || data.data || []).length);
+        counts[s.id] = pi.total_count || pi.total || pi.count || pi.totalCount || (pi.has_next ? '500+' : (data.results || data.data || []).length);
       }
     } catch {}
     await sleep(200);
@@ -7019,13 +7019,17 @@ app.get('/api/recurring-scan/history', (req, res) => {
 app.post('/api/recurring-scan/cancel', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { id } = req.body || {};
-  if (id && global._deepScans[id] && global._deepScans[id].status === 'scanning') {
-    global._deepScans[id]._cancelled = true;
-    global._deepScans[id].status = 'cancelled';
-    global._deepScans[id].progress = 'Cancelled by user';
+  if (id && global._deepScans[id]) {
+    const s = global._deepScans[id];
+    if (s.status === 'scanning') {
+      s._cancelled = true; s.status = 'cancelled'; s.progress = 'Cancelled by user';
+    } else if (s.status === 'interrupted') {
+      delete global._deepScans[id];
+    }
   } else if (!id) {
-    for (const s of Object.values(global._deepScans)) {
+    for (const [sid, s] of Object.entries(global._deepScans)) {
       if (s.status === 'scanning') { s._cancelled = true; s.status = 'cancelled'; s.progress = 'Cancelled by user'; }
+      if (s.status === 'interrupted') { delete global._deepScans[sid]; }
     }
   }
   saveScansState();
@@ -7234,8 +7238,9 @@ app.post('/api/recurring-scan', async (req, res) => {
     }
 
     scan.stats.totalCompanies = allCompanies.length;
-    safeWrite(`: 📊 Total unique companies: ${allCompanies.length} from ${searchesToProcess.length} searches\n\n`);
-    console.log(`[DeepScan ${scanId}] Total unique companies: ${allCompanies.length}`);
+    scan.stats.seenFiltered = seenSet.size;
+    safeWrite(`: 📊 Total unique companies: ${allCompanies.length} from ${searchesToProcess.length} searches (${seenSet.size} previously seen excluded)\n\n`);
+    console.log(`[DeepScan ${scanId}] Total unique companies: ${allCompanies.length} (${seenSet.size} seen excluded)`);
 
     if (scan._cancelled) throw new Error('Cancelled');
 
@@ -7509,8 +7514,9 @@ DAXOS THESIS — We invest in:
 SCORING GUIDE:
 9-10: PERFECT FIT — Daxos thesis sector + strong traction + great team + low funding. Call founder today.
 7-8: STRONG — Good sector fit, promising traction signals, worth investigating.
-5-6: INTERESTING — Decent company but wrong stage, wrong sector, or weak traction for our thesis.
-3-4: PASS — Not Daxos material. Wrong sector, too much funding, no traction, or boring product.
+5-6: INTERESTING — Decent company but wrong stage, or weak traction. Non-thesis sector companies usually land here.
+7-8 for NON-THESIS: ALLOWED if truly exceptional — explosive traction, elite founders, measurable revenue at low funding. The bar is much higher than for thesis-fit companies.
+3-4: PASS — Not Daxos material. Too much funding, no traction, or boring product.
 1-2: HARD PASS — Services company, dead product, or completely wrong for angel/seed.
 
 CRITICAL FILTERS — Auto-score 3 or below:
@@ -7651,7 +7657,7 @@ FORMAT:
 **Key Signal**: [single most compelling data point with specific numbers]
 **Risk**: [primary concern]
 
-DO NOT inflate scores. If a company doesn't fit our crypto/AI/fintech/betting thesis, it caps at 6 regardless of quality. We are a THESIS-DRIVEN fund, not a generalist.
+DO NOT inflate scores. We are a THESIS-DRIVEN fund, not a generalist. Non-thesis companies USUALLY score 5-6, BUT can score 7-8 if they show genuinely exceptional signals: explosive traction metrics (10x growth, thousands of users at minimal funding), elite founders (ex-CTO of unicorn, serial exiter), or measurable revenue growth that speaks for itself. The quality bar for a non-thesis 7+ is much higher than for thesis-fit companies.
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
