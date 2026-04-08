@@ -385,7 +385,7 @@ Keep responses mobile-friendly — short paragraphs, no walls of text. Lead with
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-harmonic-key', 'x-anthropic-key'],
+  allowedHeaders: ['Content-Type', 'x-harmonic-key', 'x-anthropic-key', 'x-scan-tier'],
 }));
 app.use(express.json({ limit: '5mb' }));
 
