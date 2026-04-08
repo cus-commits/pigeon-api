@@ -6847,7 +6847,24 @@ app.post('/api/twitter/check-activity', async (req, res) => {
 // RECURRING SCAN AGENT — Long-running overnight deep scan
 // ==========================================
 
-if (!global._recurringScan) global._recurringScan = { status: 'idle', progress: '', stats: {}, results: null, startedAt: null };
+if (!global._recurringScan) global._recurringScan = { status: 'idle', progress: '', stats: {}, results: null, startedAt: null, tier: null };
+
+const SCAN_TIERS = {
+  scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 10,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet scores top 200 → Sonnet deep top 10' },
+  standard: { name: 'Standard',      cost: '$12', budget: 12,  preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 15,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet scores top 200 → Opus deep top 15' },
+  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 40,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen all → Sonnet scores top 500 → Opus deep top 40' },
+  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 60,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen all → Sonnet full scoring → Opus deep top 60' },
+  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 100, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline — Sonnet pre-screen all → Sonnet traction score → Opus deep top 100' },
+};
+
+const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
+function loadScanHistory() { try { return JSON.parse(fs.readFileSync(RECURRING_HISTORY_FILE, 'utf8')); } catch { return []; } }
+function saveScanHistory(history) { try { fs.writeFileSync(RECURRING_HISTORY_FILE, JSON.stringify(history.slice(0, 20), null, 2)); } catch (e) {} }
+
+app.get('/api/recurring-scan/tiers', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(SCAN_TIERS);
+});
 
 app.get('/api/recurring-scan/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -6863,6 +6880,11 @@ app.get('/api/recurring-scan/results', (req, res) => {
   } catch (e) {
     res.json({ results: [], timestamp: null });
   }
+});
+
+app.get('/api/recurring-scan/history', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(loadScanHistory());
 });
 
 app.post('/api/recurring-scan/cancel', (req, res) => {
@@ -6889,6 +6911,7 @@ app.post('/api/recurring-scan', async (req, res) => {
 
   const anthropicKey = req.headers['x-anthropic-key'] || req.body?.anthropicKey;
   const harmonicKey = process.env.HARMONIC_API_KEY;
+  const tierKey = req.headers['x-scan-tier'] || req.body?.tier || 'standard';
 
   if (!anthropicKey) {
     safeWrite(`data: ${JSON.stringify({ error: 'Anthropic API key required' })}\n\n`);
@@ -6902,18 +6925,22 @@ app.post('/api/recurring-scan', async (req, res) => {
     return res.end();
   }
 
+  const tier = SCAN_TIERS[tierKey] || SCAN_TIERS.standard;
+
   const scan = global._recurringScan;
   scan.status = 'scanning';
   scan.startedAt = Date.now();
   scan._cancelled = false;
+  scan.tier = { key: tierKey, ...tier };
   scan.stats = { savedSearches: 0, totalCompanies: 0, sonnetPassed: 0, enriched: 0, deepScored: 0, topResults: 0 };
-  scan.progress = 'Starting recurring scan agent...';
+  scan.progress = `Starting ${tier.name} scan ($${tier.budget} budget)...`;
   scan.results = null;
 
-  const BUDGET_MAX = 50.0; // $50 budget cap
+  const BUDGET_MAX = tier.budget;
   let budgetUsed = 0;
-  const SONNET_COST_PER_BATCH = 0.12; // ~60 companies per batch
-  const OPUS_COST_PER_COMPANY = 0.03; // deep analysis with extended thinking
+  const SONNET_COST_PER_BATCH = 0.12;
+  const OPUS_COST_PER_COMPANY = 0.03;
+  const HAIKU_COST_PER_BATCH = 0.02;
 
   const authHeaders = { apikey: harmonicKey, Accept: 'application/json' };
 
@@ -7012,8 +7039,9 @@ app.post('/api/recurring-scan', async (req, res) => {
     // ═══════════════════════════════════════════════
     // PHASE 3: Sonnet rapid pre-screen (traction-focused)
     // ═══════════════════════════════════════════════
-    scan.progress = `Sonnet pre-screening ${allCompanies.length} companies...`;
-    safeWrite(`: 🧠 Starting Sonnet pre-screen on ${allCompanies.length} companies...\n\n`);
+    const preModelName = tier.preModel.includes('haiku') ? 'Haiku' : 'Sonnet';
+    scan.progress = `${preModelName} pre-screening ${allCompanies.length} companies...`;
+    safeWrite(`: 🧠 Starting ${preModelName} pre-screen on ${allCompanies.length} companies...\n\n`);
 
     // Sort: lowest funding first, stealth to back
     allCompanies.sort((a, b) => {
@@ -7023,7 +7051,7 @@ app.post('/api/recurring-scan', async (req, res) => {
       return (a.funding_total || 0) - (b.funding_total || 0);
     });
 
-    const PRE_BATCH = 120;
+    const PRE_BATCH = tier.preBatch;
     const preBatches = Math.ceil(allCompanies.length / PRE_BATCH);
     const sonnetPassIds = new Set();
 
@@ -7084,10 +7112,10 @@ ${batchText}`;
         const sRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prePrompt }] }),
+          body: JSON.stringify({ model: tier.preModel, max_tokens: 4000, messages: [{ role: 'user', content: prePrompt }] }),
         });
 
-        budgetUsed += SONNET_COST_PER_BATCH;
+        budgetUsed += tier.preModel.includes('haiku') ? HAIKU_COST_PER_BATCH : SONNET_COST_PER_BATCH;
 
         if (sRes.ok) {
           const sData = await sRes.json();
@@ -7183,7 +7211,7 @@ ${batchText}`;
 
     // Sonnet deep screen with full enriched data
     const portfolioContext = await fetchPortfolioContext();
-    const SCREEN_BATCH = 50;
+    const SCREEN_BATCH = tier.screenBatch;
     const screenBatches = Math.ceil(filtered.length / SCREEN_BATCH);
     const screenPassNames = new Set();
     let screenAnalysis = '';
@@ -7272,7 +7300,7 @@ ${batchText}`;
         const sRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: screenPrompt }] }),
+          body: JSON.stringify({ model: tier.screenModel, max_tokens: 4000, messages: [{ role: 'user', content: screenPrompt }] }),
         });
         budgetUsed += SONNET_COST_PER_BATCH;
 
@@ -7318,15 +7346,17 @@ ${batchText}`;
     // ═══════════════════════════════════════════════
     // PHASE 6: Opus deep analysis — top ~100 companies
     // ═══════════════════════════════════════════════
-    const opusCap = Math.min(topCandidates.length, 100);
+    const deepModelName = tier.deepModel.includes('opus') ? 'Opus' : 'Sonnet';
+    const opusCap = Math.min(topCandidates.length, tier.deepMax);
     const opusBatch = topCandidates.slice(0, opusCap);
     const remainingBudget = BUDGET_MAX - budgetUsed;
-    const maxOpusCompanies = Math.min(opusCap, Math.floor(remainingBudget / OPUS_COST_PER_COMPANY));
+    const costPerDeep = tier.deepModel.includes('opus') ? OPUS_COST_PER_COMPANY : SONNET_COST_PER_BATCH / 15;
+    const maxOpusCompanies = Math.min(opusCap, Math.floor(remainingBudget / costPerDeep));
 
-    scan.progress = `Opus deep analysis on top ${maxOpusCompanies} companies...`;
-    safeWrite(`: 🧠 Starting Opus deep thinking on ${maxOpusCompanies} companies (budget remaining: $${remainingBudget.toFixed(2)})\n\n`);
+    scan.progress = `${deepModelName} deep analysis on top ${maxOpusCompanies} companies...`;
+    safeWrite(`: 🧠 Starting ${deepModelName} deep analysis on ${maxOpusCompanies} companies (budget remaining: $${remainingBudget.toFixed(2)})\n\n`);
 
-    const OPUS_DEEP_BATCH = 15; // Smaller batches for deeper analysis
+    const OPUS_DEEP_BATCH = tier.deepBatch;
     const opusDeepBatches = Math.ceil(maxOpusCompanies / OPUS_DEEP_BATCH);
     const deepResults = [];
 
@@ -7374,9 +7404,9 @@ ${batchText}`;
         const oRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 8000, messages: [{ role: 'user', content: deepPrompt }] }),
+          body: JSON.stringify({ model: tier.deepModel, max_tokens: 8000, messages: [{ role: 'user', content: deepPrompt }] }),
         });
-        budgetUsed += batch.length * OPUS_COST_PER_COMPANY;
+        budgetUsed += batch.length * costPerDeep;
 
         if (oRes.ok) {
           const oData = await oRes.json();
@@ -7433,10 +7463,18 @@ ${batchText}`;
       budgetUsed: budgetUsed.toFixed(2),
       timestamp: new Date().toISOString(),
       duration: Math.round((Date.now() - scan.startedAt) / 1000),
+      tier: { key: tierKey, name: tier.name, cost: tier.cost },
     };
 
     const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
     try { fs.writeFileSync(RESULTS_FILE, JSON.stringify(finalResults, null, 2)); } catch (e) {}
+
+    // Append to history (keep last 20)
+    try {
+      const history = loadScanHistory();
+      history.unshift(finalResults);
+      saveScanHistory(history);
+    } catch (e) {}
 
     scan.status = 'done';
     scan.progress = `Complete — ${deepResults.length} companies deep-scored, ${scan.stats.topResults} rated 7+`;
