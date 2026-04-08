@@ -6850,11 +6850,11 @@ app.post('/api/twitter/check-activity', async (req, res) => {
 if (!global._recurringScan) global._recurringScan = { status: 'idle', progress: '', stats: {}, results: null, startedAt: null, tier: null };
 
 const SCAN_TIERS = {
-  scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 10,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet scores top 200 → Sonnet deep top 10' },
-  standard: { name: 'Standard',      cost: '$12', budget: 12,  preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 15,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet scores top 200 → Opus deep top 15' },
-  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 40,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen all → Sonnet scores top 500 → Opus deep top 40' },
-  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 60,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen all → Sonnet full scoring → Opus deep top 60' },
-  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 100, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline — Sonnet pre-screen all → Sonnet traction score → Opus deep top 100' },
+  scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   ddPush: 2,  preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 10,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet top 200 → Sonnet deep 10 → top 2 to DD' },
+  standard: { name: 'Standard',      cost: '$12', budget: 12,  ddPush: 5,  preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 15,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet top 200 → Opus deep 15 → top 5 to DD' },
+  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 8,  preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 40,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet top 500 → Opus deep 40 → top 8 to DD' },
+  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 12, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 60,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet full scoring → Opus deep 60 → top 12 to DD' },
+  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 20, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 100, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep 100 → top 20 to DD' },
 };
 
 const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
@@ -6913,6 +6913,15 @@ app.post('/api/recurring-scan', async (req, res) => {
   const harmonicKey = process.env.HARMONIC_API_KEY;
   const tierKey = req.headers['x-scan-tier'] || req.body?.tier || 'standard';
 
+  // Parse body for options (keywords, portcos, CRM stages)
+  let bodyData = {};
+  try {
+    if (req.body && typeof req.body === 'object') bodyData = req.body;
+  } catch (e) {}
+  const includePortcos = bodyData.includePortcos || false;
+  const crmStages = bodyData.crmStages || []; // ['BO','BORO','BORO-SM','Warm']
+  const keywords = bodyData.keywords || '';
+
   if (!anthropicKey) {
     safeWrite(`data: ${JSON.stringify({ error: 'Anthropic API key required' })}\n\n`);
     clearInterval(keepalive);
@@ -6932,9 +6941,10 @@ app.post('/api/recurring-scan', async (req, res) => {
   scan.startedAt = Date.now();
   scan._cancelled = false;
   scan.tier = { key: tierKey, ...tier };
-  scan.stats = { savedSearches: 0, totalCompanies: 0, sonnetPassed: 0, enriched: 0, deepScored: 0, topResults: 0 };
+  scan.stats = { savedSearches: 0, totalCompanies: 0, sonnetPassed: 0, enriched: 0, deepScored: 0, topResults: 0, ddPushed: 0 };
   scan.progress = `Starting ${tier.name} scan ($${tier.budget} budget)...`;
   scan.results = null;
+  scan.options = { includePortcos, crmStages, keywords };
 
   const BUDGET_MAX = tier.budget;
   let budgetUsed = 0;
@@ -6943,6 +6953,54 @@ app.post('/api/recurring-scan', async (req, res) => {
   const HAIKU_COST_PER_BATCH = 0.02;
 
   const authHeaders = { apikey: harmonicKey, Accept: 'application/json' };
+
+  // Build context from portcos and CRM companies for similarity scoring
+  let similarityContext = '';
+  try {
+    const contextParts = [];
+
+    if (includePortcos) {
+      safeWrite(`: 📂 Loading portfolio companies for similarity context...\n\n`);
+      const PORTCOS = ['steel.dev','bubblemaps.io','pump.fun','xverse.app','trendex.vip','haloo.ai','hirechain.io','botanixlabs.xyz','pear.garden','lagoon.finance','aura.fun','ord.io','kinddesigns.com','raze.finance','bound.money','worm.wtf','vest.markets'];
+      contextParts.push(`PORTFOLIO COMPANIES (find similar to these):\n${PORTCOS.map(d => `- ${d}`).join('\n')}`);
+    }
+
+    if (crmStages.length > 0) {
+      safeWrite(`: 📋 Loading CRM companies from ${crmStages.join(', ')}...\n\n`);
+      const airtableBase = process.env.AIRTABLE_BASE_ID;
+      const airtableTable = process.env.AIRTABLE_TABLE || 'All Companies';
+      const airtableToken = process.env.AIRTABLE_TOKEN;
+      const crmCompanies = [];
+      for (const stage of crmStages) {
+        try {
+          const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
+          const url = `https://api.airtable.com/v0/${airtableBase}/${encodeURIComponent(airtableTable)}?filterByFormula=${formula}&maxRecords=50&fields[]=Company&fields[]=Sector&fields[]=Company Link`;
+          const r = await fetch(url, { headers: { Authorization: `Bearer ${airtableToken}` } });
+          if (r.ok) {
+            const data = await r.json();
+            const names = (data.records || []).map(rec => {
+              const f = rec.fields || {};
+              return `${f.Company || '?'}${f.Sector ? ` (${f.Sector})` : ''}`;
+            });
+            if (names.length > 0) crmCompanies.push(`${stage}: ${names.join(', ')}`);
+          }
+        } catch (e) {}
+      }
+      if (crmCompanies.length > 0) {
+        contextParts.push(`CRM PIPELINE COMPANIES (find similar to these):\n${crmCompanies.join('\n')}`);
+      }
+    }
+
+    if (keywords) {
+      contextParts.push(`PRIORITY KEYWORDS/CONCEPTS:\n${keywords}`);
+    }
+
+    if (contextParts.length > 0) {
+      similarityContext = '\n\nADDITIONAL SEARCH CONTEXT:\n' + contextParts.join('\n\n') + '\n\nUse the above context to BOOST companies that are similar to our portfolio/pipeline or match our keywords. Companies resembling our existing interests should score higher.\n';
+    }
+  } catch (e) {
+    console.error('[RecurringScan] Context building error:', e.message);
+  }
 
   try {
     // ═══════════════════════════════════════════════
@@ -7105,7 +7163,7 @@ AUTO-CUT:
 - Companies with no website and no traction
 
 TARGET: Pass ~10-15% ONLY. Be extremely selective. We want REAL traction + NOVEL products.
-
+${similarityContext}
 COMPANIES:
 ${batchText}`;
 
@@ -7293,7 +7351,7 @@ FORMAT (one per company):
 Reason: [2-3 sentences on traction signals, product novelty, founder quality]
 
 Only companies scoring 7+ should be considered PASS.
-
+${similarityContext}
 COMPANIES:
 ${batchText}`;
 
@@ -7397,7 +7455,7 @@ FORMAT:
 **Risk**: [primary concern]
 
 Be brutally honest. A 9-10 means "call the founder tomorrow." A 7-8 means "worth a meeting." Below 7 means it shouldn't have made it this far.
-
+${similarityContext}
 COMPANIES:
 ${batchText}`;
 
@@ -7456,6 +7514,46 @@ ${batchText}`;
     // ═══════════════════════════════════════════════
     // PHASE 7: Save results
     // ═══════════════════════════════════════════════
+    // Push top N results to DD/vetting pipeline
+    const ddCount = Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
+    const ddCompanies = deepResults.slice(0, ddCount).map(r => ({
+      id: r.card?.id || 0,
+      name: r.name,
+      website: r.card?.website || '',
+      description: r.card?.description || '',
+      logo_url: r.card?.logo_url || '',
+      funding_total: r.card?.funding_total || 0,
+      funding_stage: r.card?.funding_stage || '',
+      headcount: r.card?.headcount || 0,
+      location: r.card?.location || '',
+      _score: r.score,
+      _confidence: r.confidence,
+      _analysis: (r.analysis || '').slice(0, 500),
+      _sourceSearch: r._sourceSearch || '',
+    }));
+
+    let ddPushed = 0;
+    if (ddCompanies.length > 0) {
+      try {
+        const VETTING_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'vetting.json');
+        let vetting = [];
+        try { vetting = JSON.parse(fs.readFileSync(VETTING_FILE, 'utf8')); } catch (e) {}
+        const existingNames = new Set(vetting.map(v => (v.name || '').toLowerCase()));
+        for (const co of ddCompanies) {
+          if (!existingNames.has(co.name.toLowerCase())) {
+            vetting.push({ ...co, addedAt: Date.now(), source: `recurring-scan-${tierKey}`, votes: {}, dismissed: false, hiddenBy: [] });
+            ddPushed++;
+          }
+        }
+        fs.writeFileSync(VETTING_FILE, JSON.stringify(vetting, null, 2));
+        safeWrite(`: 📤 Pushed ${ddPushed} companies to DD pipeline\n\n`);
+      } catch (e) {
+        console.error('[RecurringScan] DD push error:', e.message);
+      }
+    }
+
+    scan.stats.ddPushed = ddPushed;
+
     const finalResults = {
       results: deepResults,
       screenAnalysis,
@@ -7463,7 +7561,8 @@ ${batchText}`;
       budgetUsed: budgetUsed.toFixed(2),
       timestamp: new Date().toISOString(),
       duration: Math.round((Date.now() - scan.startedAt) / 1000),
-      tier: { key: tierKey, name: tier.name, cost: tier.cost },
+      tier: { key: tierKey, name: tier.name, cost: tier.cost, ddPush: tier.ddPush },
+      options: { includePortcos, crmStages, keywords },
     };
 
     const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
@@ -7477,11 +7576,12 @@ ${batchText}`;
     } catch (e) {}
 
     scan.status = 'done';
-    scan.progress = `Complete — ${deepResults.length} companies deep-scored, ${scan.stats.topResults} rated 7+`;
+    scan.progress = `Complete — ${deepResults.length} deep-scored, ${scan.stats.topResults} rated 7+, ${ddPushed} pushed to DD`;
     scan.results = finalResults;
 
     safeWrite(`: 🏁 SCAN COMPLETE\n\n`);
     safeWrite(`: 📊 ${allCompanies.length} sourced → ${survivors.length} pre-screened → ${topCandidates.length} scored 7+ → ${deepResults.length} deep-analyzed\n\n`);
+    safeWrite(`: 📤 ${ddPushed} top companies pushed to DD pipeline\n\n`);
     safeWrite(`: 💰 Budget used: $${budgetUsed.toFixed(2)} / $${BUDGET_MAX}\n\n`);
     safeWrite(`: ⏱️ Duration: ${Math.round((Date.now() - scan.startedAt) / 60000)} minutes\n\n`);
     safeWrite(`data: ${JSON.stringify(finalResults)}\n\n`);
