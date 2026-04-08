@@ -6847,7 +6847,24 @@ app.post('/api/twitter/check-activity', async (req, res) => {
 // RECURRING SCAN AGENT — Long-running overnight deep scan
 // ==========================================
 
-if (!global._recurringScan) global._recurringScan = { status: 'idle', progress: '', stats: {}, results: null, startedAt: null, tier: null };
+// Persist scan state to disk so it survives restarts
+const SCAN_STATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_state.json');
+function loadScanState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SCAN_STATE_FILE, 'utf8'));
+    // If it was scanning when server died, mark as interrupted
+    if (data.status === 'scanning') {
+      data.status = 'interrupted';
+      data.progress = `Interrupted (server restarted) — was at: ${data.progress || 'unknown phase'}`;
+      saveScanState(data);
+    }
+    return data;
+  } catch { return { status: 'idle', progress: '', stats: {}, results: null, startedAt: null, tier: null }; }
+}
+function saveScanState(state) {
+  try { fs.writeFileSync(SCAN_STATE_FILE, JSON.stringify(state)); } catch (e) {}
+}
+if (!global._recurringScan) global._recurringScan = loadScanState();
 
 const SCAN_TIERS = {
   scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   ddPush: 2,  preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 10,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet top 200 → Sonnet deep 10 → top 2 to DD' },
@@ -6907,7 +6924,7 @@ app.post('/api/recurring-scan', async (req, res) => {
   req.on('close', () => { clientConnected = false; });
 
   const safeWrite = (msg) => { try { if (clientConnected) res.write(msg); } catch (e) {} };
-  const keepalive = setInterval(() => safeWrite(': keepalive\n\n'), 5000);
+  const keepalive = setInterval(() => { safeWrite(': keepalive\n\n'); try { saveScanState({ status: global._recurringScan.status, progress: global._recurringScan.progress, stats: { ...global._recurringScan.stats }, startedAt: global._recurringScan.startedAt, tier: global._recurringScan.tier }); } catch(e){} }, 5000);
 
   const anthropicKey = req.headers['x-anthropic-key'] || req.body?.anthropicKey;
   const harmonicKey = process.env.HARMONIC_API_KEY;
@@ -6940,11 +6957,14 @@ app.post('/api/recurring-scan', async (req, res) => {
   scan.status = 'scanning';
   scan.startedAt = Date.now();
   scan._cancelled = false;
+  // Periodic state persistence (every progress update)
+  const persistState = () => { try { saveScanState({ status: scan.status, progress: scan.progress, stats: { ...scan.stats }, startedAt: scan.startedAt, tier: scan.tier }); } catch (e) {} };
   scan.tier = { key: tierKey, ...tier };
   scan.stats = { savedSearches: 0, totalCompanies: 0, sonnetPassed: 0, enriched: 0, deepScored: 0, topResults: 0, ddPushed: 0 };
   scan.progress = `Starting ${tier.name} scan ($${tier.budget} budget)...`;
   scan.results = null;
   scan.options = { includePortcos, crmStages, keywords };
+  persistState();
 
   const BUDGET_MAX = tier.budget;
   let budgetUsed = 0;
@@ -7596,6 +7616,7 @@ ${batchText}`;
     scan.status = 'done';
     scan.progress = `Complete — ${deepResults.length} deep-scored, ${scan.stats.topResults} rated 7+, ${ddPushed} pushed to DD`;
     scan.results = finalResults;
+    persistState();
 
     safeWrite(`: 🏁 SCAN COMPLETE\n\n`);
     safeWrite(`: 📊 ${allCompanies.length} sourced → ${survivors.length} pre-screened → ${topCandidates.length} scored 7+ → ${deepResults.length} deep-analyzed\n\n`);
