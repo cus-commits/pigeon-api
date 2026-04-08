@@ -6843,6 +6843,628 @@ app.post('/api/twitter/check-activity', async (req, res) => {
   res.json({ results });
 });
 
+// ==========================================
+// RECURRING SCAN AGENT — Long-running overnight deep scan
+// ==========================================
+
+if (!global._recurringScan) global._recurringScan = { status: 'idle', progress: '', stats: {}, results: null, startedAt: null };
+
+app.get('/api/recurring-scan/status', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(global._recurringScan);
+});
+
+app.get('/api/recurring-scan/results', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf8'));
+    res.json(data);
+  } catch (e) {
+    res.json({ results: [], timestamp: null });
+  }
+});
+
+app.post('/api/recurring-scan/cancel', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (global._recurringScan.status === 'scanning') {
+    global._recurringScan._cancelled = true;
+    global._recurringScan.status = 'cancelled';
+    global._recurringScan.progress = 'Cancelled by user';
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/recurring-scan', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  let clientConnected = true;
+  req.on('close', () => { clientConnected = false; });
+
+  const safeWrite = (msg) => { try { if (clientConnected) res.write(msg); } catch (e) {} };
+  const keepalive = setInterval(() => safeWrite(': keepalive\n\n'), 5000);
+
+  const anthropicKey = req.headers['x-anthropic-key'] || req.body?.anthropicKey;
+  const harmonicKey = process.env.HARMONIC_API_KEY;
+
+  if (!anthropicKey) {
+    safeWrite(`data: ${JSON.stringify({ error: 'Anthropic API key required' })}\n\n`);
+    clearInterval(keepalive);
+    return res.end();
+  }
+
+  if (global._recurringScan.status === 'scanning') {
+    safeWrite(`data: ${JSON.stringify({ error: 'A recurring scan is already running' })}\n\n`);
+    clearInterval(keepalive);
+    return res.end();
+  }
+
+  const scan = global._recurringScan;
+  scan.status = 'scanning';
+  scan.startedAt = Date.now();
+  scan._cancelled = false;
+  scan.stats = { savedSearches: 0, totalCompanies: 0, sonnetPassed: 0, enriched: 0, deepScored: 0, topResults: 0 };
+  scan.progress = 'Starting recurring scan agent...';
+  scan.results = null;
+
+  const BUDGET_MAX = 50.0; // $50 budget cap
+  let budgetUsed = 0;
+  const SONNET_COST_PER_BATCH = 0.12; // ~60 companies per batch
+  const OPUS_COST_PER_COMPANY = 0.03; // deep analysis with extended thinking
+
+  const authHeaders = { apikey: harmonicKey, Accept: 'application/json' };
+
+  try {
+    // ═══════════════════════════════════════════════
+    // PHASE 1: Fetch ALL saved searches
+    // ═══════════════════════════════════════════════
+    scan.progress = 'Fetching saved searches from Harmonic...';
+    safeWrite(`: 🔍 Fetching all saved searches...\n\n`);
+
+    const searchesRes = await fetch(`${HARMONIC_BASE}/savedSearches`, { headers: authHeaders });
+    if (!searchesRes.ok) throw new Error(`Harmonic saved searches failed: ${searchesRes.status}`);
+    const searchesData = await searchesRes.json();
+    const allSearches = (Array.isArray(searchesData) ? searchesData : (searchesData.results || [])).filter(s => {
+      const type = (s.type || '').toUpperCase();
+      return type !== 'PERSONS_LIST' && type !== 'PERSONS' && type !== 'PERSON' && type !== 'PEOPLE';
+    });
+
+    scan.stats.savedSearches = allSearches.length;
+    safeWrite(`: 📋 Found ${allSearches.length} saved searches — fetching all results...\n\n`);
+    console.log(`[RecurringScan] Found ${allSearches.length} saved searches`);
+
+    // ═══════════════════════════════════════════════
+    // PHASE 2: Fetch companies from ALL saved searches
+    // ═══════════════════════════════════════════════
+    const allCompanies = [];
+    const seenIds = new Set();
+    const seenSet = new Set(); // dismissed companies
+
+    // Load dismissed IDs
+    try {
+      const SEEN_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'autoscan_seen.json');
+      const seenData = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
+      Object.values(seenData).forEach(arr => { if (Array.isArray(arr)) arr.forEach(id => seenSet.add(String(id))); });
+    } catch (e) {}
+
+    for (let si = 0; si < allSearches.length; si++) {
+      if (scan._cancelled) break;
+      const search = allSearches[si];
+      const searchName = search.name || search.title || `Search ${search.id}`;
+      scan.progress = `Fetching search ${si + 1}/${allSearches.length}: "${searchName}"`;
+      safeWrite(`: 📡 [${si + 1}/${allSearches.length}] Fetching "${searchName}"...\n\n`);
+
+      try {
+        let afterCursor = null;
+        let page = 0;
+        do {
+          let url = `${HARMONIC_BASE}/savedSearches:results/${search.id}?size=500`;
+          if (afterCursor) url += `&cursor=${encodeURIComponent(afterCursor)}`;
+
+          let fetchRes = null;
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+              const controller = new AbortController();
+              const timeout = setTimeout(() => controller.abort(), 120000);
+              fetchRes = await fetch(url, { headers: authHeaders, signal: controller.signal });
+              clearTimeout(timeout);
+              if (fetchRes.ok) break;
+              fetchRes = null;
+            } catch (e) { fetchRes = null; }
+            if (attempt < 2) await sleep(2000);
+          }
+          if (!fetchRes || !fetchRes.ok) break;
+
+          const data = await fetchRes.json();
+          const batch = extractCompaniesFromSavedSearch(data);
+          let newCount = 0;
+          for (const c of batch) {
+            const cid = String(c.id || c.entity_id || (c.entity_urn || '').split(':').pop());
+            if (cid && !seenIds.has(cid) && !seenSet.has(cid)) {
+              seenIds.add(cid);
+              c._sourceSearch = searchName;
+              allCompanies.push(c);
+              newCount++;
+            }
+          }
+          page++;
+          const pi = data.page_info || data.pageInfo || {};
+          const hasNext = pi.has_next || pi.has_next_page || false;
+          const nextCursor = pi.next || pi.end_cursor || null;
+          if (batch.length === 0 || newCount === 0 || !hasNext || !nextCursor) break;
+          afterCursor = nextCursor;
+          await sleep(100);
+        } while (page < 20);
+      } catch (e) {
+        console.error(`[RecurringScan] Search "${searchName}" error:`, e.message);
+      }
+    }
+
+    scan.stats.totalCompanies = allCompanies.length;
+    safeWrite(`: 📊 Total unique companies: ${allCompanies.length} from ${allSearches.length} searches\n\n`);
+    console.log(`[RecurringScan] Total unique companies: ${allCompanies.length}`);
+
+    if (scan._cancelled) throw new Error('Cancelled');
+
+    // ═══════════════════════════════════════════════
+    // PHASE 3: Sonnet rapid pre-screen (traction-focused)
+    // ═══════════════════════════════════════════════
+    scan.progress = `Sonnet pre-screening ${allCompanies.length} companies...`;
+    safeWrite(`: 🧠 Starting Sonnet pre-screen on ${allCompanies.length} companies...\n\n`);
+
+    // Sort: lowest funding first, stealth to back
+    allCompanies.sort((a, b) => {
+      const aS = (a.name || '').toLowerCase().includes('stealth') ? 1 : 0;
+      const bS = (b.name || '').toLowerCase().includes('stealth') ? 1 : 0;
+      if (aS !== bS) return aS - bS;
+      return (a.funding_total || 0) - (b.funding_total || 0);
+    });
+
+    const PRE_BATCH = 120;
+    const preBatches = Math.ceil(allCompanies.length / PRE_BATCH);
+    const sonnetPassIds = new Set();
+
+    // Build minimal company text for pre-screen
+    function miniCompanyText(companies) {
+      return companies.map((c, i) => {
+        const parts = [`${i + 1}. **${c.name || 'Unknown'}**`];
+        if (c.description) parts.push(`   ${(c.description || '').slice(0, 200)}`);
+        if (c.website || c.domain) parts.push(`   Web: ${c.website || c.domain}`);
+        if (c.funding_total) parts.push(`   Raised: $${c.funding_total >= 1e6 ? (c.funding_total/1e6).toFixed(1)+'M' : (c.funding_total/1e3).toFixed(0)+'K'}`);
+        if (c.funding_stage) parts.push(`   Stage: ${c.funding_stage}`);
+        if (c.headcount) parts.push(`   Team: ${c.headcount}`);
+        if (c.founded_date || c.founded) parts.push(`   Founded: ${c.founded_date || c.founded}`);
+        if (c._sourceSearch) parts.push(`   Source: ${c._sourceSearch}`);
+        return parts.join('\n');
+      }).join('\n\n');
+    }
+
+    for (let bi = 0; bi < preBatches; bi++) {
+      if (scan._cancelled) break;
+      if (budgetUsed >= BUDGET_MAX * 0.6) {
+        safeWrite(`: ⚠️ Budget guard: ${budgetUsed.toFixed(2)}/${BUDGET_MAX} — stopping pre-screen, keeping ${sonnetPassIds.size} passes\n\n`);
+        break;
+      }
+
+      const batch = allCompanies.slice(bi * PRE_BATCH, (bi + 1) * PRE_BATCH);
+      const batchText = miniCompanyText(batch);
+
+      scan.progress = `Sonnet pre-screen batch ${bi + 1}/${preBatches} — ${sonnetPassIds.size} passed`;
+      safeWrite(`: 🔬 Pre-screen batch ${bi + 1}/${preBatches} (${batch.length} companies, ${sonnetPassIds.size} passed so far)\n\n`);
+
+      try {
+        const prePrompt = `You are a rapid deal screener for Daxos Capital ($100K-$250K, Pre-Seed/Seed).
+
+TASK: For each company, output ONE line: CompanyName — PASS or CUT — [3-5 word reason]
+
+PASS criteria (must meet 2+):
+- Post-revenue or clear user traction (web traffic, users, growth signals)
+- Recently launched and gaining momentum (hockey stick potential)
+- Low funding (<$5M raised) but real product success — NOT vaporware
+- Novel/disruptive product that solves a real problem
+- Strong founder pedigree (ex-Tesla, Citadel, YC, Erebor, top-tier companies)
+- Genuine product-market fit signals
+
+AUTO-CUT:
+- Stealth/pre-launch with no product
+- VC funds, accelerators, consulting firms
+- >$20M raised (too late for us)
+- Vibe-coded/no-substance projects
+- Carbon/climate/charity
+- Companies with no website and no traction
+
+TARGET: Pass ~10-15% ONLY. Be extremely selective. We want REAL traction + NOVEL products.
+
+COMPANIES:
+${batchText}`;
+
+        const sRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prePrompt }] }),
+        });
+
+        budgetUsed += SONNET_COST_PER_BATCH;
+
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          const sText = sData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+
+          const passMatches = sText.matchAll(/([^\n—\-]+?)\s*[—\-–]\s*PASS/gi);
+          for (const m of passMatches) {
+            const name = m[1].trim().replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').toLowerCase().trim();
+            if (name.length > 1) {
+              // Find matching company index to track
+              const matchIdx = batch.findIndex(c => (c.name || '').toLowerCase().trim() === name ||
+                (c.name || '').toLowerCase().replace(/\s*\(.*?\)/g, '').trim() === name);
+              if (matchIdx >= 0) sonnetPassIds.add(bi * PRE_BATCH + matchIdx);
+              else {
+                // Fuzzy match
+                const fuzzyIdx = batch.findIndex(c => {
+                  const cn = (c.name || '').toLowerCase().trim();
+                  return cn.includes(name) || name.includes(cn);
+                });
+                if (fuzzyIdx >= 0) sonnetPassIds.add(bi * PRE_BATCH + fuzzyIdx);
+              }
+            }
+          }
+
+          // Stream some verdicts
+          const lines = sText.split('\n').filter(l => l.includes('PASS') || l.includes('CUT')).slice(0, 6);
+          for (const line of lines) {
+            const isPASS = line.includes('PASS');
+            const compName = line.split(/\s*[—\-–]\s*/)[0].replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').trim().slice(0, 30);
+            if (compName.length > 2) safeWrite(`: ${isPASS ? '✅' : '❌'} ${compName}\n\n`);
+          }
+        }
+      } catch (e) {
+        console.error(`[RecurringScan] Pre-screen batch ${bi + 1} error:`, e.message);
+      }
+      await sleep(300);
+    }
+
+    const survivors = [...sonnetPassIds].map(idx => allCompanies[idx]).filter(Boolean);
+    scan.stats.sonnetPassed = survivors.length;
+    safeWrite(`: ✅ Pre-screen complete: ${survivors.length} of ${allCompanies.length} passed (${((survivors.length / allCompanies.length) * 100).toFixed(1)}%)\n\n`);
+    console.log(`[RecurringScan] Pre-screen: ${survivors.length}/${allCompanies.length} passed`);
+
+    if (scan._cancelled) throw new Error('Cancelled');
+
+    // ═══════════════════════════════════════════════
+    // PHASE 4: GQL enrichment of survivors
+    // ═══════════════════════════════════════════════
+    scan.progress = `Enriching ${survivors.length} companies with full data...`;
+    safeWrite(`: 📥 Enriching ${survivors.length} companies via Harmonic GQL...\n\n`);
+
+    const companyIds = survivors.map(c => parseInt(c.id || c.entity_id || (c.entity_urn || '').split(':').pop())).filter(id => !isNaN(id) && id > 0);
+    let enrichedCards = [];
+    if (companyIds.length > 0 && harmonicKey) {
+      enrichedCards = await gqlEnrichCompanies(companyIds, harmonicKey);
+      // Merge source search info
+      enrichedCards.forEach(card => {
+        const orig = survivors.find(s => {
+          const sid = String(s.id || s.entity_id || (s.entity_urn || '').split(':').pop());
+          return sid === String(card.id);
+        });
+        if (orig) card._sourceSearch = orig._sourceSearch;
+      });
+    }
+
+    scan.stats.enriched = enrichedCards.length;
+    safeWrite(`: 📊 Enriched ${enrichedCards.length} companies\n\n`);
+
+    if (scan._cancelled) throw new Error('Cancelled');
+
+    // ═══════════════════════════════════════════════
+    // PHASE 5: Sonnet traction-focused scoring (post-enrichment)
+    // ═══════════════════════════════════════════════
+    // Filter out VCs, wrong-stage, etc
+    const filtered = enrichedCards.filter(c => {
+      const desc = ((c.description || '') + ' ' + (c.tags || []).join(' ')).toLowerCase();
+      if (/\b(venture capital|vc firm|private equity|hedge fund|asset management|family office|accelerator|incubator)\b/.test(desc)) return false;
+      if ((c.funding_total || 0) > 20000000) return false;
+      if ((c.name || '').toLowerCase().includes('stealth')) return false;
+      return true;
+    });
+
+    safeWrite(`: 🔽 Filtered to ${filtered.length} (removed ${enrichedCards.length - filtered.length} VCs/late-stage/stealth)\n\n`);
+
+    // Sort by traction signals — web traffic first
+    filtered.sort((a, b) => {
+      const aWeb = a.traction?.webTraffic || 0;
+      const bWeb = b.traction?.webTraffic || 0;
+      const aGrowth = a.traction?.webGrowth30d || 0;
+      const bGrowth = b.traction?.webGrowth30d || 0;
+      return (bWeb + bGrowth * 1000) - (aWeb + aGrowth * 1000);
+    });
+
+    // Sonnet deep screen with full enriched data
+    const portfolioContext = await fetchPortfolioContext();
+    const SCREEN_BATCH = 50;
+    const screenBatches = Math.ceil(filtered.length / SCREEN_BATCH);
+    const screenPassNames = new Set();
+    let screenAnalysis = '';
+
+    scan.progress = `Sonnet scoring ${filtered.length} enriched companies...`;
+
+    function buildCompanyTextRecurring(cards, startIdx) {
+      return cards.map((c, i) => {
+        const parts = [`${startIdx + i + 1}. **${c.name}**`];
+        if (c._sourceSearch) parts.push(`   Source Search: ${c._sourceSearch}`);
+        if (c.description) parts.push(`   Desc: ${c.description.slice(0, 300)}`);
+        if (c.website) parts.push(`   Web: ${c.website}`);
+        if (c.funding_stage) parts.push(`   Stage: ${c.funding_stage}`);
+        if (c.funding_total) parts.push(`   Raised: $${c.funding_total >= 1e6 ? (c.funding_total/1e6).toFixed(1)+'M' : (c.funding_total/1e3).toFixed(0)+'K'}`);
+        if (c.funding_date) parts.push(`   Last Funding: ${c.funding_date}`);
+        if (c.headcount) parts.push(`   Team: ${c.headcount}`);
+        if (c.location) parts.push(`   Location: ${c.location}`);
+        if (c.founded) parts.push(`   Founded: ${c.founded}`);
+        if (c.investors?.length) parts.push(`   Investors: ${c.investors.join(', ')}`);
+        if (c.founders?.length) {
+          c.founders.forEach(f => {
+            const fl = [`   👤 ${f.name}`];
+            if (f.headline) fl.push(`      ${f.headline}`);
+            if (f.careerPath) fl.push(`      Career: ${f.careerPath}`);
+            if (f.education?.length) fl.push(`      Edu: ${f.education.map(e => `${e.degree || ''} @ ${e.school}`.trim()).join(', ')}`);
+            if (f.highlights?.length) fl.push(`      Notable: ${f.highlights.join('; ')}`);
+            parts.push(fl.join('\n'));
+          });
+        }
+        if (c.founder_prior_companies?.length) parts.push(`   Founder alumni: ${c.founder_prior_companies.join(', ')}`);
+        if (c.highlights?.length) parts.push(`   Highlights: ${c.highlights.slice(0, 3).join('; ')}`);
+        const t = c.traction || {};
+        const tm = [];
+        if (t.webTraffic) tm.push(`Web: ${t.webTraffic}/mo`);
+        if (t.webGrowth30d) tm.push(`Web30d: ${t.webGrowth30d > 0 ? '+' : ''}${t.webGrowth30d}%`);
+        if (t.webGrowth90d) tm.push(`Web90d: ${t.webGrowth90d > 0 ? '+' : ''}${t.webGrowth90d}%`);
+        if (t.hcGrowth30d) tm.push(`HC30d: ${t.hcGrowth30d > 0 ? '+' : ''}${t.hcGrowth30d}%`);
+        if (tm.length) parts.push(`   📈 Traction: ${tm.join(', ')}`);
+        return parts.join('\n');
+      }).join('\n\n');
+    }
+
+    for (let si = 0; si < screenBatches; si++) {
+      if (scan._cancelled) break;
+      if (budgetUsed >= BUDGET_MAX * 0.75) {
+        safeWrite(`: ⚠️ Budget ${budgetUsed.toFixed(2)}/${BUDGET_MAX} — stopping Sonnet screen\n\n`);
+        break;
+      }
+
+      const batch = filtered.slice(si * SCREEN_BATCH, (si + 1) * SCREEN_BATCH);
+      const batchText = buildCompanyTextRecurring(batch, si * SCREEN_BATCH);
+
+      scan.progress = `Sonnet scoring batch ${si + 1}/${screenBatches} — ${screenPassNames.size} winners`;
+      safeWrite(`: 🎯 Scoring batch ${si + 1}/${screenBatches} (${screenPassNames.size} winners so far)\n\n`);
+
+      try {
+        const screenPrompt = `You are a senior deal analyst for Daxos Capital ($100K-$250K, Pre-Seed/Seed).
+
+${portfolioContext ? portfolioContext : ''}
+
+MISSION: Find companies showing REAL TRACTION with GENUINELY NOVEL products. Score 1-10.
+
+HIGH SCORES (8-10):
+- Post-revenue with growing web traffic (hockey stick trajectory)
+- Recently launched, low funding, but real users/customers
+- Ex-Tesla/Citadel/YC/Erebor/top-tier founders building something novel
+- Clear product-market fit: users love it, organic growth
+- $0-5M raised but significant traction (we invest BEFORE the hype)
+
+LOW SCORES (1-4):
+- No traction, no users, no revenue, just an idea
+- Vibe-coded/AI-wrapper nonsense with no moat
+- >$10M raised without proportional traction
+- Consulting/services disguised as a startup
+- Me-too product in crowded market
+
+FORMAT (one per company):
+**CompanyName** — Score: X/10
+Reason: [2-3 sentences on traction signals, product novelty, founder quality]
+
+Only companies scoring 7+ should be considered PASS.
+
+COMPANIES:
+${batchText}`;
+
+        const sRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: screenPrompt }] }),
+        });
+        budgetUsed += SONNET_COST_PER_BATCH;
+
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          const sText = sData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+          screenAnalysis += sText + '\n\n';
+
+          // Parse scores — find companies scoring 7+
+          const scoreRegex = /\*\*([^*]+)\*\*\s*[—\-–]\s*Score:\s*(\d+)/gi;
+          let match;
+          while ((match = scoreRegex.exec(sText)) !== null) {
+            const name = match[1].trim();
+            const score = parseInt(match[2]);
+            if (score >= 7) screenPassNames.add(name.toLowerCase());
+          }
+
+          // Stream top scores
+          const highScores = sText.split('\n').filter(l => /Score:\s*[789]|Score:\s*10/i.test(l)).slice(0, 4);
+          for (const line of highScores) {
+            const cn = (line.match(/\*\*([^*]+)\*\*/) || [])[1] || '';
+            const sc = (line.match(/Score:\s*(\d+)/i) || [])[1] || '';
+            if (cn) safeWrite(`: 🏆 ${cn} — ${sc}/10\n\n`);
+          }
+        }
+      } catch (e) {
+        console.error(`[RecurringScan] Screen batch ${si + 1} error:`, e.message);
+      }
+      await sleep(300);
+    }
+
+    // Match screen passes to enriched cards
+    const topCandidates = filtered.filter(c => {
+      const n = (c.name || '').toLowerCase().trim();
+      return screenPassNames.has(n) || [...screenPassNames].some(p => p.includes(n) || n.includes(p));
+    });
+
+    safeWrite(`: 🎖️ Sonnet scoring complete: ${topCandidates.length} companies scored 7+ out of ${filtered.length}\n\n`);
+    console.log(`[RecurringScan] Sonnet screen: ${topCandidates.length} scored 7+ from ${filtered.length}`);
+
+    if (scan._cancelled) throw new Error('Cancelled');
+
+    // ═══════════════════════════════════════════════
+    // PHASE 6: Opus deep analysis — top ~100 companies
+    // ═══════════════════════════════════════════════
+    const opusCap = Math.min(topCandidates.length, 100);
+    const opusBatch = topCandidates.slice(0, opusCap);
+    const remainingBudget = BUDGET_MAX - budgetUsed;
+    const maxOpusCompanies = Math.min(opusCap, Math.floor(remainingBudget / OPUS_COST_PER_COMPANY));
+
+    scan.progress = `Opus deep analysis on top ${maxOpusCompanies} companies...`;
+    safeWrite(`: 🧠 Starting Opus deep thinking on ${maxOpusCompanies} companies (budget remaining: $${remainingBudget.toFixed(2)})\n\n`);
+
+    const OPUS_DEEP_BATCH = 15; // Smaller batches for deeper analysis
+    const opusDeepBatches = Math.ceil(maxOpusCompanies / OPUS_DEEP_BATCH);
+    const deepResults = [];
+
+    for (let oi = 0; oi < opusDeepBatches; oi++) {
+      if (scan._cancelled) break;
+      if (budgetUsed >= BUDGET_MAX) {
+        safeWrite(`: 💰 Budget cap reached ($${budgetUsed.toFixed(2)}/${BUDGET_MAX})\n\n`);
+        break;
+      }
+
+      const batch = opusBatch.slice(oi * OPUS_DEEP_BATCH, (oi + 1) * OPUS_DEEP_BATCH);
+      const batchText = buildCompanyTextRecurring(batch, oi * OPUS_DEEP_BATCH);
+
+      scan.progress = `Opus batch ${oi + 1}/${opusDeepBatches} — ${deepResults.length} deep-scored`;
+      safeWrite(`: 🔬 Opus deep batch ${oi + 1}/${opusDeepBatches} (${batch.length} companies)\n\n`);
+
+      try {
+        const deepPrompt = `You are Daxos Capital's top deal analyst performing DEEP due diligence.
+
+CONTEXT: These ${batch.length} companies survived screening of ${allCompanies.length} total companies. They represent the top ~1% from across all our Harmonic saved searches. Your job is to provide conviction-level analysis.
+
+${portfolioContext ? portfolioContext : ''}
+
+For EACH company, write a thorough investment paragraph covering:
+1. **Product & Market**: What they build, why it matters, market size signal
+2. **Traction Evidence**: Web traffic, user signals, revenue indicators, growth trajectory
+3. **Founder Quality**: Background, prior companies, education, why they're credible
+4. **Why Now**: Timing thesis — why this company at this stage
+5. **Risk Flags**: What could go wrong, competition, execution risk
+6. **Daxos Fit**: How it maps to our thesis (fintech, crypto, AI, exchanges, betting, etc.)
+
+FINAL SCORE: 1-10 with confidence level (High/Medium/Low)
+
+FORMAT:
+### CompanyName — Final Score: X/10 (Confidence: High/Medium/Low)
+[Full investment paragraph — 150-250 words]
+**Key Signal**: [single most compelling data point]
+**Risk**: [primary concern]
+
+Be brutally honest. A 9-10 means "call the founder tomorrow." A 7-8 means "worth a meeting." Below 7 means it shouldn't have made it this far.
+
+COMPANIES:
+${batchText}`;
+
+        const oRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 8000, messages: [{ role: 'user', content: deepPrompt }] }),
+        });
+        budgetUsed += batch.length * OPUS_COST_PER_COMPANY;
+
+        if (oRes.ok) {
+          const oData = await oRes.json();
+          const oText = oData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+
+          // Parse each company's deep analysis
+          const sections = oText.split(/###\s+/).filter(s => s.trim());
+          for (const section of sections) {
+            const nameMatch = section.match(/^([^—\n]+?)\s*[—\-–]\s*Final Score:\s*(\d+)\/10/i);
+            if (nameMatch) {
+              const companyName = nameMatch[1].trim().replace(/\*\*/g, '');
+              const score = parseInt(nameMatch[2]);
+              const confMatch = section.match(/Confidence:\s*(High|Medium|Low)/i);
+              const confidence = confMatch ? confMatch[1] : 'Medium';
+
+              // Find matching card
+              const card = batch.find(c => {
+                const cn = (c.name || '').toLowerCase();
+                const pn = companyName.toLowerCase();
+                return cn === pn || cn.includes(pn) || pn.includes(cn);
+              });
+
+              deepResults.push({
+                name: companyName,
+                score,
+                confidence,
+                analysis: section.trim(),
+                card: card || null,
+                _sourceSearch: card?._sourceSearch || '',
+              });
+
+              safeWrite(`: ${score >= 9 ? '🌟' : score >= 7 ? '⭐' : '📋'} ${companyName} — ${score}/10 (${confidence})\n\n`);
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[RecurringScan] Opus batch ${oi + 1} error:`, e.message);
+      }
+      await sleep(500);
+    }
+
+    // Sort deep results by score
+    deepResults.sort((a, b) => b.score - a.score || (a.confidence === 'High' ? -1 : 1));
+    scan.stats.deepScored = deepResults.length;
+    scan.stats.topResults = deepResults.filter(r => r.score >= 7).length;
+
+    // ═══════════════════════════════════════════════
+    // PHASE 7: Save results
+    // ═══════════════════════════════════════════════
+    const finalResults = {
+      results: deepResults,
+      screenAnalysis,
+      stats: scan.stats,
+      budgetUsed: budgetUsed.toFixed(2),
+      timestamp: new Date().toISOString(),
+      duration: Math.round((Date.now() - scan.startedAt) / 1000),
+    };
+
+    const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
+    try { fs.writeFileSync(RESULTS_FILE, JSON.stringify(finalResults, null, 2)); } catch (e) {}
+
+    scan.status = 'done';
+    scan.progress = `Complete — ${deepResults.length} companies deep-scored, ${scan.stats.topResults} rated 7+`;
+    scan.results = finalResults;
+
+    safeWrite(`: 🏁 SCAN COMPLETE\n\n`);
+    safeWrite(`: 📊 ${allCompanies.length} sourced → ${survivors.length} pre-screened → ${topCandidates.length} scored 7+ → ${deepResults.length} deep-analyzed\n\n`);
+    safeWrite(`: 💰 Budget used: $${budgetUsed.toFixed(2)} / $${BUDGET_MAX}\n\n`);
+    safeWrite(`: ⏱️ Duration: ${Math.round((Date.now() - scan.startedAt) / 60000)} minutes\n\n`);
+    safeWrite(`data: ${JSON.stringify(finalResults)}\n\n`);
+
+  } catch (e) {
+    if (e.message === 'Cancelled') {
+      scan.status = 'cancelled';
+      scan.progress = 'Cancelled by user';
+      safeWrite(`data: ${JSON.stringify({ error: 'Scan cancelled' })}\n\n`);
+    } else {
+      console.error('[RecurringScan] Fatal error:', e.message);
+      scan.status = 'error';
+      scan.progress = `Error: ${e.message}`;
+      safeWrite(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+    }
+  } finally {
+    clearInterval(keepalive);
+    res.end();
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Pigeon Finder API running on port ${PORT}`);
 });
