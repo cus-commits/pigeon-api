@@ -7910,6 +7910,7 @@ ${batchText}`;
 
 // ==========================================
 // REACHOUTS — Multi-platform DM tracker
+// Server-side 24/7 polling + extension sync
 // ==========================================
 
 const reachoutsData = {
@@ -7918,7 +7919,529 @@ const reachoutsData = {
   lastSync: {},
 };
 
-// Extension pushes scraped DMs here
+const reachoutsCredentials = {
+  gmail: null,
+  telegram: null,
+  twitter: null,
+  discord: null,
+  linkedin: null,
+};
+
+const pollingIntervals = {};
+
+function mergeReachoutsMessages(platform, newMessages) {
+  const existingByKey = {};
+  reachoutsData.messages.forEach(m => {
+    existingByKey[`${m.platform}:${m.conversationId}`] = m;
+  });
+  newMessages.forEach(msg => {
+    const key = `${platform}:${msg.conversationId}`;
+    const existing = existingByKey[key];
+    existingByKey[key] = {
+      platform,
+      conversationId: msg.conversationId,
+      senderName: msg.senderName || existing?.senderName || 'Unknown',
+      senderAvatar: msg.senderAvatar || existing?.senderAvatar || null,
+      lastMessage: msg.lastMessage || existing?.lastMessage || '',
+      timestamp: msg.timestamp || new Date().toISOString(),
+      unread: msg.unread !== undefined ? msg.unread : true,
+      url: msg.url || existing?.url || null,
+      markedRead: existing?.markedRead || false,
+    };
+  });
+  reachoutsData.messages = Object.values(existingByKey);
+  reachoutsData.lastSync[platform] = new Date().toISOString();
+}
+
+function startPolling(platform, fn, intervalMs) {
+  if (pollingIntervals[platform]) clearInterval(pollingIntervals[platform]);
+  console.log(`[Reachouts] Starting ${platform} polling every ${intervalMs / 1000}s`);
+  fn(); // run immediately
+  pollingIntervals[platform] = setInterval(fn, intervalMs);
+}
+
+function stopPolling(platform) {
+  if (pollingIntervals[platform]) {
+    clearInterval(pollingIntervals[platform]);
+    delete pollingIntervals[platform];
+    console.log(`[Reachouts] Stopped ${platform} polling`);
+  }
+}
+
+// ---- GMAIL (OAuth2 REST API) ----
+
+async function pollGmail() {
+  const creds = reachoutsCredentials.gmail;
+  if (!creds) return;
+  try {
+    // Refresh access token
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: creds.clientId,
+        client_secret: creds.clientSecret,
+        refresh_token: creds.refreshToken,
+        grant_type: 'refresh_token',
+      }),
+    });
+    const tokenData = await tokenResp.json();
+    if (!tokenData.access_token) {
+      console.error('[Reachouts/Gmail] Token refresh failed:', tokenData.error);
+      reachoutsData.platformStatus.gmail = { connected: false, error: tokenData.error || 'Token refresh failed' };
+      return;
+    }
+    const accessToken = tokenData.access_token;
+    const headers = { Authorization: `Bearer ${accessToken}` };
+
+    // Fetch unread messages (DMs = messages in inbox that are unread)
+    const listResp = await fetch(
+      'https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is%3Aunread+in%3Ainbox&maxResults=20',
+      { headers }
+    );
+    const listData = await listResp.json();
+    const messageIds = (listData.messages || []).map(m => m.id);
+
+    const messages = [];
+    for (const id of messageIds.slice(0, 15)) {
+      const msgResp = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
+        { headers }
+      );
+      const msgData = await msgResp.json();
+      const getHeader = (name) => msgData.payload?.headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+      const from = getHeader('From');
+      const subject = getHeader('Subject');
+      const date = getHeader('Date');
+
+      messages.push({
+        conversationId: `gmail-${msgData.threadId || id}`,
+        senderName: from.replace(/<.*>/, '').trim() || from,
+        lastMessage: subject,
+        timestamp: date ? new Date(date).toISOString() : new Date().toISOString(),
+        unread: true,
+        url: `https://mail.google.com/mail/u/0/#inbox/${msgData.threadId || id}`,
+      });
+    }
+
+    mergeReachoutsMessages('gmail', messages);
+    reachoutsData.platformStatus.gmail = { connected: true, lastSync: new Date().toISOString(), mode: 'api' };
+    console.log(`[Reachouts/Gmail] Synced ${messages.length} unread messages`);
+  } catch (e) {
+    console.error('[Reachouts/Gmail] Poll error:', e.message);
+    reachoutsData.platformStatus.gmail = { connected: true, lastSync: reachoutsData.lastSync.gmail, error: e.message };
+  }
+}
+
+// Gmail OAuth flow
+app.post('/api/reachouts/connect/gmail', (req, res) => {
+  const { clientId, clientSecret, refreshToken } = req.body;
+  if (!clientId || !clientSecret || !refreshToken) {
+    return res.status(400).json({ error: 'clientId, clientSecret, and refreshToken required' });
+  }
+  reachoutsCredentials.gmail = { clientId, clientSecret, refreshToken };
+  startPolling('gmail', pollGmail, 120000); // every 2 min
+  res.json({ ok: true, message: 'Gmail connected — polling every 2 minutes' });
+});
+
+app.get('/api/reachouts/connect/gmail/auth-url', (req, res) => {
+  const { clientId, redirectUri } = req.query;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+  const redirect = redirectUri || `https://pigeon-api.up.railway.app/api/reachouts/callback/gmail`;
+  const url = `https://accounts.google.com/o/oauth2/v2/auth?` +
+    `client_id=${encodeURIComponent(clientId)}` +
+    `&redirect_uri=${encodeURIComponent(redirect)}` +
+    `&response_type=code` +
+    `&scope=${encodeURIComponent('https://www.googleapis.com/auth/gmail.readonly')}` +
+    `&access_type=offline&prompt=consent`;
+  res.json({ authUrl: url });
+});
+
+app.get('/api/reachouts/callback/gmail', async (req, res) => {
+  const { code, clientId, clientSecret } = req.query;
+  const cid = clientId || reachoutsCredentials.gmail?.clientId;
+  const csec = clientSecret || reachoutsCredentials.gmail?.clientSecret;
+  if (!code || !cid || !csec) {
+    return res.status(400).send('Missing code or credentials. Set clientId and clientSecret first via /api/reachouts/connect/gmail');
+  }
+  try {
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: cid,
+        client_secret: csec,
+        redirect_uri: `https://pigeon-api.up.railway.app/api/reachouts/callback/gmail`,
+        grant_type: 'authorization_code',
+      }),
+    });
+    const tokenData = await tokenResp.json();
+    if (tokenData.refresh_token) {
+      reachoutsCredentials.gmail = { clientId: cid, clientSecret: csec, refreshToken: tokenData.refresh_token };
+      startPolling('gmail', pollGmail, 120000);
+      res.send('<h2>Gmail connected!</h2><p>You can close this tab. Polling started.</p>');
+    } else {
+      res.status(400).send(`<h2>Error</h2><p>${tokenData.error || 'No refresh token received'}</p>`);
+    }
+  } catch (e) {
+    res.status(500).send(`<h2>Error</h2><p>${e.message}</p>`);
+  }
+});
+
+// ---- TELEGRAM (Bot API) ----
+
+let telegramOffset = 0;
+
+async function pollTelegram() {
+  const creds = reachoutsCredentials.telegram;
+  if (!creds) return;
+  try {
+    const resp = await fetch(
+      `https://api.telegram.org/bot${creds.botToken}/getUpdates?offset=${telegramOffset}&limit=50&timeout=0`
+    );
+    const data = await resp.json();
+    if (!data.ok) {
+      console.error('[Reachouts/Telegram] API error:', data.description);
+      reachoutsData.platformStatus.telegram = { connected: false, error: data.description };
+      return;
+    }
+
+    const messages = [];
+    for (const update of (data.result || [])) {
+      telegramOffset = Math.max(telegramOffset, update.update_id + 1);
+      const msg = update.message || update.channel_post;
+      if (!msg) continue;
+
+      const sender = msg.from || msg.chat;
+      const name = sender.first_name ? `${sender.first_name} ${sender.last_name || ''}`.trim() : (sender.title || sender.username || 'Unknown');
+
+      messages.push({
+        conversationId: `tg-${msg.chat.id}`,
+        senderName: name,
+        senderAvatar: null,
+        lastMessage: msg.text || msg.caption || '[media]',
+        timestamp: new Date(msg.date * 1000).toISOString(),
+        unread: true,
+        url: msg.chat.username ? `https://t.me/${msg.chat.username}` : null,
+      });
+    }
+
+    if (messages.length > 0) {
+      mergeReachoutsMessages('telegram', messages);
+      console.log(`[Reachouts/Telegram] Synced ${messages.length} messages`);
+    }
+    reachoutsData.platformStatus.telegram = { connected: true, lastSync: new Date().toISOString(), mode: 'bot-api' };
+  } catch (e) {
+    console.error('[Reachouts/Telegram] Poll error:', e.message);
+  }
+}
+
+app.post('/api/reachouts/connect/telegram', (req, res) => {
+  const { botToken } = req.body;
+  if (!botToken) return res.status(400).json({ error: 'botToken required' });
+  reachoutsCredentials.telegram = { botToken };
+  telegramOffset = 0;
+  startPolling('telegram', pollTelegram, 30000); // every 30s
+  res.json({ ok: true, message: 'Telegram bot connected — polling every 30 seconds' });
+});
+
+// ---- TWITTER/X (Internal GraphQL API with session cookies) ----
+
+const TWITTER_BEARER = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+
+async function pollTwitter() {
+  const creds = reachoutsCredentials.twitter;
+  if (!creds) return;
+  try {
+    // Fetch DM inbox using Twitter's internal API
+    const headers = {
+      'Authorization': `Bearer ${TWITTER_BEARER}`,
+      'x-csrf-token': creds.ct0,
+      'Cookie': `auth_token=${creds.authToken}; ct0=${creds.ct0}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'x-twitter-active-user': 'yes',
+      'x-twitter-client-language': 'en',
+    };
+
+    // Try the DM inbox endpoint
+    const inboxResp = await fetch(
+      'https://x.com/i/api/1.1/dm/inbox_initial_state.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1&dm_secret_conversations_enabled=false&krs_registration_enabled=true&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_ext_limited_action_results=true&include_quote_count=true&include_reply_count=1&tweet_mode=extended&include_ext_views=true&dm_users=true&include_groups=true&include_inbox_timelines=true&include_ext_media_color=true&supports_reactions=true&include_ext_edit_control=true&ext=mediaColor%2CaltText%2CmediaStats%2ChighlightedLabel%2CvoiceInfo%2CbirdwatchPivot%2CsuperFollowMetadata%2CunmentionInfo%2CeditControl',
+      { headers }
+    );
+
+    if (inboxResp.status === 401 || inboxResp.status === 403) {
+      console.error('[Reachouts/Twitter] Session expired — reconnect needed');
+      reachoutsData.platformStatus.twitter = { connected: false, error: 'Session expired — update cookies' };
+      stopPolling('twitter');
+      return;
+    }
+
+    const inbox = await inboxResp.json();
+    const conversations = inbox.inbox_initial_state?.conversations || {};
+    const users = inbox.inbox_initial_state?.users || {};
+    const entries = inbox.inbox_initial_state?.entries || [];
+
+    const messages = [];
+    for (const [convId, conv] of Object.entries(conversations)) {
+      const isUnread = conv.status === 'HAS_MORE' ||
+        (conv.last_read_event_id && conv.sort_event_id && conv.last_read_event_id < conv.sort_event_id);
+
+      // Find last message in this conversation from entries
+      const convEntries = entries.filter(e => e.message?.conversation_id === convId);
+      const lastEntry = convEntries[convEntries.length - 1];
+      const lastMsg = lastEntry?.message;
+
+      // Get participant names
+      const participantIds = (conv.participants || []).map(p => p.user_id);
+      const participantNames = participantIds
+        .map(id => users[id]?.name || users[id]?.screen_name || '')
+        .filter(Boolean)
+        .join(', ');
+
+      const senderId = lastMsg?.message_data?.sender_id;
+      const senderName = users[senderId]?.name || participantNames || 'Unknown';
+
+      messages.push({
+        conversationId: `tw-${convId}`,
+        senderName,
+        senderAvatar: users[senderId]?.profile_image_url_https || null,
+        lastMessage: lastMsg?.message_data?.text || '',
+        timestamp: lastMsg?.message_data?.time
+          ? new Date(parseInt(lastMsg.message_data.time)).toISOString()
+          : new Date(parseInt(conv.sort_timestamp)).toISOString(),
+        unread: !!isUnread,
+        url: `https://x.com/messages/${convId}`,
+      });
+    }
+
+    mergeReachoutsMessages('twitter', messages);
+    reachoutsData.platformStatus.twitter = { connected: true, lastSync: new Date().toISOString(), mode: 'session-api' };
+    console.log(`[Reachouts/Twitter] Synced ${messages.length} conversations`);
+  } catch (e) {
+    console.error('[Reachouts/Twitter] Poll error:', e.message);
+    reachoutsData.platformStatus.twitter = { connected: true, lastSync: reachoutsData.lastSync.twitter, error: e.message };
+  }
+}
+
+app.post('/api/reachouts/connect/twitter', (req, res) => {
+  const { ct0, authToken } = req.body;
+  if (!ct0 || !authToken) return res.status(400).json({ error: 'ct0 and authToken cookies required' });
+  reachoutsCredentials.twitter = { ct0, authToken };
+  startPolling('twitter', pollTwitter, 120000); // every 2 min
+  res.json({ ok: true, message: 'Twitter connected via session — polling every 2 minutes. Session lasts ~months.' });
+});
+
+// ---- DISCORD (User token API) ----
+
+async function pollDiscord() {
+  const creds = reachoutsCredentials.discord;
+  if (!creds) return;
+  try {
+    const headers = {
+      'Authorization': creds.userToken,
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    };
+
+    // Get DM channels
+    const channelsResp = await fetch('https://discord.com/api/v9/users/@me/channels', { headers });
+    if (channelsResp.status === 401 || channelsResp.status === 403) {
+      console.error('[Reachouts/Discord] Token invalid or expired');
+      reachoutsData.platformStatus.discord = { connected: false, error: 'Token invalid — update it' };
+      stopPolling('discord');
+      return;
+    }
+    const channels = await channelsResp.json();
+
+    // Get read states to determine unread
+    let readStates = {};
+    try {
+      const readResp = await fetch('https://discord.com/api/v9/users/@me/read-states', { headers });
+      if (readResp.ok) {
+        const readData = await readResp.json();
+        readData.forEach(rs => { readStates[rs.id] = rs; });
+      }
+    } catch (e) { /* read states endpoint may not be available */ }
+
+    const messages = [];
+    for (const channel of channels.slice(0, 20)) {
+      if (channel.type !== 1 && channel.type !== 3) continue; // 1=DM, 3=group DM
+
+      const recipientNames = (channel.recipients || []).map(r => r.global_name || r.username).join(', ');
+
+      // Fetch last message
+      let lastMessage = '';
+      let lastTimestamp = channel.last_message_id
+        ? new Date(Number(BigInt(channel.last_message_id) >> 22n) + 1420070400000).toISOString()
+        : new Date().toISOString();
+
+      try {
+        const msgsResp = await fetch(`https://discord.com/api/v9/channels/${channel.id}/messages?limit=1`, { headers });
+        if (msgsResp.ok) {
+          const msgs = await msgsResp.json();
+          if (msgs[0]) {
+            lastMessage = msgs[0].content || '[attachment]';
+            lastTimestamp = msgs[0].timestamp;
+          }
+        }
+      } catch (e) { /* skip if rate limited */ }
+
+      // Determine if unread
+      const readState = readStates[channel.id];
+      const isUnread = readState
+        ? (channel.last_message_id && channel.last_message_id !== readState.last_message_id)
+        : !!channel.last_message_id;
+
+      messages.push({
+        conversationId: `discord-${channel.id}`,
+        senderName: recipientNames || 'Unknown',
+        senderAvatar: channel.recipients?.[0]?.avatar
+          ? `https://cdn.discordapp.com/avatars/${channel.recipients[0].id}/${channel.recipients[0].avatar}.png`
+          : null,
+        lastMessage,
+        timestamp: lastTimestamp,
+        unread: !!isUnread,
+        url: `https://discord.com/channels/@me/${channel.id}`,
+      });
+
+      // Rate limit protection
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    mergeReachoutsMessages('discord', messages);
+    reachoutsData.platformStatus.discord = { connected: true, lastSync: new Date().toISOString(), mode: 'user-token' };
+    console.log(`[Reachouts/Discord] Synced ${messages.length} DM channels`);
+  } catch (e) {
+    console.error('[Reachouts/Discord] Poll error:', e.message);
+    reachoutsData.platformStatus.discord = { connected: true, lastSync: reachoutsData.lastSync.discord, error: e.message };
+  }
+}
+
+app.post('/api/reachouts/connect/discord', (req, res) => {
+  const { userToken } = req.body;
+  if (!userToken) return res.status(400).json({ error: 'userToken required (from browser dev tools)' });
+  reachoutsCredentials.discord = { userToken };
+  startPolling('discord', pollDiscord, 180000); // every 3 min (conservative to avoid detection)
+  res.json({ ok: true, message: 'Discord connected — polling every 3 minutes. WARNING: self-bots risk account ban.' });
+});
+
+// ---- LINKEDIN (Voyager API with session cookies) ----
+
+async function pollLinkedin() {
+  const creds = reachoutsCredentials.linkedin;
+  if (!creds) return;
+  try {
+    const headers = {
+      'Cookie': `li_at=${creds.liAt}; JSESSIONID="${creds.jsessionid}"`,
+      'csrf-token': creds.jsessionid,
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+      'x-li-lang': 'en_US',
+      'x-li-track': '{"clientVersion":"1.13.8","mpVersion":"1.13.8","osName":"web","timezoneOffset":-5,"timezone":"America/New_York","deviceFormFactor":"DESKTOP","mpName":"voyager-web"}',
+      'x-restli-protocol-version': '2.0.0',
+    };
+
+    const convResp = await fetch(
+      'https://www.linkedin.com/voyager/api/messaging/conversations?keyVersion=LEGACY_INBOX&q=syncToken&count=20',
+      { headers }
+    );
+
+    if (convResp.status === 401 || convResp.status === 403 || convResp.status === 999) {
+      console.error('[Reachouts/LinkedIn] Session expired or blocked');
+      reachoutsData.platformStatus.linkedin = { connected: false, error: 'Session expired — update cookies' };
+      stopPolling('linkedin');
+      return;
+    }
+
+    const convData = await convResp.json();
+    const conversations = convData.elements || convData.included?.filter(e => e.$type === 'com.linkedin.voyager.messaging.Conversation') || [];
+
+    const messages = [];
+    for (const conv of conversations.slice(0, 15)) {
+      const participants = conv['*participants'] || conv.participants || [];
+      let senderName = 'Unknown';
+
+      // Try to extract participant names from included entities
+      if (convData.included) {
+        const profiles = convData.included.filter(e =>
+          e.$type === 'com.linkedin.voyager.identity.shared.MiniProfile' ||
+          e.$type === 'com.linkedin.voyager.messaging.MessagingMember'
+        );
+        const names = profiles
+          .filter(p => p.firstName || p.miniProfile)
+          .map(p => p.firstName ? `${p.firstName} ${p.lastName || ''}`.trim() : '')
+          .filter(Boolean);
+        if (names.length > 0) senderName = names[0];
+      }
+
+      // Fallback to participantNames if available
+      if (senderName === 'Unknown' && conv.participantNames) {
+        senderName = conv.participantNames;
+      }
+
+      const lastEvent = conv.events?.[0] || {};
+      const eventContent = lastEvent.eventContent || {};
+      const messageBody = eventContent.attributedBody?.text ||
+        eventContent.body ||
+        eventContent.subject ||
+        '';
+
+      const entityUrn = conv.entityUrn || conv['*elements']?.[0] || '';
+      const convId = entityUrn.split(':').pop() || `li-${Date.now()}`;
+
+      messages.push({
+        conversationId: `li-${convId}`,
+        senderName,
+        lastMessage: messageBody,
+        timestamp: conv.lastActivityAt ? new Date(conv.lastActivityAt).toISOString() : new Date().toISOString(),
+        unread: !!conv.unreadCount || conv.read === false,
+        url: `https://www.linkedin.com/messaging/thread/${convId}/`,
+      });
+    }
+
+    mergeReachoutsMessages('linkedin', messages);
+    reachoutsData.platformStatus.linkedin = { connected: true, lastSync: new Date().toISOString(), mode: 'session-api' };
+    console.log(`[Reachouts/LinkedIn] Synced ${messages.length} conversations`);
+  } catch (e) {
+    console.error('[Reachouts/LinkedIn] Poll error:', e.message);
+    reachoutsData.platformStatus.linkedin = { connected: true, lastSync: reachoutsData.lastSync.linkedin, error: e.message };
+  }
+}
+
+app.post('/api/reachouts/connect/linkedin', (req, res) => {
+  const { liAt, jsessionid } = req.body;
+  if (!liAt || !jsessionid) return res.status(400).json({ error: 'liAt and jsessionid cookies required' });
+  reachoutsCredentials.linkedin = { liAt, jsessionid };
+  startPolling('linkedin', pollLinkedin, 300000); // every 5 min (conservative — LinkedIn is aggressive)
+  res.json({ ok: true, message: 'LinkedIn connected — polling every 5 minutes. Sessions expire in ~1-2 weeks.' });
+});
+
+// ---- CONNECT / DISCONNECT / STATUS ----
+
+app.post('/api/reachouts/disconnect/:platform', (req, res) => {
+  const { platform } = req.params;
+  stopPolling(platform);
+  reachoutsCredentials[platform] = null;
+  reachoutsData.platformStatus[platform] = { connected: false };
+  res.json({ ok: true, message: `${platform} disconnected` });
+});
+
+app.get('/api/reachouts/credentials', (req, res) => {
+  const status = {};
+  for (const [platform, creds] of Object.entries(reachoutsCredentials)) {
+    status[platform] = {
+      connected: !!creds,
+      polling: !!pollingIntervals[platform],
+      mode: reachoutsData.platformStatus[platform]?.mode || null,
+    };
+  }
+  res.json(status);
+});
+
+// ---- EXTENSION SYNC (still supported alongside server polling) ----
+
 app.post('/api/reachouts/sync', (req, res) => {
   const { platform, messages, extensionId } = req.body;
   if (!platform || !Array.isArray(messages)) {
@@ -7929,35 +8452,29 @@ app.post('/api/reachouts/sync', (req, res) => {
     return res.status(400).json({ error: `Invalid platform. Use: ${validPlatforms.join(', ')}` });
   }
 
-  // Merge incoming messages — deduplicate by platform + conversationId
-  const existingByKey = {};
-  reachoutsData.messages.forEach(m => {
-    existingByKey[`${m.platform}:${m.conversationId}`] = m;
-  });
+  const formatted = messages.map(msg => ({
+    conversationId: msg.conversationId || msg.senderId || `${platform}-${Date.now()}`,
+    senderName: msg.senderName || 'Unknown',
+    senderAvatar: msg.senderAvatar || null,
+    lastMessage: msg.lastMessage || msg.preview || '',
+    timestamp: msg.timestamp || new Date().toISOString(),
+    unread: msg.unread !== undefined ? msg.unread : true,
+    url: msg.url || null,
+  }));
 
-  messages.forEach(msg => {
-    const key = `${platform}:${msg.conversationId || msg.senderId || Date.now()}`;
-    existingByKey[key] = {
-      platform,
-      conversationId: msg.conversationId || msg.senderId || `${platform}-${Date.now()}`,
-      senderName: msg.senderName || 'Unknown',
-      senderAvatar: msg.senderAvatar || null,
-      lastMessage: msg.lastMessage || msg.preview || '',
-      timestamp: msg.timestamp || new Date().toISOString(),
-      unread: msg.unread !== undefined ? msg.unread : true,
-      url: msg.url || null,
-      markedRead: false,
-    };
-  });
-
-  reachoutsData.messages = Object.values(existingByKey);
-  reachoutsData.lastSync[platform] = new Date().toISOString();
-  reachoutsData.platformStatus[platform] = { connected: true, lastSync: reachoutsData.lastSync[platform], extensionId };
+  mergeReachoutsMessages(platform, formatted);
+  reachoutsData.platformStatus[platform] = {
+    ...reachoutsData.platformStatus[platform],
+    connected: true,
+    lastSync: reachoutsData.lastSync[platform],
+    extensionId,
+  };
 
   res.json({ ok: true, totalMessages: reachoutsData.messages.filter(m => m.platform === platform).length });
 });
 
-// Get all messages (optionally filter by platform)
+// ---- READ ENDPOINTS ----
+
 app.get('/api/reachouts/messages', (req, res) => {
   const { platform, unreadOnly } = req.query;
   let msgs = reachoutsData.messages;
@@ -7967,7 +8484,6 @@ app.get('/api/reachouts/messages', (req, res) => {
   res.json({ messages: msgs, lastSync: reachoutsData.lastSync });
 });
 
-// Get dashboard summary
 app.get('/api/reachouts/summary', (req, res) => {
   const platforms = ['twitter', 'discord', 'linkedin', 'gmail', 'telegram', 'other'];
   const summary = {};
@@ -7978,12 +8494,13 @@ app.get('/api/reachouts/summary', (req, res) => {
       unread: msgs.filter(m => m.unread && !m.markedRead).length,
       lastSync: reachoutsData.lastSync[p] || null,
       connected: !!(reachoutsData.platformStatus[p]?.connected),
+      mode: reachoutsData.platformStatus[p]?.mode || null,
+      error: reachoutsData.platformStatus[p]?.error || null,
     };
   });
   res.json({ summary, totalUnread: Object.values(summary).reduce((s, p) => s + p.unread, 0) });
 });
 
-// Mark message(s) as read
 app.post('/api/reachouts/mark-read', (req, res) => {
   const { conversationIds, platform, markAll } = req.body;
   if (markAll && platform) {
@@ -7994,7 +8511,6 @@ app.post('/api/reachouts/mark-read', (req, res) => {
   res.json({ ok: true });
 });
 
-// Manual message entry (for "other" platforms)
 app.post('/api/reachouts/manual', (req, res) => {
   const { platform, senderName, lastMessage, url } = req.body;
   if (!senderName) return res.status(400).json({ error: 'senderName required' });
@@ -8012,7 +8528,6 @@ app.post('/api/reachouts/manual', (req, res) => {
   res.json({ ok: true });
 });
 
-// Get platform connection status
 app.get('/api/reachouts/status', (req, res) => {
   res.json({ platforms: reachoutsData.platformStatus, lastSync: reachoutsData.lastSync });
 });
