@@ -7908,6 +7908,115 @@ ${batchText}`;
   }
 });
 
+// ==========================================
+// REACHOUTS — Multi-platform DM tracker
+// ==========================================
+
+const reachoutsData = {
+  messages: [],
+  platformStatus: {},
+  lastSync: {},
+};
+
+// Extension pushes scraped DMs here
+app.post('/api/reachouts/sync', (req, res) => {
+  const { platform, messages, extensionId } = req.body;
+  if (!platform || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'platform and messages[] required' });
+  }
+  const validPlatforms = ['twitter', 'discord', 'linkedin', 'gmail', 'telegram', 'other'];
+  if (!validPlatforms.includes(platform)) {
+    return res.status(400).json({ error: `Invalid platform. Use: ${validPlatforms.join(', ')}` });
+  }
+
+  // Merge incoming messages — deduplicate by platform + conversationId
+  const existingByKey = {};
+  reachoutsData.messages.forEach(m => {
+    existingByKey[`${m.platform}:${m.conversationId}`] = m;
+  });
+
+  messages.forEach(msg => {
+    const key = `${platform}:${msg.conversationId || msg.senderId || Date.now()}`;
+    existingByKey[key] = {
+      platform,
+      conversationId: msg.conversationId || msg.senderId || `${platform}-${Date.now()}`,
+      senderName: msg.senderName || 'Unknown',
+      senderAvatar: msg.senderAvatar || null,
+      lastMessage: msg.lastMessage || msg.preview || '',
+      timestamp: msg.timestamp || new Date().toISOString(),
+      unread: msg.unread !== undefined ? msg.unread : true,
+      url: msg.url || null,
+      markedRead: false,
+    };
+  });
+
+  reachoutsData.messages = Object.values(existingByKey);
+  reachoutsData.lastSync[platform] = new Date().toISOString();
+  reachoutsData.platformStatus[platform] = { connected: true, lastSync: reachoutsData.lastSync[platform], extensionId };
+
+  res.json({ ok: true, totalMessages: reachoutsData.messages.filter(m => m.platform === platform).length });
+});
+
+// Get all messages (optionally filter by platform)
+app.get('/api/reachouts/messages', (req, res) => {
+  const { platform, unreadOnly } = req.query;
+  let msgs = reachoutsData.messages;
+  if (platform) msgs = msgs.filter(m => m.platform === platform);
+  if (unreadOnly === 'true') msgs = msgs.filter(m => m.unread && !m.markedRead);
+  msgs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  res.json({ messages: msgs, lastSync: reachoutsData.lastSync });
+});
+
+// Get dashboard summary
+app.get('/api/reachouts/summary', (req, res) => {
+  const platforms = ['twitter', 'discord', 'linkedin', 'gmail', 'telegram', 'other'];
+  const summary = {};
+  platforms.forEach(p => {
+    const msgs = reachoutsData.messages.filter(m => m.platform === p);
+    summary[p] = {
+      total: msgs.length,
+      unread: msgs.filter(m => m.unread && !m.markedRead).length,
+      lastSync: reachoutsData.lastSync[p] || null,
+      connected: !!(reachoutsData.platformStatus[p]?.connected),
+    };
+  });
+  res.json({ summary, totalUnread: Object.values(summary).reduce((s, p) => s + p.unread, 0) });
+});
+
+// Mark message(s) as read
+app.post('/api/reachouts/mark-read', (req, res) => {
+  const { conversationIds, platform, markAll } = req.body;
+  if (markAll && platform) {
+    reachoutsData.messages.forEach(m => { if (m.platform === platform) m.markedRead = true; });
+  } else if (Array.isArray(conversationIds)) {
+    reachoutsData.messages.forEach(m => { if (conversationIds.includes(m.conversationId)) m.markedRead = true; });
+  }
+  res.json({ ok: true });
+});
+
+// Manual message entry (for "other" platforms)
+app.post('/api/reachouts/manual', (req, res) => {
+  const { platform, senderName, lastMessage, url } = req.body;
+  if (!senderName) return res.status(400).json({ error: 'senderName required' });
+  reachoutsData.messages.push({
+    platform: platform || 'other',
+    conversationId: `manual-${Date.now()}`,
+    senderName,
+    senderAvatar: null,
+    lastMessage: lastMessage || '',
+    timestamp: new Date().toISOString(),
+    unread: true,
+    url: url || null,
+    markedRead: false,
+  });
+  res.json({ ok: true });
+});
+
+// Get platform connection status
+app.get('/api/reachouts/status', (req, res) => {
+  res.json({ platforms: reachoutsData.platformStatus, lastSync: reachoutsData.lastSync });
+});
+
 app.listen(PORT, () => {
   console.log(`Pigeon Finder API running on port ${PORT}`);
 });
