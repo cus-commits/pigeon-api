@@ -5190,8 +5190,7 @@ app.get('/api/airtable/companies', async (req, res) => {
       const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
       url += `&filterByFormula=${formula}`;
     }
-    // Sort by creation date descending
-    url += '&sort%5B0%5D%5Bfield%5D=Created&sort%5B0%5D%5Bdirection%5D=desc';
+    // Don't rely on Airtable sort — sort server-side after mapping dates
 
     console.log(`[Airtable] Fetching companies${stage ? ` (stage: ${stage})` : ''}`);
     const r = await fetch(url, { headers });
@@ -5224,6 +5223,8 @@ app.get('/api/airtable/companies', async (req, res) => {
       notes: rec.fields['Original Notes + Ongoing Negotiation Notes'] || '',
       reachout_notes: rec.fields['Initial Reachout Notes'] || '',
     }));
+    // Sort by created_time (Last Time CRM Stage Modified) descending
+    companies.sort((a, b) => new Date(b.created_time || 0).getTime() - new Date(a.created_time || 0).getTime());
     console.log(`[Airtable] Got ${companies.length} companies`);
     res.json({ companies, total: companies.length });
   } catch (e) {
