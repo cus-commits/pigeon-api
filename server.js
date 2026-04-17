@@ -1,8 +1,29 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Persistent storage for reachouts
+const REACHOUTS_DATA_FILE = path.join(__dirname, '.reachouts-data.json');
+const REACHOUTS_CREDS_FILE = path.join(__dirname, '.reachouts-creds.json');
+
+function loadReachoutsData() {
+  try { return JSON.parse(fs.readFileSync(REACHOUTS_DATA_FILE, 'utf8')); }
+  catch { return { messages: [], platformStatus: {}, lastSync: {} }; }
+}
+function saveReachoutsData(data) {
+  try { fs.writeFileSync(REACHOUTS_DATA_FILE, JSON.stringify(data)); } catch (e) { console.error('[Reachouts] Save data error:', e.message); }
+}
+function loadReachoutsCreds() {
+  try { return JSON.parse(fs.readFileSync(REACHOUTS_CREDS_FILE, 'utf8')); }
+  catch { return { gmail: null, telegram: null, twitter: null, discord: null, linkedin: null }; }
+}
+function saveReachoutsCreds(creds) {
+  try { fs.writeFileSync(REACHOUTS_CREDS_FILE, JSON.stringify(creds)); } catch (e) { console.error('[Reachouts] Save creds error:', e.message); }
+}
 
 const HARMONIC_BASE = 'https://api.harmonic.ai';
 const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
@@ -7913,19 +7934,8 @@ ${batchText}`;
 // Server-side 24/7 polling + extension sync
 // ==========================================
 
-const reachoutsData = {
-  messages: [],
-  platformStatus: {},
-  lastSync: {},
-};
-
-const reachoutsCredentials = {
-  gmail: null,
-  telegram: null,
-  twitter: null,
-  discord: null,
-  linkedin: null,
-};
+const reachoutsData = loadReachoutsData();
+const reachoutsCredentials = loadReachoutsCreds();
 
 const pollingIntervals = {};
 
@@ -7951,6 +7961,7 @@ function mergeReachoutsMessages(platform, newMessages) {
   });
   reachoutsData.messages = Object.values(existingByKey);
   reachoutsData.lastSync[platform] = new Date().toISOString();
+  saveReachoutsData(reachoutsData);
 }
 
 function startPolling(platform, fn, intervalMs) {
@@ -8040,6 +8051,7 @@ app.post('/api/reachouts/connect/gmail', (req, res) => {
     return res.status(400).json({ error: 'clientId, clientSecret, and refreshToken required' });
   }
   reachoutsCredentials.gmail = { clientId, clientSecret, refreshToken };
+  saveReachoutsCreds(reachoutsCredentials);
   startPolling('gmail', pollGmail, 120000); // every 2 min
   res.json({ ok: true, message: 'Gmail connected — polling every 2 minutes' });
 });
@@ -8079,6 +8091,7 @@ app.get('/api/reachouts/callback/gmail', async (req, res) => {
     const tokenData = await tokenResp.json();
     if (tokenData.refresh_token) {
       reachoutsCredentials.gmail = { clientId: cid, clientSecret: csec, refreshToken: tokenData.refresh_token };
+      saveReachoutsCreds(reachoutsCredentials);
       startPolling('gmail', pollGmail, 120000);
       res.send('<h2>Gmail connected!</h2><p>You can close this tab. Polling started.</p>');
     } else {
@@ -8141,6 +8154,7 @@ app.post('/api/reachouts/connect/telegram', (req, res) => {
   const { botToken } = req.body;
   if (!botToken) return res.status(400).json({ error: 'botToken required' });
   reachoutsCredentials.telegram = { botToken };
+  saveReachoutsCreds(reachoutsCredentials);
   telegramOffset = 0;
   startPolling('telegram', pollTelegram, 30000); // every 30s
   res.json({ ok: true, message: 'Telegram bot connected — polling every 30 seconds' });
@@ -8229,6 +8243,7 @@ app.post('/api/reachouts/connect/twitter', (req, res) => {
   const { ct0, authToken } = req.body;
   if (!ct0 || !authToken) return res.status(400).json({ error: 'ct0 and authToken cookies required' });
   reachoutsCredentials.twitter = { ct0, authToken };
+  saveReachoutsCreds(reachoutsCredentials);
   startPolling('twitter', pollTwitter, 120000); // every 2 min
   res.json({ ok: true, message: 'Twitter connected via session — polling every 2 minutes. Session lasts ~months.' });
 });
@@ -8323,6 +8338,7 @@ app.post('/api/reachouts/connect/discord', (req, res) => {
   const { userToken } = req.body;
   if (!userToken) return res.status(400).json({ error: 'userToken required (from browser dev tools)' });
   reachoutsCredentials.discord = { userToken };
+  saveReachoutsCreds(reachoutsCredentials);
   startPolling('discord', pollDiscord, 180000); // every 3 min (conservative to avoid detection)
   res.json({ ok: true, message: 'Discord connected — polling every 3 minutes. WARNING: self-bots risk account ban.' });
 });
@@ -8414,6 +8430,7 @@ app.post('/api/reachouts/connect/linkedin', (req, res) => {
   const { liAt, jsessionid } = req.body;
   if (!liAt || !jsessionid) return res.status(400).json({ error: 'liAt and jsessionid cookies required' });
   reachoutsCredentials.linkedin = { liAt, jsessionid };
+  saveReachoutsCreds(reachoutsCredentials);
   startPolling('linkedin', pollLinkedin, 300000); // every 5 min (conservative — LinkedIn is aggressive)
   res.json({ ok: true, message: 'LinkedIn connected — polling every 5 minutes. Sessions expire in ~1-2 weeks.' });
 });
@@ -8424,7 +8441,9 @@ app.post('/api/reachouts/disconnect/:platform', (req, res) => {
   const { platform } = req.params;
   stopPolling(platform);
   reachoutsCredentials[platform] = null;
+  saveReachoutsCreds(reachoutsCredentials);
   reachoutsData.platformStatus[platform] = { connected: false };
+  saveReachoutsData(reachoutsData);
   res.json({ ok: true, message: `${platform} disconnected` });
 });
 
@@ -8508,6 +8527,7 @@ app.post('/api/reachouts/mark-read', (req, res) => {
   } else if (Array.isArray(conversationIds)) {
     reachoutsData.messages.forEach(m => { if (conversationIds.includes(m.conversationId)) m.markedRead = true; });
   }
+  saveReachoutsData(reachoutsData);
   res.json({ ok: true });
 });
 
@@ -8525,6 +8545,7 @@ app.post('/api/reachouts/manual', (req, res) => {
     url: url || null,
     markedRead: false,
   });
+  saveReachoutsData(reachoutsData);
   res.json({ ok: true });
 });
 
@@ -8534,6 +8555,28 @@ app.get('/api/reachouts/status', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Pigeon Finder API running on port ${PORT}`);
+
+  // Auto-reconnect saved credentials on startup
+  if (reachoutsCredentials.gmail) {
+    console.log('[Reachouts] Auto-reconnecting Gmail...');
+    startPolling('gmail', pollGmail, 120000);
+  }
+  if (reachoutsCredentials.telegram) {
+    console.log('[Reachouts] Auto-reconnecting Telegram...');
+    startPolling('telegram', pollTelegram, 30000);
+  }
+  if (reachoutsCredentials.twitter) {
+    console.log('[Reachouts] Auto-reconnecting Twitter...');
+    startPolling('twitter', pollTwitter, 120000);
+  }
+  if (reachoutsCredentials.discord) {
+    console.log('[Reachouts] Auto-reconnecting Discord...');
+    startPolling('discord', pollDiscord, 180000);
+  }
+  if (reachoutsCredentials.linkedin) {
+    console.log('[Reachouts] Auto-reconnecting LinkedIn...');
+    startPolling('linkedin', pollLinkedin, 300000);
+  }
 });
 
 // --- Helpers ---
