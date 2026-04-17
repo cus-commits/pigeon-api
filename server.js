@@ -5190,8 +5190,8 @@ app.get('/api/airtable/companies', async (req, res) => {
       const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
       url += `&filterByFormula=${formula}`;
     }
-    // Sort by most recent first
-    url += '&sort%5B0%5D%5Bfield%5D=Company&sort%5B0%5D%5Bdirection%5D=asc';
+    // Sort by most recently modified first
+    url += '&sort%5B0%5D%5Bfield%5D=Last%20Modified%20Time&sort%5B0%5D%5Bdirection%5D=desc';
 
     console.log(`[Airtable] Fetching companies${stage ? ` (stage: ${stage})` : ''}`);
     const r = await fetch(url, { headers });
@@ -5203,12 +5203,13 @@ app.get('/api/airtable/companies', async (req, res) => {
     const data = await r.json();
     // Log first record's field names for debugging
     if (data.records?.length > 0) {
-      console.log(`[Airtable] First record fields: ${Object.keys(data.records[0].fields).join(', ')}`);
-      console.log(`[Airtable] First record Company field: "${data.records[0].fields['Company']}" | Name: "${data.records[0].fields['Name']}" | company: "${data.records[0].fields['company']}"`);
+      const fieldNames = Object.keys(data.records[0].fields);
+      console.log(`[Airtable] First record fields: ${fieldNames.join(', ')}`);
+      console.log(`[Airtable] Last Modified Time: "${data.records[0].fields['Last Modified Time']}" | createdTime: "${data.records[0].createdTime}"`);
     }
     const companies = (data.records || []).map(rec => ({
       airtable_id: rec.id,
-      created_time: rec.createdTime || null,
+      created_time: rec.fields['Last Modified Time'] || rec.fields['Last Modified'] || rec.fields['Modified'] || rec.createdTime || null,
       company: (rec.fields['Company'] || '').trim(),
       crm_stage: rec.fields['CRM Stage'] || '',
       in_or_out: rec.fields['IN or OUT'] || [],
@@ -5229,6 +5230,23 @@ app.get('/api/airtable/companies', async (req, res) => {
     console.error('[Airtable] Error:', e.message);
     res.json({ error: e.message, companies: [] });
   }
+});
+
+// DEBUG: See raw Airtable fields for first record
+app.get('/api/airtable/debug-fields', async (req, res) => {
+  const headers = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  if (!headers || !baseId) return res.json({ error: 'Not configured' });
+  try {
+    const stage = req.query.stage || 'BO';
+    const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
+    const url = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?maxRecords=1&filterByFormula=${formula}`;
+    const r = await fetch(url, { headers });
+    const data = await r.json();
+    const rec = data.records?.[0];
+    if (!rec) return res.json({ error: 'No records found' });
+    res.json({ id: rec.id, createdTime: rec.createdTime, fieldNames: Object.keys(rec.fields), fields: rec.fields });
+  } catch (e) { res.json({ error: e.message }); }
 });
 
 // GET /api/airtable/reachout-notes?company=CompanyName
