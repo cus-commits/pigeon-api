@@ -475,8 +475,6 @@ app.post('/api/validate-key', async (req, res) => {
 // ==========================================
 // SHARED FAVORITES SYSTEM
 // ==========================================
-const fs = require('fs');
-const path = require('path');
 const SHARED_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'shared_favorites.json');
 
 function loadShared() {
