@@ -5190,8 +5190,8 @@ app.get('/api/airtable/companies', async (req, res) => {
       const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
       url += `&filterByFormula=${formula}`;
     }
-    // Sort by most recently modified first
-    url += '&sort%5B0%5D%5Bfield%5D=Last%20Modified%20Time&sort%5B0%5D%5Bdirection%5D=desc';
+    // Sort by most recently stage-changed first
+    url += '&sort%5B0%5D%5Bfield%5D=Last%20Time%20CRM%20Stage%20Modified&sort%5B0%5D%5Bdirection%5D=desc';
 
     console.log(`[Airtable] Fetching companies${stage ? ` (stage: ${stage})` : ''}`);
     const r = await fetch(url, { headers });
@@ -5209,7 +5209,7 @@ app.get('/api/airtable/companies', async (req, res) => {
     }
     const companies = (data.records || []).map(rec => ({
       airtable_id: rec.id,
-      created_time: rec.fields['Last Modified Time'] || rec.fields['Last Modified'] || rec.fields['Modified'] || rec.createdTime || null,
+      created_time: rec.fields['Last Time CRM Stage Modified'] || rec.fields['Created'] || rec.createdTime || null,
       company: (rec.fields['Company'] || '').trim(),
       crm_stage: rec.fields['CRM Stage'] || '',
       in_or_out: rec.fields['IN or OUT'] || [],
