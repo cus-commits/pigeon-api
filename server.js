@@ -7865,7 +7865,7 @@ ${batchText}`;
     const ddCount = Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
     const ddCompanies = deepResults.slice(0, ddCount).map(r => ({
       id: r.card?.id || 0,
-      name: r.name,
+      name: (r.name || '').replace(/^\d+\.\s*/, ''),
       website: r.card?.website || '',
       description: r.card?.description || '',
       logo_url: r.card?.logo_url || '',
@@ -7904,7 +7904,7 @@ ${batchText}`;
     const flattenedResults = deepResults.map(r => {
       if (!r.card) return r;
       const { card, ...rest } = r;
-      return { ...card, ...rest, _score: r.score, score: r.score, confidence: r.confidence, analysis: r.analysis, _sourceSearch: r._sourceSearch };
+      return { ...card, ...rest, name: (rest.name || card.name || '').replace(/^\d+\.\s*/, ''), _score: r.score, score: r.score, confidence: r.confidence, analysis: r.analysis, _sourceSearch: r._sourceSearch };
     });
 
     const finalResults = {
