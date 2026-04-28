@@ -7882,17 +7882,16 @@ ${batchText}`;
     let ddPushed = 0;
     if (ddCompanies.length > 0) {
       try {
-        const VETTING_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'vetting.json');
-        let vetting = [];
-        try { vetting = JSON.parse(fs.readFileSync(VETTING_FILE, 'utf8')); } catch (e) {}
+        const vettingData = loadVetting();
+        const vetting = vettingData.companies || [];
         const existingNames = new Set(vetting.map(v => (v.name || '').toLowerCase()));
         for (const co of ddCompanies) {
           if (!existingNames.has(co.name.toLowerCase())) {
-            vetting.push({ ...co, addedAt: Date.now(), source: 'scan-agent', votes: {}, dismissed: false, hiddenBy: [] });
+            vetting.push({ ...co, addedAt: Date.now(), source: 'recurring-scan', votes: {}, dismissed: false, hiddenBy: [] });
             ddPushed++;
           }
         }
-        fs.writeFileSync(VETTING_FILE, JSON.stringify(vetting, null, 2));
+        saveVetting({ ...vettingData, companies: vetting });
         safeWrite(`: 📤 Pushed ${ddPushed} companies to DD pipeline\n\n`);
       } catch (e) {
         console.error('[RecurringScan] DD push error:', e.message);
