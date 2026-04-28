@@ -2259,8 +2259,14 @@ function saveScanHistory(history) {
 
 app.get('/api/autoscan/history', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const history = loadScanHistory();
-  res.json({ history });
+  const autoHistory = loadScanHistory();
+  const recurringHistory = loadRecurringScanHistory();
+  const merged = [...autoHistory, ...recurringHistory].sort((a, b) => {
+    const ta = typeof a.timestamp === 'string' ? new Date(a.timestamp).getTime() : (a.timestamp || 0);
+    const tb = typeof b.timestamp === 'string' ? new Date(b.timestamp).getTime() : (b.timestamp || 0);
+    return tb - ta;
+  });
+  res.json({ history: merged });
 });
 
 app.post('/api/autoscan/history/add', (req, res) => {
@@ -6943,8 +6949,8 @@ const SCAN_TIERS = {
 };
 
 const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
-function loadScanHistory() { try { return JSON.parse(fs.readFileSync(RECURRING_HISTORY_FILE, 'utf8')); } catch { return []; } }
-function saveScanHistory(history) { try { fs.writeFileSync(RECURRING_HISTORY_FILE, JSON.stringify(history.slice(0, 20), null, 2)); } catch (e) {} }
+function loadRecurringScanHistory() { try { return JSON.parse(fs.readFileSync(RECURRING_HISTORY_FILE, 'utf8')); } catch { return []; } }
+function saveRecurringScanHistory(history) { try { fs.writeFileSync(RECURRING_HISTORY_FILE, JSON.stringify(history.slice(0, 20), null, 2)); } catch (e) {} }
 
 app.get('/api/recurring-scan/tiers', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -7051,7 +7057,7 @@ app.get('/api/recurring-scan/results', (req, res) => {
 
 app.get('/api/recurring-scan/history', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(loadScanHistory());
+  res.json(loadRecurringScanHistory());
 });
 
 app.post('/api/recurring-scan/cancel', (req, res) => {
@@ -7895,8 +7901,15 @@ ${batchText}`;
 
     scan.stats.ddPushed = ddPushed;
 
+    // Flatten card data into each result so frontend can access company.id, company.website etc directly
+    const flattenedResults = deepResults.map(r => {
+      if (!r.card) return r;
+      const { card, ...rest } = r;
+      return { ...card, ...rest, _score: r.score, score: r.score, confidence: r.confidence, analysis: r.analysis, _sourceSearch: r._sourceSearch };
+    });
+
     const finalResults = {
-      results: deepResults,
+      results: flattenedResults,
       screenAnalysis,
       stats: scan.stats,
       budgetUsed: budgetUsed.toFixed(2),
@@ -7904,6 +7917,7 @@ ${batchText}`;
       duration: Math.round((Date.now() - scan.startedAt) / 1000),
       tier: { key: tierKey, name: tier.name, cost: tier.cost, ddPush: tier.ddPush },
       options: { includePortcos, crmStages, keywords, excludeKeywords, sectors: filterSectors, stages: filterStages, geos: filterGeos, models: filterModels, signals: filterSignals, maxRaised: filterMaxRaised, foundedAfter: filterFoundedAfter, notes: filterNotes },
+      user: scanUser,
     };
 
     const RESULTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_results.json');
@@ -7911,9 +7925,9 @@ ${batchText}`;
 
     // Append to history (keep last 20)
     try {
-      const history = loadScanHistory();
-      history.unshift(finalResults);
-      saveScanHistory(history);
+      const history = loadRecurringScanHistory();
+      history.unshift({ ...finalResults, personId: (scanUser || 'mark').toLowerCase(), profileName: `${tier.name} Scan` });
+      saveRecurringScanHistory(history);
     } catch (e) {}
 
     scan.status = 'done';
