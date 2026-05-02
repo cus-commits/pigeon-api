@@ -6230,40 +6230,6 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         } catch (e) {}
       }
 
-      // Strategy 3: search_agent — EXACT match only (no fuzzy for batch-funding)
-      if (!harmonicId) {
-        try {
-          const sr = await fetch(`${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
-          if (sr.ok) {
-            const sd = await sr.json();
-            const coName = name.toLowerCase().trim();
-            for (const r of (sd.results || [])) {
-              const rid = r.id || (r.urn || r.entity_urn || '').split(':').pop();
-              if (!rid) continue;
-              const rName = (r.name || r.text || '').toLowerCase().trim();
-              if (rName === coName) { harmonicId = parseInt(rid) || rid; matchMethod = 'search-agent'; break; }
-            }
-          }
-        } catch (e) {}
-      }
-
-      // Strategy 4: Direct REST — verify name matches
-      if (!harmonicId) {
-        try {
-          const nr = await fetch(`${HARMONIC_BASE}/companies?name=${encodeURIComponent(name)}`, { headers: { apikey: harmonicKey } });
-          if (nr.ok) {
-            const nd = await nr.json();
-            const company = Array.isArray(nd) ? nd[0] : (nd.results?.[0] || nd);
-            const foundName = (company?.name || '').toLowerCase().trim();
-            const foundId = company?.id || (company?.entity_urn || company?.entityUrn || '').split(':').pop() || null;
-            if (foundId && parseInt(foundId) && foundName === name.toLowerCase().trim()) {
-              harmonicId = parseInt(foundId);
-              matchMethod = 'name-direct';
-            }
-          }
-        } catch (e) {}
-      }
-
       if (harmonicId) {
         idMap[name] = { harmonicId, matchMethod };
         // Cache with domain-aware key to prevent name collisions
@@ -6307,27 +6273,17 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         const card = gqlToCard(gc);
         const { matchMethod } = idMap[name];
 
-        // Verify the returned company name isn't wildly different (prevent Pred → Predata, Charm → Charm Security)
+        // Website validation: if matched by name (not domain), check card website matches Airtable website
         if (matchMethod !== 'domain' && matchMethod !== 'cache') {
-          const reqName = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-          const gotName = (card.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-          if (reqName && gotName) {
-            const shorter = reqName.length <= gotName.length ? reqName : gotName;
-            const longer = reqName.length <= gotName.length ? gotName : reqName;
-            const nameMatch = shorter === longer || (longer.includes(shorter) && shorter.length >= longer.length * 0.6);
-            if (!nameMatch) {
-              const rWords = name.toLowerCase().split(/\s+/);
-              const gWords = (card.name || '').toLowerCase().split(/\s+/);
-              const overlap = rWords.filter(w => gWords.some(g => g === w)).length;
-              if (overlap / Math.max(rWords.length, 1) < 0.5) {
-                console.log(`[BatchFunding] REJECTED mismatch: "${name}" → "${card.name}" (${matchMethod}, ${(overlap/rWords.length*100).toFixed(0)}% overlap)`);
-                const rejCo = batch.find(c => c.name === name);
-                const rejDomain = rejCo?.website ? rejCo.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
-                if (rejDomain) delete idCache[`${name.toLowerCase().trim()}|${rejDomain}`];
-                delete idCache[name.toLowerCase().trim()];
-                continue;
-              }
-            }
+          const reqCo = batch.find(c => c.name === name);
+          const atDomain = reqCo?.website ? reqCo.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
+          const hDomain = (card.website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+          if (atDomain && hDomain && domainsConflict(atDomain, hDomain)) {
+            console.log(`[BatchFunding] REJECTED wrong company: "${name}" → "${card.name}" (${matchMethod}) — website ${atDomain} vs ${hDomain}`);
+            const rejDomain = atDomain;
+            if (rejDomain) delete idCache[`${name.toLowerCase().trim()}|${rejDomain}`];
+            delete idCache[name.toLowerCase().trim()];
+            continue;
           }
         }
 
