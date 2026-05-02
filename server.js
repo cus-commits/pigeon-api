@@ -6337,6 +6337,7 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
     }
   }
 
+  saveIdCache();
   console.log(`[BatchFunding] Enriched ${Object.keys(results).length}/${batch.length} companies`);
   res.json({ results });
 });
@@ -6355,6 +6356,26 @@ app.post('/api/harmonic/cache-id', (req, res) => {
 
   console.log(`[HarmonicCache] Manually cached "${name}" → ID ${harmonicId}`);
   res.json({ success: true, name, harmonicId });
+});
+
+// Delete cache entry or clear all
+app.delete('/api/harmonic/cache-id', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const HARMONIC_CACHE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'harmonic_id_cache.json');
+  let idCache = {};
+  try { if (fs.existsSync(HARMONIC_CACHE_FILE)) idCache = JSON.parse(fs.readFileSync(HARMONIC_CACHE_FILE, 'utf8')); } catch (e) {}
+  const key = req.query.key;
+  if (key === 'all') {
+    idCache = {};
+    console.log('[HarmonicCache] Cleared all cache entries');
+  } else if (key) {
+    delete idCache[key];
+    console.log(`[HarmonicCache] Deleted cache key: ${key}`);
+  } else {
+    return res.status(400).json({ error: 'key param required (or key=all to clear)' });
+  }
+  try { fs.writeFileSync(HARMONIC_CACHE_FILE, JSON.stringify(idCache)); } catch (e) {}
+  res.json({ success: true, count: Object.keys(idCache).length });
 });
 
 // Get current cache
