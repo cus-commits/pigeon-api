@@ -6209,7 +6209,8 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         const queries = [name];
         if (domainBase && domainBase !== coName.replace(/[^a-z0-9]/g, '') && domainBase.length >= 4) queries.push(domainBase);
 
-        let bestCandidate = null; // { id, method, score }
+        const candidates = []; // { id, method, score, closeness }
+        const seenIds = new Set();
         for (const query of queries) {
           try {
             const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(query)}&size=5`, { headers: { apikey: harmonicKey } });
@@ -6220,6 +6221,9 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
             for (const r of raw) {
               const rid = (r.entity_urn || '').split(':').pop();
               if (!rid || !parseInt(rid)) continue;
+              const numId = parseInt(rid);
+              if (seenIds.has(numId)) continue;
+              seenIds.add(numId);
               const rText = (r.text || '').toLowerCase().trim();
               if (rText.length < 2) continue;
               const rClean = rText.replace(/[^a-z0-9]/g, '');
@@ -6240,15 +6244,31 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
                 const domainCloseness = domainBase ? (rClean === domainBase ? 1 : domainBase.includes(rClean) ? 0.8 : rClean.includes(domainBase) ? 0.7 : 0) : 0;
                 const nameCloseness = rText === coName ? 1 : coName.includes(rText) ? 0.8 : rText.includes(coName) ? 0.7 : 0;
                 const closeness = domainCloseness + nameCloseness;
-                const better = !bestCandidate || score > bestCandidate.score || (score === bestCandidate.score && closeness > bestCandidate.closeness);
-                if (better) bestCandidate = { id: parseInt(rid), method, score, closeness };
+                candidates.push({ id: numId, method, score, closeness });
               }
             }
           } catch (e) {}
         }
-        if (bestCandidate) {
-          harmonicId = bestCandidate.id;
-          matchMethod = bestCandidate.method;
+        if (candidates.length > 0) {
+          candidates.sort((a, b) => b.score - a.score || b.closeness - a.closeness);
+          const topScore = candidates[0].score;
+          const tied = candidates.filter(c => c.score === topScore && c.score === 3);
+          if (tied.length > 1 && coDomain) {
+            // Multiple domain-match candidates — enrich to check actual websites
+            try {
+              const tiedGql = await gqlEnrichCompanies(tied.map(c => c.id), harmonicKey);
+              for (const gc of tiedGql) {
+                const gw = (gc.website?.url || gc.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+                if (gw && !domainsConflict(coDomain, gw)) {
+                  harmonicId = gc.id; matchMethod = 'domain+typeahead'; break;
+                }
+              }
+            } catch (e) {}
+          }
+          if (!harmonicId) {
+            harmonicId = candidates[0].id;
+            matchMethod = candidates[0].method;
+          }
         }
       }
 
