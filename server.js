@@ -6236,8 +6236,10 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
                   score = 1; method = 'name-fuzzy';
                 }
               }
-              if (score > 0 && (!bestCandidate || score > bestCandidate.score)) {
-                bestCandidate = { id: parseInt(rid), method, score };
+              if (score > 0) {
+                const closeness = 1 - Math.abs(rClean.length - domainBase.length) / Math.max(rClean.length, domainBase.length, 1);
+                const better = !bestCandidate || score > bestCandidate.score || (score === bestCandidate.score && closeness > bestCandidate.closeness);
+                if (better) bestCandidate = { id: parseInt(rid), method, score, closeness };
               }
             }
           } catch (e) {}
