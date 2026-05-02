@@ -5641,36 +5641,50 @@ app.post('/api/airtable/enrich', async (req, res) => {
       }
     }
 
-    // Strategy 2: Typeahead by name
+    // Strategy 2: Typeahead — try domain name first (more specific), then company name
     if (!targetId) {
-      console.log(`[Enrich] Trying typeahead: ${company}`);
-      const lookupRes = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(company)}&size=3`, { headers: { apikey: harmonicKey } });
-      if (lookupRes.ok) {
-        const lookupData = await lookupRes.json();
-        const results = lookupData.results || [];
-        if (results.length > 0) {
-          // Try exact name match first
-          const compLower = company.toLowerCase().trim();
-          const exact = results.find(r => (r.name || '').toLowerCase().trim() === compLower);
-          if (exact) {
-            targetId = exact.id || (exact.entity_urn || '').split(':').pop();
-            console.log(`[Enrich] Found exact match: ${exact.name} (ID: ${targetId})`);
-          } else {
-            // Fuzzy check: only accept results[0] if the name shares significant overlap
-            const r0Name = (results[0].name || '').toLowerCase().trim();
-            const compWords = compLower.split(/\s+/);
-            const r0Words = r0Name.split(/\s+/);
-            const overlap = compWords.filter(w => r0Words.some(rw => rw.includes(w) || w.includes(rw))).length;
-            const similarity = overlap / Math.max(compWords.length, 1);
-            if (similarity >= 0.4) {
-              const target = results[0];
-              targetId = target.id || (target.entity_urn || '').split(':').pop();
-              console.log(`[Enrich] Fuzzy match (${(similarity*100).toFixed(0)}%): "${company}" → "${target.name}" (ID: ${targetId})`);
-            } else {
-              console.log(`[Enrich] No good match for "${company}". Best: "${results[0].name}" (${(similarity*100).toFixed(0)}% overlap — rejected)`);
+      const enrichDomain = (website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+      const enrichDomainBase = enrichDomain ? enrichDomain.split('.')[0] : '';
+      const queries = [];
+      if (enrichDomainBase && enrichDomainBase.toLowerCase() !== company.toLowerCase().trim()) queries.push(enrichDomainBase);
+      queries.push(company);
+
+      for (const query of queries) {
+        if (targetId) break;
+        console.log(`[Enrich] Trying typeahead: ${query}`);
+        try {
+          const lookupRes = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(query)}&size=3`, { headers: { apikey: harmonicKey } });
+          if (lookupRes.ok) {
+            const lookupData = await lookupRes.json();
+            const results = lookupData.results || [];
+            if (results.length > 0) {
+              const compLower = company.toLowerCase().trim();
+              const exact = results.find(r => (r.name || '').toLowerCase().trim() === compLower);
+              if (exact) {
+                targetId = exact.id || (exact.entity_urn || '').split(':').pop();
+                console.log(`[Enrich] Found exact match: ${exact.name} (ID: ${targetId})`);
+              } else if (enrichDomainBase) {
+                const domainMatch = results.find(r => (r.name || r.text || '').toLowerCase().includes(enrichDomainBase));
+                if (domainMatch) {
+                  targetId = domainMatch.id || (domainMatch.entity_urn || '').split(':').pop();
+                  console.log(`[Enrich] Domain-name match: "${query}" → "${domainMatch.name || domainMatch.text}" (ID: ${targetId})`);
+                }
+              }
+              if (!targetId) {
+                const r0Name = (results[0].name || '').toLowerCase().trim();
+                const compWords = compLower.split(/\s+/);
+                const r0Words = r0Name.split(/\s+/);
+                const overlap = compWords.filter(w => r0Words.some(rw => rw.includes(w) || w.includes(rw))).length;
+                const similarity = overlap / Math.max(compWords.length, 1);
+                if (similarity >= 0.4) {
+                  const target = results[0];
+                  targetId = target.id || (target.entity_urn || '').split(':').pop();
+                  console.log(`[Enrich] Fuzzy match (${(similarity*100).toFixed(0)}%): "${company}" → "${target.name}" (ID: ${targetId})`);
+                }
+              }
             }
           }
-        }
+        } catch (e) {}
       }
     }
 
@@ -6200,34 +6214,39 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         }
       }
 
-      // Strategy 2: Typeahead search
-      // Harmonic typeahead returns: { results: [{ entity_urn, text, type }] }
-      // NO `name` or `id` fields — use `text` for matching, parse ID from `entity_urn`
+      // Strategy 2: Typeahead search — try domain name first (more specific), then company name
       if (!harmonicId) {
-        try {
-          const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
-          if (tr.ok) {
-            const td = await tr.json();
-            const raw = (td.results || []).filter(r => r.type === 'COMPANY');
-            const coName = name.toLowerCase().trim();
-            const coDomain = co.website ? co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
+        const coDomain = co.website ? co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
+        const domainBase = coDomain ? coDomain.split('.')[0] : '';
+        const queries = [];
+        if (domainBase && domainBase.toLowerCase() !== name.toLowerCase().trim()) queries.push(domainBase);
+        queries.push(name);
 
-            for (const r of raw) {
-              const rid = (r.entity_urn || '').split(':').pop();
-              if (!rid || !parseInt(rid)) continue;
-              const rText = (r.text || '').toLowerCase().trim();
-              if (rText.length < 2) continue; // Skip empty/garbage results
+        for (const query of queries) {
+          if (harmonicId) break;
+          try {
+            const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(query)}&size=5`, { headers: { apikey: harmonicKey } });
+            if (tr.ok) {
+              const td = await tr.json();
+              const raw = (td.results || []).filter(r => r.type === 'COMPANY');
+              const coName = name.toLowerCase().trim();
 
-              if (rText === coName) { harmonicId = parseInt(rid); matchMethod = 'name'; break; }
-              if (coDomain && rText.includes(coDomain)) { harmonicId = parseInt(rid); matchMethod = 'domain+typeahead'; break; }
-              // Fuzzy: only if the clean name has 3+ chars and real overlap
-              const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
-              if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
-                harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
+              for (const r of raw) {
+                const rid = (r.entity_urn || '').split(':').pop();
+                if (!rid || !parseInt(rid)) continue;
+                const rText = (r.text || '').toLowerCase().trim();
+                if (rText.length < 2) continue;
+
+                if (rText === coName) { harmonicId = parseInt(rid); matchMethod = 'name'; break; }
+                if (domainBase && rText.includes(domainBase)) { harmonicId = parseInt(rid); matchMethod = 'domain+typeahead'; break; }
+                const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
+                if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
+                  harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
+                }
               }
             }
-          }
-        } catch (e) {}
+          } catch (e) {}
+        }
       }
 
       if (harmonicId) {
