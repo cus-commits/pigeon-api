@@ -6214,13 +6214,15 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         }
       }
 
-      // Strategy 2: Typeahead search — try domain name first (more specific), then company name
+      // Strategy 2: Typeahead — search company name first, then domain base if different
       if (!harmonicId) {
         const coDomain = co.website ? co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
         const domainBase = coDomain ? coDomain.split('.')[0] : '';
-        const queries = [];
-        if (domainBase && domainBase.toLowerCase() !== name.toLowerCase().trim()) queries.push(domainBase);
-        queries.push(name);
+        const coName = name.toLowerCase().trim();
+
+        // Search company name first
+        const queries = [name];
+        if (domainBase && domainBase !== coName.replace(/[^a-z0-9]/g, '') && domainBase.length >= 4) queries.push(domainBase);
 
         for (const query of queries) {
           if (harmonicId) break;
@@ -6229,19 +6231,32 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
             if (tr.ok) {
               const td = await tr.json();
               const raw = (td.results || []).filter(r => r.type === 'COMPANY');
-              const coName = name.toLowerCase().trim();
 
-              for (const r of raw) {
-                const rid = (r.entity_urn || '').split(':').pop();
-                if (!rid || !parseInt(rid)) continue;
-                const rText = (r.text || '').toLowerCase().trim();
-                if (rText.length < 2) continue;
-
-                if (rText === coName) { harmonicId = parseInt(rid); matchMethod = 'name'; break; }
-                if (domainBase && rText.includes(domainBase)) { harmonicId = parseInt(rid); matchMethod = 'domain+typeahead'; break; }
-                const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
-                if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
-                  harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
+              // Pass 1: prefer result matching domain base (most reliable)
+              if (domainBase && domainBase.length >= 4) {
+                for (const r of raw) {
+                  const rid = (r.entity_urn || '').split(':').pop();
+                  if (!rid || !parseInt(rid)) continue;
+                  const rText = (r.text || '').toLowerCase().trim();
+                  if (rText.length < 2) continue;
+                  const rClean = rText.replace(/[^a-z0-9]/g, '');
+                  if (rClean.includes(domainBase) || domainBase.includes(rClean)) {
+                    harmonicId = parseInt(rid); matchMethod = 'domain+typeahead'; break;
+                  }
+                }
+              }
+              // Pass 2: exact or fuzzy name match
+              if (!harmonicId) {
+                for (const r of raw) {
+                  const rid = (r.entity_urn || '').split(':').pop();
+                  if (!rid || !parseInt(rid)) continue;
+                  const rText = (r.text || '').toLowerCase().trim();
+                  if (rText.length < 2) continue;
+                  if (rText === coName) { harmonicId = parseInt(rid); matchMethod = 'name'; break; }
+                  const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
+                  if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
+                    harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
+                  }
                 }
               }
             }
