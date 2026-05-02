@@ -6208,6 +6208,7 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         const coName = name.toLowerCase().trim();
         const queries = [name];
         if (domainBase && domainBase !== coName.replace(/[^a-z0-9]/g, '') && domainBase.length >= 4) queries.push(domainBase);
+        if (coDomain && coDomain !== name.toLowerCase().trim() && coDomain !== domainBase) queries.push(coDomain);
 
         const candidates = []; // { id, method, score, closeness }
         const seenIds = new Set();
