@@ -5276,6 +5276,7 @@ app.get('/api/airtable/companies', async (req, res) => {
       intro_call_notes: rec.fields['Intro Call Notes'] || '',
       notes: rec.fields['Original Notes + Ongoing Negotiation Notes'] || '',
       reachout_notes: rec.fields['Initial Reachout Notes'] || '',
+      harmonic_id: rec.fields['Harmonic ID'] || null,
     }));
     // Sort by created_time (Last Time CRM Stage Modified) descending
     companies.sort((a, b) => new Date(b.created_time || 0).getTime() - new Date(a.created_time || 0).getTime());
@@ -6167,17 +6168,25 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
     try { fs.writeFileSync(HARMONIC_CACHE_FILE, JSON.stringify(idCache)); } catch (e) {}
   }
 
-  // Phase 1: Find Harmonic IDs — check cache first, then API lookups
+  // Phase 1: Find Harmonic IDs — Airtable stored ID first, then cache, then API lookups
   const idMap = {};
   const needsLookup = [];
+  const newlyMatched = []; // Track companies that need Harmonic ID saved to Airtable
 
   for (const co of batch) {
     const name = co.name || '';
     if (!name) continue;
-    // Cache key includes website domain to prevent name collisions (e.g., multiple companies named "Charm")
+
+    // Priority 1: Airtable-stored Harmonic ID (most reliable — manually verified)
+    if (co.harmonic_id) {
+      idMap[name] = { harmonicId: parseInt(co.harmonic_id), matchMethod: 'airtable' };
+      console.log(`[BatchFunding] ✓ "${name}" → ID ${co.harmonic_id} (airtable)`);
+      continue;
+    }
+
+    // Priority 2: Persistent cache
     const coDomain = co.website ? co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
     const cacheKey = coDomain ? `${name.toLowerCase().trim()}|${coDomain}` : name.toLowerCase().trim();
-    // Also check legacy name-only key for backward compat, but only if no domain-specific key exists
     const legacyCacheKey = name.toLowerCase().trim();
     if (idCache[cacheKey]) {
       idMap[name] = { harmonicId: idCache[cacheKey], matchMethod: 'cache' };
@@ -6279,10 +6288,10 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
 
       if (harmonicId) {
         idMap[name] = { harmonicId, matchMethod };
-        // Cache with domain-aware key to prevent name collisions
         const cacheDomain = co.website ? co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
         const saveCacheKey = cacheDomain ? `${name.toLowerCase().trim()}|${cacheDomain}` : name.toLowerCase().trim();
         idCache[saveCacheKey] = typeof harmonicId === 'number' ? harmonicId : parseInt(harmonicId) || harmonicId;
+        if (co.airtable_id) newlyMatched.push({ airtable_id: co.airtable_id, harmonic_id: harmonicId, name });
         console.log(`[BatchFunding] ✓ "${name}" → ID ${harmonicId} (${matchMethod}, cached as: ${saveCacheKey})`);
       } else {
         console.log(`[BatchFunding] ✗ "${name}" — no match (website: ${co.website || 'none'}, twitter: ${co.twitter || 'none'})`);
@@ -6369,6 +6378,26 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
   saveIdCache();
   console.log(`[BatchFunding] Enriched ${Object.keys(results).length}/${batch.length} companies`);
   res.json({ results });
+
+  // Auto-save verified Harmonic IDs back to Airtable (fire-and-forget, after response sent)
+  const toSave = newlyMatched.filter(m => results[m.name]?.verified && results[m.name]?.harmonic_id);
+  if (toSave.length > 0) {
+    const atKey = process.env.AIRTABLE_TOKEN;
+    const atBase = process.env.AIRTABLE_BASE_ID || 'appZjMzKRqOou2OmV';
+    if (atKey) {
+      const records = toSave.map(m => ({ id: m.airtable_id, fields: { 'Harmonic ID': m.harmonic_id } }));
+      for (let i = 0; i < records.length; i += 10) {
+        const chunk = records.slice(i, i + 10);
+        try {
+          await fetch(`https://api.airtable.com/v0/${atBase}/ALL%20COMPANIES`, {
+            method: 'PATCH', headers: { 'Authorization': `Bearer ${atKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ records: chunk }),
+          });
+          console.log(`[BatchFunding] Saved ${chunk.length} Harmonic IDs to Airtable`);
+        } catch (e) { console.error('[BatchFunding] Airtable save error:', e.message); }
+      }
+    }
+  }
 });
 
 // Manual Harmonic ID cache — seed mappings for companies that can't be auto-found
