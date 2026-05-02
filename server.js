@@ -6254,13 +6254,17 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
           const topScore = candidates[0].score;
           const tied = candidates.filter(c => c.score === topScore && c.score === 3);
           if (tied.length > 1 && coDomain) {
-            // Multiple domain-match candidates — enrich to check actual websites
             try {
               const tiedGql = await gqlEnrichCompanies(tied.map(c => c.id), harmonicKey);
+              // Prefer exact domain match, then non-conflicting
               for (const gc of tiedGql) {
                 const gw = (gc.website?.url || gc.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-                if (gw && !domainsConflict(coDomain, gw)) {
-                  harmonicId = gc.id; matchMethod = 'domain+typeahead'; break;
+                if (gw === coDomain) { harmonicId = gc.id; matchMethod = 'domain+typeahead'; break; }
+              }
+              if (!harmonicId) {
+                for (const gc of tiedGql) {
+                  const gw = (gc.website?.url || gc.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+                  if (gw && !domainsConflict(coDomain, gw)) { harmonicId = gc.id; matchMethod = 'domain+typeahead'; break; }
                 }
               }
             } catch (e) {}
