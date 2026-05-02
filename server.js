@@ -5651,23 +5651,7 @@ app.post('/api/airtable/enrich', async (req, res) => {
   try {
     let targetId = null;
 
-    // Strategy 1: Look up by website domain (most accurate)
-    if (website) {
-      const domain = website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
-      if (domain) {
-        console.log(`[Enrich] Trying domain lookup: ${domain}`);
-        const domainRes = await fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(domain)}`, { headers: { apikey: harmonicKey } });
-        if (domainRes.ok) {
-          const domainData = await domainRes.json();
-          if (domainData.id) {
-            targetId = domainData.id;
-            console.log(`[Enrich] Found by domain: ${domainData.name} (ID: ${targetId})`);
-          }
-        }
-      }
-    }
-
-    // Strategy 2: Typeahead — try domain name first (more specific), then company name
+    // Typeahead — try domain name first (more specific), then company name
     if (!targetId) {
       const enrichDomain = (website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
       const enrichDomainBase = enrichDomain ? enrichDomain.split('.')[0] : '';
@@ -6217,76 +6201,50 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
       let harmonicId = null;
       let matchMethod = '';
 
-      // Strategy 1: Domain lookup (highest confidence)
-      // Harmonic /companies?website_domain= returns a flat object on match, [] on no match
-      if (co.website) {
-        const domain = co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
-        if (domain && domain.includes('.')) {
-          try {
-            // Try exact domain first
-            let dr = await fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(domain)}`, { headers: { apikey: harmonicKey } });
-            let dd = dr.ok ? await dr.json() : null;
-            // If empty array, try with www prefix
-            if (dd && ((Array.isArray(dd) && dd.length === 0) || (!dd.id && !dd.entity_urn))) {
-              dr = await fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent('www.' + domain)}`, { headers: { apikey: harmonicKey } });
-              dd = dr.ok ? await dr.json() : null;
-            }
-            if (dd) {
-              const company = Array.isArray(dd) ? dd[0] : (dd.results?.[0] || dd);
-              const foundId = company?.id || (company?.entity_urn || company?.entityUrn || '').split(':').pop() || null;
-              if (foundId && parseInt(foundId)) { harmonicId = parseInt(foundId); matchMethod = 'domain'; }
-            }
-          } catch (e) {}
-        }
-      }
-
-      // Strategy 2: Typeahead — search company name first, then domain base if different
+      // Typeahead — collect candidates from both name and domain base queries, pick best
       if (!harmonicId) {
         const coDomain = co.website ? co.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
         const domainBase = coDomain ? coDomain.split('.')[0] : '';
         const coName = name.toLowerCase().trim();
-
-        // Search company name first
         const queries = [name];
         if (domainBase && domainBase !== coName.replace(/[^a-z0-9]/g, '') && domainBase.length >= 4) queries.push(domainBase);
 
+        let bestCandidate = null; // { id, method, score }
         for (const query of queries) {
-          if (harmonicId) break;
           try {
             const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(query)}&size=5`, { headers: { apikey: harmonicKey } });
-            if (tr.ok) {
-              const td = await tr.json();
-              const raw = (td.results || []).filter(r => r.type === 'COMPANY');
+            if (!tr.ok) continue;
+            const td = await tr.json();
+            const raw = (td.results || []).filter(r => r.type === 'COMPANY');
 
-              // Pass 1: prefer result matching domain base (most reliable)
-              if (domainBase && domainBase.length >= 4) {
-                for (const r of raw) {
-                  const rid = (r.entity_urn || '').split(':').pop();
-                  if (!rid || !parseInt(rid)) continue;
-                  const rText = (r.text || '').toLowerCase().trim();
-                  if (rText.length < 2) continue;
-                  const rClean = rText.replace(/[^a-z0-9]/g, '');
-                  if (rClean.includes(domainBase) || domainBase.includes(rClean)) {
-                    harmonicId = parseInt(rid); matchMethod = 'domain+typeahead'; break;
-                  }
+            for (const r of raw) {
+              const rid = (r.entity_urn || '').split(':').pop();
+              if (!rid || !parseInt(rid)) continue;
+              const rText = (r.text || '').toLowerCase().trim();
+              if (rText.length < 2) continue;
+              const rClean = rText.replace(/[^a-z0-9]/g, '');
+
+              let score = 0;
+              let method = '';
+              if (domainBase && domainBase.length >= 4 && (rClean.includes(domainBase) || domainBase.includes(rClean))) {
+                score = 3; method = 'domain+typeahead';
+              } else if (rText === coName) {
+                score = 2; method = 'name';
+              } else {
+                const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
+                if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
+                  score = 1; method = 'name-fuzzy';
                 }
               }
-              // Pass 2: exact or fuzzy name match
-              if (!harmonicId) {
-                for (const r of raw) {
-                  const rid = (r.entity_urn || '').split(':').pop();
-                  if (!rid || !parseInt(rid)) continue;
-                  const rText = (r.text || '').toLowerCase().trim();
-                  if (rText.length < 2) continue;
-                  if (rText === coName) { harmonicId = parseInt(rid); matchMethod = 'name'; break; }
-                  const cleanR = rText.replace(/\.com|\.io|\.ai|\.xyz|\.co|https?:\/\//g, '').trim();
-                  if (cleanR.length >= 3 && (rText.includes(coName) || coName.includes(cleanR))) {
-                    harmonicId = parseInt(rid); matchMethod = 'name-fuzzy'; break;
-                  }
-                }
+              if (score > 0 && (!bestCandidate || score > bestCandidate.score)) {
+                bestCandidate = { id: parseInt(rid), method, score };
               }
             }
           } catch (e) {}
+        }
+        if (bestCandidate) {
+          harmonicId = bestCandidate.id;
+          matchMethod = bestCandidate.method;
         }
       }
 
