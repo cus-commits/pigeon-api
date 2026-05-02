@@ -5369,16 +5369,6 @@ app.post('/api/airtable/add', async (req, res) => {
         }
       }
 
-      // URL cross-validation: if enrichment came from typeahead, verify website doesn't conflict
-      if (harmonicData && enrichedWebsite) {
-        const harmonicDomain = (harmonicData.website?.url || harmonicData.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-        const providedDomain = enrichedWebsite.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-        if (domainsConflict(providedDomain, harmonicDomain)) {
-          console.log(`[Airtable+Harmonic] REJECTED enrichment: website mismatch — provided: ${providedDomain} vs Harmonic: ${harmonicDomain} (${harmonicData.name})`);
-          harmonicData = null;
-        }
-      }
-
       if (harmonicData) {
         const c = harmonicData;
         const f = c.funding || {};
@@ -5681,24 +5671,6 @@ app.post('/api/airtable/enrich', async (req, res) => {
             }
           }
         }
-      }
-    }
-
-    // URL cross-validation: if matched by typeahead (not domain), verify website doesn't conflict
-    if (targetId && website) {
-      try {
-        const vr = await fetch(`${HARMONIC_BASE}/companies/${targetId}`, { headers: { apikey: harmonicKey } });
-        if (vr.ok) {
-          const vc = await vr.json();
-          const harmonicDomain = (vc.website?.url || vc.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-          const airtableDomain = (website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-          if (domainsConflict(airtableDomain, harmonicDomain)) {
-            console.log(`[Enrich] REJECTED "${company}" → "${vc.name}": website mismatch — Airtable: ${airtableDomain} vs Harmonic: ${harmonicDomain}`);
-            return res.json({ error: `"${company}" found in Harmonic as "${vc.name}" but website doesn't match (${airtableDomain} vs ${harmonicDomain})`, mismatch: true });
-          }
-        }
-      } catch (e) {
-        console.warn(`[Enrich] URL validation fetch failed for "${company}":`, e.message);
       }
     }
 
@@ -6292,37 +6264,6 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         } catch (e) {}
       }
 
-      // URL cross-validation: if matched by name (not domain), verify website/twitter don't conflict
-      if (harmonicId && matchMethod !== 'domain' && (co.website || co.twitter)) {
-        try {
-          const vr = await fetch(`${HARMONIC_BASE}/companies/${harmonicId}`, { headers: { apikey: harmonicKey } });
-          if (vr.ok) {
-            const vc = await vr.json();
-            const harmonicDomain = (vc.website?.url || vc.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-            const airtableDomain = (co.website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-            const harmonicTwitter = (vc.socials?.twitter?.url || '').replace(/^https?:\/\/(www\.)?(x|twitter)\.com\//i, '').replace(/\/.*$/, '').toLowerCase();
-            const airtableTwitter = (co.twitter || '').replace(/^https?:\/\/(www\.)?(x|twitter)\.com\//i, '').replace(/\/.*$/, '').toLowerCase();
-
-            let domainConflict = domainsConflict(airtableDomain, harmonicDomain);
-            let twitterConflict = false;
-            if (airtableTwitter && harmonicTwitter && airtableTwitter !== harmonicTwitter) {
-              twitterConflict = true;
-            }
-
-            if (domainConflict || twitterConflict) {
-              console.log(`[BatchFunding] REJECTED "${name}" → "${vc.name}" (${matchMethod}): URL mismatch — Airtable: ${airtableDomain || 'none'}/${airtableTwitter || 'none'} vs Harmonic: ${harmonicDomain || 'none'}/${harmonicTwitter || 'none'}`);
-              harmonicId = null;
-              matchMethod = '';
-            } else {
-              console.log(`[BatchFunding] ✓ URL cross-validation passed for "${name}" (${matchMethod})`);
-            }
-          }
-        } catch (e) {
-          console.warn(`[BatchFunding] URL validation fetch failed for "${name}":`, e.message);
-          // On fetch failure, still allow the match (don't block enrichment)
-        }
-      }
-
       if (harmonicId) {
         idMap[name] = { harmonicId, matchMethod };
         // Cache with domain-aware key to prevent name collisions
@@ -6366,22 +6307,26 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         const card = gqlToCard(gc);
         const { matchMethod } = idMap[name];
 
-        // Verify the returned company name isn't wildly different (prevent UseRocket → wrong company)
+        // Verify the returned company name isn't wildly different (prevent Pred → Predata, Charm → Charm Security)
         if (matchMethod !== 'domain' && matchMethod !== 'cache') {
           const reqName = name.toLowerCase().replace(/[^a-z0-9]/g, '');
           const gotName = (card.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-          if (reqName && gotName && !reqName.includes(gotName) && !gotName.includes(reqName)) {
-            const rWords = name.toLowerCase().split(/\s+/);
-            const gWords = (card.name || '').toLowerCase().split(/\s+/);
-            const overlap = rWords.filter(w => gWords.some(g => g.includes(w) || w.includes(g))).length;
-            if (overlap / Math.max(rWords.length, 1) < 0.3) {
-              console.log(`[BatchFunding] REJECTED mismatch: "${name}" → "${card.name}" (${matchMethod}, ${(overlap/rWords.length*100).toFixed(0)}% overlap)`);
-              // Remove bad cache entry (try both domain-aware and legacy keys)
-              const rejCo = batch.find(c => c.name === name);
-              const rejDomain = rejCo?.website ? rejCo.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
-              if (rejDomain) delete idCache[`${name.toLowerCase().trim()}|${rejDomain}`];
-              delete idCache[name.toLowerCase().trim()];
-              continue;
+          if (reqName && gotName) {
+            const shorter = reqName.length <= gotName.length ? reqName : gotName;
+            const longer = reqName.length <= gotName.length ? gotName : reqName;
+            const nameMatch = shorter === longer || (longer.includes(shorter) && shorter.length >= longer.length * 0.6);
+            if (!nameMatch) {
+              const rWords = name.toLowerCase().split(/\s+/);
+              const gWords = (card.name || '').toLowerCase().split(/\s+/);
+              const overlap = rWords.filter(w => gWords.some(g => g === w)).length;
+              if (overlap / Math.max(rWords.length, 1) < 0.5) {
+                console.log(`[BatchFunding] REJECTED mismatch: "${name}" → "${card.name}" (${matchMethod}, ${(overlap/rWords.length*100).toFixed(0)}% overlap)`);
+                const rejCo = batch.find(c => c.name === name);
+                const rejDomain = rejCo?.website ? rejCo.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
+                if (rejDomain) delete idCache[`${name.toLowerCase().trim()}|${rejDomain}`];
+                delete idCache[name.toLowerCase().trim()];
+                continue;
+              }
             }
           }
         }
