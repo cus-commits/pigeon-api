@@ -6190,9 +6190,11 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
     const legacyCacheKey = name.toLowerCase().trim();
     if (idCache[cacheKey]) {
       idMap[name] = { harmonicId: idCache[cacheKey], matchMethod: 'cache' };
+      if (co.airtable_id && !co.harmonic_id) newlyMatched.push({ airtable_id: co.airtable_id, harmonic_id: idCache[cacheKey], name });
       console.log(`[BatchFunding] ✓ "${name}" → ID ${idCache[cacheKey]} (cache, key: ${cacheKey})`);
     } else if (!coDomain && idCache[legacyCacheKey]) {
       idMap[name] = { harmonicId: idCache[legacyCacheKey], matchMethod: 'cache' };
+      if (co.airtable_id && !co.harmonic_id) newlyMatched.push({ airtable_id: co.airtable_id, harmonic_id: idCache[legacyCacheKey], name });
       console.log(`[BatchFunding] ✓ "${name}" → ID ${idCache[legacyCacheKey]} (cache-legacy)`);
     } else {
       needsLookup.push(co);
