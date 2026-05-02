@@ -28,6 +28,28 @@ function saveReachoutsCreds(creds) {
 const HARMONIC_BASE = 'https://api.harmonic.ai';
 const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
 
+function domainsConflict(domainA, domainB) {
+  if (!domainA || !domainB) return false;
+  if (domainA === domainB) return false;
+  if (domainA.includes(domainB) || domainB.includes(domainA)) return false;
+  const commonTlds = new Set(['com','io','ai','xyz','co','gg','fi','app','org','net','dev','sh','us','uk','de','fun']);
+  function baseName(d) {
+    const parts = d.split('.');
+    const tld = parts[parts.length - 1];
+    const base = commonTlds.has(tld) ? parts.slice(0, -1).join('') : parts.join('');
+    return base.replace(/^(app|get|use|try|pay|my|www|go)/, '');
+  }
+  const baseA = baseName(domainA);
+  const baseB = baseName(domainB);
+  if (baseA && baseB && baseA.length >= 3 && baseB.length >= 3) {
+    if (baseA === baseB) return false;
+    const shorter = baseA.length <= baseB.length ? baseA : baseB;
+    const longer = baseA.length <= baseB.length ? baseB : baseA;
+    if (longer.includes(shorter) && shorter.length >= longer.length * 0.6) return false;
+  }
+  return true;
+}
+
 // ==========================================
 // GRAPHQL ENRICHMENT — Scout-quality data
 // ==========================================
@@ -5351,7 +5373,7 @@ app.post('/api/airtable/add', async (req, res) => {
       if (harmonicData && enrichedWebsite) {
         const harmonicDomain = (harmonicData.website?.url || harmonicData.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
         const providedDomain = enrichedWebsite.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-        if (providedDomain && harmonicDomain && providedDomain !== harmonicDomain && !providedDomain.includes(harmonicDomain) && !harmonicDomain.includes(providedDomain)) {
+        if (domainsConflict(providedDomain, harmonicDomain)) {
           console.log(`[Airtable+Harmonic] REJECTED enrichment: website mismatch — provided: ${providedDomain} vs Harmonic: ${harmonicDomain} (${harmonicData.name})`);
           harmonicData = null;
         }
@@ -5670,7 +5692,7 @@ app.post('/api/airtable/enrich', async (req, res) => {
           const vc = await vr.json();
           const harmonicDomain = (vc.website?.url || vc.website?.domain || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
           const airtableDomain = (website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-          if (airtableDomain && harmonicDomain && airtableDomain !== harmonicDomain && !airtableDomain.includes(harmonicDomain) && !harmonicDomain.includes(airtableDomain)) {
+          if (domainsConflict(airtableDomain, harmonicDomain)) {
             console.log(`[Enrich] REJECTED "${company}" → "${vc.name}": website mismatch — Airtable: ${airtableDomain} vs Harmonic: ${harmonicDomain}`);
             return res.json({ error: `"${company}" found in Harmonic as "${vc.name}" but website doesn't match (${airtableDomain} vs ${harmonicDomain})`, mismatch: true });
           }
@@ -5721,7 +5743,7 @@ app.post('/api/airtable/enrich', async (req, res) => {
     // Twitter: ONLY add if Airtable has no twitter AND we can verify via website match
     const harmonicDomain = (c.website?.domain || c.website?.url || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
     const airtableDomain = (website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
-    const websiteMatch = harmonicDomain && airtableDomain && (harmonicDomain === airtableDomain || harmonicDomain.includes(airtableDomain) || airtableDomain.includes(harmonicDomain));
+    const websiteMatch = harmonicDomain && airtableDomain && !domainsConflict(harmonicDomain, airtableDomain);
     
     if (websiteMatch && c.socials?.twitter?.url) {
       // Only set twitter if websites match (confirms right company)
@@ -6281,10 +6303,7 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
             const harmonicTwitter = (vc.socials?.twitter?.url || '').replace(/^https?:\/\/(www\.)?(x|twitter)\.com\//i, '').replace(/\/.*$/, '').toLowerCase();
             const airtableTwitter = (co.twitter || '').replace(/^https?:\/\/(www\.)?(x|twitter)\.com\//i, '').replace(/\/.*$/, '').toLowerCase();
 
-            let domainConflict = false;
-            if (airtableDomain && harmonicDomain && airtableDomain !== harmonicDomain && !airtableDomain.includes(harmonicDomain) && !harmonicDomain.includes(airtableDomain)) {
-              domainConflict = true;
-            }
+            let domainConflict = domainsConflict(airtableDomain, harmonicDomain);
             let twitterConflict = false;
             if (airtableTwitter && harmonicTwitter && airtableTwitter !== harmonicTwitter) {
               twitterConflict = true;
