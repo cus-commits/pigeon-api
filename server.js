@@ -1178,6 +1178,32 @@ app.post('/api/chat', async (req, res) => {
 // HARMONIC ENRICHMENT ENDPOINTS
 // ==========================================
 
+// Domain lookup diagnostic
+app.get('/api/harmonic/domain-lookup', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const harmonicKey = process.env.HARMONIC_API_KEY;
+  if (!harmonicKey) return res.json({ error: 'No key' });
+  const domain = req.query.domain || '';
+  if (!domain) return res.json({ error: 'domain param required' });
+  try {
+    const url = `${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(domain)}`;
+    const r = await fetch(url, { headers: { apikey: harmonicKey } });
+    const data = r.ok ? await r.json() : { httpError: r.status };
+    const isMatch = data && !Array.isArray(data) && data.id;
+    res.json({
+      domain,
+      found: !!isMatch,
+      harmonicId: data.id || null,
+      harmonicName: data.name || null,
+      harmonicWebsite: data.website?.url || data.website?.domain || null,
+      rawType: Array.isArray(data) ? 'array' : typeof data,
+      rawKeys: typeof data === 'object' && !Array.isArray(data) ? Object.keys(data).slice(0, 10) : null,
+    });
+  } catch (e) {
+    res.json({ domain, error: e.message });
+  }
+});
+
 // Live typeahead search
 app.get('/api/harmonic/typeahead', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -6307,8 +6333,8 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
         const card = gqlToCard(gc);
         const { matchMethod } = idMap[name];
 
-        // Website validation: if matched by name (not domain), check card website matches Airtable website
-        if (matchMethod !== 'domain' && matchMethod !== 'cache') {
+        // Website validation: ALWAYS check card website matches Airtable website (including cache matches)
+        if (matchMethod !== 'domain') {
           const reqCo = batch.find(c => c.name === name);
           const atDomain = reqCo?.website ? reqCo.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase() : '';
           const hDomain = (card.website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
