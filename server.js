@@ -6291,7 +6291,7 @@ app.post('/api/harmonic/batch-funding', async (req, res) => {
     }
   });
 
-  const CONCURRENCY = 10;
+  const CONCURRENCY = 3;
   for (let i = 0; i < lookupPromises.length; i += CONCURRENCY) {
     await Promise.all(lookupPromises.slice(i, i + CONCURRENCY));
   }
