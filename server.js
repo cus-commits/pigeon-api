@@ -4647,11 +4647,20 @@ app.post('/api/signals/super', async (req, res) => {
       stage = [],
       customKeywords = '',
       superTier = 'sonnet', // 'sonnet' | 'opus20' | 'opus80'
+      // Anchors (Deep Search integration)
+      baselines = [],
+      baselineImportance = 7,
+      includeCRM = false,
+      crmStages = [],
+      crmImportance = 5,
+      portfolioCompanies = [],
+      portfolioImportance = 5,
     } = req.body;
     const useOpus = superTier === 'opus20' || superTier === 'opus80';
     const opusTopN = superTier === 'opus80' ? 80 : superTier === 'opus20' ? 20 : 0;
+    const hasAnchors = baselines.length > 0 || (includeCRM && crmStages.length > 0) || portfolioCompanies.length > 0;
 
-    if (sectors.length === 0 && !customKeywords.trim()) {
+    if (sectors.length === 0 && !customKeywords.trim() && !hasAnchors) {
       return sendResult({ error: 'Pick at least one sector or add custom keywords.' });
     }
 
@@ -4949,6 +4958,156 @@ app.post('/api/signals/super', async (req, res) => {
       }
     }
 
+    // ---- ANCHORS (Baselines + Portfolio + CRM) ----
+    // When user provides anchor companies, fetch their similar companies from Harmonic
+    // and inject them as harmonic-source signals with anchor metadata.
+    let anchorContext = ''; // Used in scoring prompts
+    let anchorCompanyNames = []; // For matching during scoring
+
+    if (hasAnchors && harmonicKey) {
+      sendProgress('Fetching anchor companies (baselines/portfolio)...', 'import', { source: 'anchors' });
+      const harmonicHeaders = { apikey: harmonicKey };
+      const seenAnchorIds = new Set();
+
+      // Determine fetch sizes based on importance (0-10 scale)
+      // Importance 5 = ~50 similar, importance 10 = ~100 similar, importance 1 = ~10 similar
+      const sizeFromImportance = (imp) => Math.max(10, Math.min(100, imp * 10));
+
+      // Helper: fetch similar companies for a given company id, add to allSignals
+      const fetchAnchorSimilar = async (anchorCo, weight, anchorType) => {
+        let id = anchorCo.id;
+        // If no ID, try typeahead lookup
+        if (!id && anchorCo.name) {
+          try {
+            const lookupRes = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(anchorCo.name)}&size=1`, { headers: harmonicHeaders });
+            if (lookupRes.ok) {
+              const lookupData = await lookupRes.json();
+              const match = (lookupData.results || [])[0];
+              if (match) id = match.id || (match.entity_urn || '').split(':').pop();
+            }
+          } catch (e) {}
+        }
+        if (!id) return 0;
+
+        const size = sizeFromImportance(weight);
+        try {
+          const r = await fetch(`${HARMONIC_BASE}/search/similar_companies/${id}?size=${size}`, { headers: harmonicHeaders });
+          if (!r.ok) return 0;
+          const data = await r.json();
+          let raw = Array.isArray(data) ? data : (data.results || data.similar_companies || data.companies || []);
+          if (!raw.length) return 0;
+
+          const alreadyFull = raw[0] && typeof raw[0] === 'object' && raw[0].name;
+          let companies = [];
+          if (alreadyFull) {
+            companies = raw.map(c => gqlToCard(c));
+          } else {
+            const ids = raw.map(r => {
+              if (typeof r === 'string') return r.includes(':') ? r.split(':').pop() : r;
+              if (typeof r === 'number') return r;
+              return r.id || (r.entity_urn || r.entityUrn || '').split(':').pop() || null;
+            }).filter(Boolean);
+            if (ids.length > 0) {
+              const enriched = await gqlEnrichCompanies(ids, harmonicKey);
+              companies = enriched.map(c => gqlToCard(c));
+            }
+          }
+
+          let added = 0;
+          for (const c of companies) {
+            const cid = String(c.id || c.entity_id || '');
+            const nameKey = (c.name || '').toLowerCase().trim();
+            if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
+            seenAnchorIds.add(cid);
+            seenAnchorIds.add(nameKey);
+
+            const tm = c.tractionMetrics || {};
+            const webGrowth = tm.webTraffic?.ago30d?.percentChange || null;
+            const hcGrowth = tm.headcount?.ago90d?.percentChange || null;
+            const founders = Array.isArray(c.founders) ? c.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
+
+            allSignals.push({
+              source: 'harmonic',
+              id: `hm-${cid}`,
+              title: c.name || '?',
+              subtitle: c.funding_stage || c.stage || 'Unknown',
+              text: (c.description || '').slice(0, 300),
+              url: c.website?.url || c.website?.domain || c.website || '',
+              pfp: c.logo_url || c.logoUrl || '',
+              followers: c.headcount || 0,
+              engagement: c.funding_total || 0,
+              likes: 0,
+              timestamp: c.created_at || c.founded_date || null,
+              meta: {
+                funding: c.funding_total || 0,
+                stage: c.funding_stage || c.stage,
+                headcount: c.headcount,
+                website: c.website?.url || c.website || '',
+                founders, webGrowth, hcGrowth,
+              },
+              _anchor: { type: anchorType, weight, baseline: anchorCo.name },
+            });
+            sourceStats.harmonic = (sourceStats.harmonic || 0) + 1;
+            added++;
+          }
+          return added;
+        } catch (e) {
+          console.error(`[Super/Anchor] error fetching similar for ${anchorCo.name}:`, e.message);
+          return 0;
+        }
+      };
+
+      // Process baselines
+      if (baselines.length > 0) {
+        anchorCompanyNames.push(...baselines.map(b => b.name));
+        for (const b of baselines) {
+          const n = await fetchAnchorSimilar(b, baselineImportance, 'baseline');
+          console.log(`[Super/Anchor] baseline "${b.name}" → ${n} similar companies`);
+        }
+        anchorContext += `BASELINE COMPANIES (importance ${baselineImportance}/10): ${baselines.map(b => b.name).join(', ')}\n`;
+      }
+
+      // Process portfolio
+      if (portfolioCompanies.length > 0) {
+        anchorCompanyNames.push(...portfolioCompanies.map(p => p.name));
+        for (const p of portfolioCompanies) {
+          const n = await fetchAnchorSimilar(p, portfolioImportance, 'portfolio');
+          console.log(`[Super/Anchor] portfolio "${p.name}" → ${n} similar companies`);
+        }
+        anchorContext += `PORTFOLIO ANCHORS (importance ${portfolioImportance}/10): ${portfolioCompanies.map(p => p.name).join(', ')}\n`;
+      }
+
+      // Process CRM (fetch from Airtable as context)
+      if (includeCRM && crmStages.length > 0) {
+        try {
+          const airtableHdrs = (typeof airtableHeaders === 'function') ? airtableHeaders() : null;
+          const airtableBaseId = process.env.AIRTABLE_BASE_ID;
+          if (airtableHdrs && airtableBaseId) {
+            const crmNames = [];
+            for (const stage of crmStages) {
+              try {
+                const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
+                const url = `${AIRTABLE_API}/${airtableBaseId}/${AIRTABLE_TABLE}?maxRecords=50&filterByFormula=${formula}`;
+                const r = await fetch(url, { headers: airtableHdrs });
+                if (r.ok) {
+                  const data = await r.json();
+                  for (const rec of (data.records || [])) {
+                    const name = (rec.fields['Company'] || '').trim();
+                    if (name) crmNames.push(name);
+                  }
+                }
+              } catch (e) {}
+            }
+            anchorCompanyNames.push(...crmNames);
+            anchorContext += `CRM PIPELINE (importance ${crmImportance}/10, stages ${crmStages.join('/')}): ${crmNames.slice(0, 30).join(', ')}${crmNames.length > 30 ? ` (+${crmNames.length - 30} more)` : ''}\n`;
+            console.log(`[Super/Anchor] CRM context: ${crmNames.length} companies from ${crmStages.join('/')}`);
+          }
+        } catch (e) { console.error('[Super/Anchor] CRM fetch error:', e.message); }
+      }
+
+      sendProgress(`Anchors loaded — ${sourceStats.harmonic || 0} similar companies from Harmonic`, 'import', { source: 'anchors' });
+    }
+
     // ---- HARMONIC ----
     if (sources.includes('harmonic') && harmonicKey) {
       sendProgress('Scanning Harmonic database...', 'import', { source: 'harmonic' });
@@ -5081,10 +5240,10 @@ app.post('/api/signals/super', async (req, res) => {
         const prompt = `You are a crypto deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
 
 You're reviewing ${batch.length} signals from MULTIPLE sources: Twitter/X, Farcaster, GitHub repos, Product Hunt, and Harmonic company database.
-
+${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nGive HIGHER ratings to signals matching these anchor patterns. Companies similar to baselines/portfolio anchors should bias toward HIGH.\n` : ''}
 RATE EACH SIGNAL:
-- HIGH: Clearly investable — founder building something specific, raising a round, launching a product, early team with real traction
-- MEDIUM: Interesting but needs context — could be a lead worth following  
+- HIGH: Clearly investable — founder building something specific, raising a round, launching a product, early team with real traction${anchorContext ? ' OR strongly matches the anchor pattern (similar business model, market, stage)' : ''}
+- MEDIUM: Interesting but needs context — could be a lead worth following
 - LOW: Not relevant — commentary, memes, established projects, noise
 
 BE STRICT. Most should be LOW. Only HIGH if clearly investable.
@@ -5162,8 +5321,8 @@ ${signalText}`;
         if (topForOpus.length > 0) {
           sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
           const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
-
-Score each company/signal 1-10 based on investability. Consider: founder quality, product traction, market timing, uniqueness, funding stage fit.
+${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nWeight similarity to these anchor patterns heavily in your scoring. A strong match on baseline/portfolio similarity should boost the score by 1-2 points.\n` : ''}
+Score each company/signal 1-10 based on investability. Consider: founder quality, product traction, market timing, uniqueness, funding stage fit${anchorContext ? ', AND similarity to the anchor companies above' : ''}.
 
 SCORING GUIDE:
 - 9-10: Exceptional — clear product, strong founder, right timing, must-meet
