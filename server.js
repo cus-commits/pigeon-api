@@ -4646,18 +4646,21 @@ app.post('/api/signals/super', async (req, res) => {
       timeRange = 'week',
       stage = [],
       customKeywords = '',
-      superTier = 'sonnet', // 'sonnet' | 'opus20' | 'opus80'
+      superTier = 'sonnet', // haiku|sonnet|opus20|opus80|extreme
       // Anchors (Deep Search integration)
       baselines = [],
-      baselineImportance = 7,
+      baselineImportance = 70,    // 0-100
       includeCRM = false,
       crmStages = [],
-      crmImportance = 5,
+      crmImportance = 50,         // 0-100
       portfolioCompanies = [],
-      portfolioImportance = 5,
+      portfolioImportance = 50,   // 0-100
+      additionalInfo = '',        // freeform extra context
     } = req.body;
-    const useOpus = superTier === 'opus20' || superTier === 'opus80';
-    const opusTopN = superTier === 'opus80' ? 80 : superTier === 'opus20' ? 20 : 0;
+    const useOpus = ['opus20', 'opus80', 'extreme'].includes(superTier);
+    const opusTopN = { opus20: 20, opus80: 80, extreme: 200 }[superTier] || 0;
+    const useHaikuScreen = superTier === 'haiku';
+    const screenModel = useHaikuScreen ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-20250514';
     const hasAnchors = baselines.length > 0 || (includeCRM && crmStages.length > 0) || portfolioCompanies.length > 0;
 
     if (sectors.length === 0 && !customKeywords.trim() && !hasAnchors) {
@@ -4969,9 +4972,9 @@ app.post('/api/signals/super', async (req, res) => {
       const harmonicHeaders = { apikey: harmonicKey };
       const seenAnchorIds = new Set();
 
-      // Determine fetch sizes based on importance (0-10 scale)
-      // Importance 5 = ~50 similar, importance 10 = ~100 similar, importance 1 = ~10 similar
-      const sizeFromImportance = (imp) => Math.max(10, Math.min(100, imp * 10));
+      // Determine fetch sizes based on importance (0-100 scale)
+      // Importance 50 = ~50 similar, 100 = ~100 similar, 10 = ~10 similar
+      const sizeFromImportance = (imp) => Math.max(10, Math.min(100, Math.round(imp)));
 
       // Helper: fetch similar companies for a given company id, add to allSignals
       const fetchAnchorSimilar = async (anchorCo, weight, anchorType) => {
@@ -5064,7 +5067,7 @@ app.post('/api/signals/super', async (req, res) => {
           const n = await fetchAnchorSimilar(b, baselineImportance, 'baseline');
           console.log(`[Super/Anchor] baseline "${b.name}" → ${n} similar companies`);
         }
-        anchorContext += `BASELINE COMPANIES (importance ${baselineImportance}/10): ${baselines.map(b => b.name).join(', ')}\n`;
+        anchorContext += `BASELINE COMPANIES (importance ${baselineImportance}%): ${baselines.map(b => b.name).join(', ')}\n`;
       }
 
       // Process portfolio
@@ -5074,7 +5077,7 @@ app.post('/api/signals/super', async (req, res) => {
           const n = await fetchAnchorSimilar(p, portfolioImportance, 'portfolio');
           console.log(`[Super/Anchor] portfolio "${p.name}" → ${n} similar companies`);
         }
-        anchorContext += `PORTFOLIO ANCHORS (importance ${portfolioImportance}/10): ${portfolioCompanies.map(p => p.name).join(', ')}\n`;
+        anchorContext += `PORTFOLIO ANCHORS (importance ${portfolioImportance}%): ${portfolioCompanies.map(p => p.name).join(', ')}\n`;
       }
 
       // Process CRM (fetch from Airtable as context)
@@ -5099,7 +5102,7 @@ app.post('/api/signals/super', async (req, res) => {
               } catch (e) {}
             }
             anchorCompanyNames.push(...crmNames);
-            anchorContext += `CRM PIPELINE (importance ${crmImportance}/10, stages ${crmStages.join('/')}): ${crmNames.slice(0, 30).join(', ')}${crmNames.length > 30 ? ` (+${crmNames.length - 30} more)` : ''}\n`;
+            anchorContext += `CRM PIPELINE (importance ${crmImportance}%, stages ${crmStages.join('/')}): ${crmNames.slice(0, 30).join(', ')}${crmNames.length > 30 ? ` (+${crmNames.length - 30} more)` : ''}\n`;
             console.log(`[Super/Anchor] CRM context: ${crmNames.length} companies from ${crmStages.join('/')}`);
           }
         } catch (e) { console.error('[Super/Anchor] CRM fetch error:', e.message); }
@@ -5240,7 +5243,7 @@ app.post('/api/signals/super', async (req, res) => {
         const prompt = `You are a crypto deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
 
 You're reviewing ${batch.length} signals from MULTIPLE sources: Twitter/X, Farcaster, GitHub repos, Product Hunt, and Harmonic company database.
-${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nGive HIGHER ratings to signals matching these anchor patterns. Companies similar to baselines/portfolio anchors should bias toward HIGH.\n` : ''}
+${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nGive HIGHER ratings to signals matching these anchor patterns. Companies similar to baselines/portfolio anchors should bias toward HIGH.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (use this to shape your scoring — pay attention to what they say to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 8000)}\n` : ''}
 RATE EACH SIGNAL:
 - HIGH: Clearly investable — founder building something specific, raising a round, launching a product, early team with real traction${anchorContext ? ' OR strongly matches the anchor pattern (similar business model, market, stage)' : ''}
 - MEDIUM: Interesting but needs context — could be a lead worth following
@@ -5261,7 +5264,7 @@ ${signalText}`;
           const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+            body: JSON.stringify({ model: screenModel, max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
           });
 
           if (claudeRes.ok) {
@@ -5321,7 +5324,7 @@ ${signalText}`;
         if (topForOpus.length > 0) {
           sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
           const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
-${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nWeight similarity to these anchor patterns heavily in your scoring. A strong match on baseline/portfolio similarity should boost the score by 1-2 points.\n` : ''}
+${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nWeight similarity to these anchor patterns heavily in your scoring. A strong match on baseline/portfolio similarity should boost the score by 1-2 points.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (use this to shape your scoring — pay attention to what they say to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 12000)}\n` : ''}
 Score each company/signal 1-10 based on investability. Consider: founder quality, product traction, market timing, uniqueness, funding stage fit${anchorContext ? ', AND similarity to the anchor companies above' : ''}.
 
 SCORING GUIDE:
