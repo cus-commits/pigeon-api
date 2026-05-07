@@ -4661,6 +4661,36 @@ app.post('/api/signals/super', async (req, res) => {
     const opusTopN = { opus20: 20, opus80: 80, extreme: 200 }[superTier] || 0;
     const useHaikuScreen = superTier === 'haiku';
     const screenModel = useHaikuScreen ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-20250514';
+    // For Max/Extreme tiers, guarantee Opus runs by falling back to top-N by engagement
+    // when not enough HIGH/MEDIUM signals exist. Users paid for deep scoring — give it to them.
+    const opusFillToN = ['opus80', 'extreme'].includes(superTier);
+
+    // ── Real token-based cost tracking ──
+    // Anthropic pricing (per 1M tokens): Haiku 4.5 $1/$5 · Sonnet 4 $3/$15 · Opus 4.6 $15/$75
+    const PRICING = {
+      'claude-haiku-4-5-20251001':  { in: 1,  out: 5  },
+      'claude-sonnet-4-20250514':   { in: 3,  out: 15 },
+      'claude-opus-4-6':            { in: 15, out: 75 },
+    };
+    const usage = { sonnetIn: 0, sonnetOut: 0, opusIn: 0, opusOut: 0, haikuIn: 0, haikuOut: 0 };
+    const recordUsage = (model, u) => {
+      if (!u) return;
+      const inT = u.input_tokens || 0, outT = u.output_tokens || 0;
+      if (model.includes('haiku'))      { usage.haikuIn += inT; usage.haikuOut += outT; }
+      else if (model.includes('opus'))  { usage.opusIn  += inT; usage.opusOut  += outT; }
+      else                              { usage.sonnetIn += inT; usage.sonnetOut += outT; }
+    };
+    const computeCost = () => {
+      const sonnet = (usage.sonnetIn * PRICING['claude-sonnet-4-20250514'].in + usage.sonnetOut * PRICING['claude-sonnet-4-20250514'].out) / 1e6;
+      const opus   = (usage.opusIn   * PRICING['claude-opus-4-6'].in           + usage.opusOut   * PRICING['claude-opus-4-6'].out)           / 1e6;
+      const haiku  = (usage.haikuIn  * PRICING['claude-haiku-4-5-20251001'].in + usage.haikuOut  * PRICING['claude-haiku-4-5-20251001'].out) / 1e6;
+      return { total: sonnet + opus + haiku, sonnet, opus, haiku, usage };
+    };
+
+    // Track which sources actually ran (vs requested but skipped due to missing env keys)
+    const sourcesRequested = [...sources];
+    const sourcesActual = [];
+    const sourcesSkipped = []; // [{source, reason}]
     const hasAnchors = baselines.length > 0 || (includeCRM && crmStages.length > 0) || portfolioCompanies.length > 0;
 
     if (sectors.length === 0 && !customKeywords.trim() && !hasAnchors) {
@@ -4713,6 +4743,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- TWITTER ----
     if (sources.includes('twitter') && rapidApiKey) {
+      sourcesActual.push('twitter');
       sendProgress('Scanning X/Twitter...', 'import', { source: 'twitter' });
       const rapidHeaders = { 'x-rapidapi-host': 'twitter-v24.p.rapidapi.com', 'x-rapidapi-key': rapidApiKey };
       const twitterKws = uniqueKeywords.slice(0, 10);
@@ -4761,6 +4792,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- FARCASTER ----
     if (sources.includes('farcaster') && neynarKey) {
+      sourcesActual.push('farcaster');
       sendProgress('Scanning Farcaster...', 'import', { source: 'farcaster' });
       const farcasterKws = uniqueKeywords.slice(0, 8);
       for (const kw of farcasterKws) {
@@ -4798,6 +4830,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- GITHUB ----
     if (sources.includes('github')) {
+      sourcesActual.push('github');
       sendProgress('Scanning GitHub...', 'import', { source: 'github' });
       const chainTerms = chains.filter(c => c !== 'Any Chain').map(c => c.toLowerCase());
       const ghKws = uniqueKeywords.slice(0, 6);
@@ -4840,6 +4873,7 @@ app.post('/api/signals/super', async (req, res) => {
       const phKey = process.env.PH_API_KEY;
       const phSecret = process.env.PH_API_SECRET;
       let phToken = process.env.PH_TOKEN; // cached token
+      if (phToken || (phKey && phSecret)) sourcesActual.push('producthunt');
 
       if (!phToken && phKey && phSecret) {
         // Get client credentials token
@@ -5113,6 +5147,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     // ---- HARMONIC ----
     if (sources.includes('harmonic') && harmonicKey) {
+      sourcesActual.push('harmonic');
       sendProgress('Scanning Harmonic database...', 'import', { source: 'harmonic' });
       const harmonicHeaders = { apikey: harmonicKey };
       // Map stage labels to Harmonic API values
@@ -5191,8 +5226,24 @@ app.post('/api/signals/super', async (req, res) => {
       console.log('[Super] Harmonic:', sourceStats.harmonic, 'signals');
     }
 
+    // Compute which requested sources skipped (missing API keys)
+    for (const s of sourcesRequested) {
+      if (sourcesActual.includes(s)) continue;
+      const reasons = {
+        twitter: 'RAPIDAPI_KEY env var not set',
+        farcaster: 'NEYNAR_API_KEY env var not set',
+        producthunt: 'PH_API_KEY/PH_API_SECRET env vars not set',
+        harmonic: 'HARMONIC_API_KEY env var not set',
+      };
+      sourcesSkipped.push({ source: s, reason: reasons[s] || 'unavailable' });
+    }
+    if (sourcesSkipped.length > 0) {
+      console.log('[Super] Sources skipped:', sourcesSkipped);
+      sendProgress(`⚠ Sources skipped: ${sourcesSkipped.map(s => s.source).join(', ')} (missing env keys)`, 'import', { skipped: sourcesSkipped });
+    }
+
     const totalSignals = allSignals.length;
-    console.log('[Super] Total signals:', totalSignals, 'breakdown:', JSON.stringify(sourceStats));
+    console.log('[Super] Total signals:', totalSignals, 'breakdown:', JSON.stringify(sourceStats), '| sourcesActual:', sourcesActual, '| skipped:', sourcesSkipped.map(s => s.source));
 
     if (totalSignals === 0) {
       return sendResult({ signals: [], analysis: null, sourceStats, totalSignals: 0, error: 'No signals found. Try broader topics or enable more sources.' });
@@ -5269,8 +5320,9 @@ ${signalText}`;
 
           if (claudeRes.ok) {
             const data = await claudeRes.json();
+            recordUsage(screenModel, data.usage);
             const text = data.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-            
+
             try {
               const jsonMatch = text.match(/```json\s*\n?([\s\S]*?)\n?```/);
               if (jsonMatch) {
@@ -5320,7 +5372,24 @@ ${signalText}`;
       // OPTIONAL: Opus deep scoring on top signals
       let opusAnalysis = '';
       if (useOpus && anthropicKey) {
-        const topForOpus = rated.filter(s => s.signal === 'HIGH' || s.signal === 'MEDIUM').slice(0, opusTopN);
+        // Build the candidate pool for Opus.
+        // For Max/Extreme: guarantee Opus runs by filling up to opusTopN with top-engagement
+        //   signals when HIGH/MEDIUM is short. User paid for deep scoring — give it to them.
+        // For Deep (opus20): keep the strict HIGH/MEDIUM filter (lighter touch).
+        let topForOpus;
+        if (opusFillToN) {
+          // Sort by signal priority then engagement, take top N
+          const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+          const ordered = [...rated].sort((a, b) => {
+            const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
+            if (sigDiff !== 0) return sigDiff;
+            return (b.engagement || 0) - (a.engagement || 0);
+          });
+          topForOpus = ordered.slice(0, opusTopN);
+        } else {
+          topForOpus = rated.filter(s => s.signal === 'HIGH' || s.signal === 'MEDIUM').slice(0, opusTopN);
+        }
+        console.log(`[Super] Opus pool: ${topForOpus.length} signals (tier=${superTier}, fillToN=${opusFillToN}, opusTopN=${opusTopN})`);
         if (topForOpus.length > 0) {
           sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
           const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
@@ -5351,6 +5420,7 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
             });
             if (opusRes.ok) {
               const opusData = await opusRes.json();
+              recordUsage('claude-opus-4-6', opusData.usage);
               opusAnalysis = opusData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
               try {
                 const jsonMatch = opusAnalysis.match(/```json\s*\n?([\s\S]*?)\n?```/);
@@ -5411,15 +5481,35 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
 
       sendProgress('Done — preparing results...', 'done', {});
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      const sonnetCost = forClaude.length * 0.001;
-      const opusCost = useOpus ? Math.min(opusTopN, rated.filter(s => s._opusScore).length) * 0.015 : 0;
-      const estimatedCost = (sonnetCost + opusCost).toFixed(3);
-      return sendResult({ signals: rated, analysis: cleanAnalysis, sourceStats, totalSignals, ddPushed: highSignals.slice(0, maxPush).length, elapsed, estimatedCost, tier: superTier });
+      const cost = computeCost();
+      const estimatedCost = cost.total.toFixed(3);
+      const opusRanCount = rated.filter(s => s._opusScore).length;
+      console.log(`[Super] DONE — tier=${superTier} signals=${totalSignals} opusScored=${opusRanCount} cost=$${estimatedCost} (sonnet=$${cost.sonnet.toFixed(3)} opus=$${cost.opus.toFixed(3)} haiku=$${cost.haiku.toFixed(3)}) tokens=${JSON.stringify(usage)}`);
+      return sendResult({
+        signals: rated,
+        analysis: cleanAnalysis,
+        sourceStats,
+        totalSignals,
+        ddPushed: highSignals.slice(0, maxPush).length,
+        elapsed,
+        estimatedCost,
+        costBreakdown: {
+          total: cost.total,
+          sonnet: cost.sonnet,
+          opus: cost.opus,
+          haiku: cost.haiku,
+          tokens: usage,
+        },
+        tier: superTier,
+        sourcesActual,
+        sourcesSkipped,
+        opusScoredCount: opusRanCount,
+      });
     }
 
-    // Fallback: no Claude
+    // Fallback: no Claude (no anthropicKey)
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    return sendResult({ signals: sorted.slice(0, 80), analysis: null, sourceStats, totalSignals, elapsed, estimatedCost: '0.00' });
+    return sendResult({ signals: sorted.slice(0, 80), analysis: null, sourceStats, totalSignals, elapsed, estimatedCost: '0.00', sourcesActual, sourcesSkipped, tier: superTier });
 
   } catch (err) {
     console.error('[Super] Error:', err);
