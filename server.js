@@ -2436,6 +2436,315 @@ app.post('/api/autoscan/clear-status/:personId?', (req, res) => {
   }
 });
 
+// ==========================================
+// DEEP SEARCH — Similar + AI Discovery + Scoring
+// ==========================================
+app.post('/api/deep-search', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  let clientConnected = true;
+  req.on('close', () => { clientConnected = false; });
+  const safeWrite = (data) => { if (clientConnected) try { res.write(data); } catch (e) {} };
+  const keepAlive = setInterval(() => safeWrite(': keepalive\n\n'), 5000);
+
+  const sendProgress = (message, stage, pct, details) => {
+    safeWrite(`data: ${JSON.stringify({ progress: { message, stage, pct: pct || 0, details } })}\n\n`);
+  };
+
+  const sendResult = (data) => {
+    clearInterval(keepAlive);
+    safeWrite(`data: ${JSON.stringify(data)}\n\n`);
+    if (clientConnected) try { res.end(); } catch (e) {}
+  };
+
+  try {
+    const harmonicKey = req.headers['x-harmonic-key'] || process.env.HARMONIC_API_KEY;
+    const anthropicKey = req.headers['x-anthropic-key'] || process.env.ANTHROPIC_API_KEY;
+    if (!harmonicKey || !anthropicKey) return sendResult({ error: 'API keys required' });
+
+    const { baselines, tier, keywords, industries, notes } = req.body;
+    if (!baselines?.length) return sendResult({ error: 'At least one baseline company required' });
+
+    const tierKey = tier || 'standard';
+    console.log(`[DeepSearch] Starting ${tierKey} search with ${baselines.length} baselines: ${baselines.map(b => b.name).join(', ')}`);
+
+    // STEP 1: Fetch similar companies from Harmonic for each baseline
+    sendProgress('Finding similar companies from Harmonic...', 'import', 5);
+    let allSimilar = [];
+    const seenNames = new Set();
+
+    for (const baseline of baselines) {
+      let rawResults = [];
+      try {
+        const id = baseline.id;
+        if (id) {
+          const url = `${HARMONIC_BASE}/search/similar_companies/${id}?size=100`;
+          const r = await fetch(url, { headers: { apikey: harmonicKey } });
+          if (r.ok) {
+            const data = await r.json();
+            rawResults = Array.isArray(data) ? data : (data.results || data.similar_companies || data.companies || []);
+          }
+        }
+        if (rawResults.length === 0 && baseline.name) {
+          const lookupRes = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(baseline.name)}&size=1`, { headers: { apikey: harmonicKey } });
+          if (lookupRes.ok) {
+            const lookupData = await lookupRes.json();
+            const match = (lookupData.results || [])[0];
+            if (match) {
+              const matchId = match.id || (match.entity_urn || '').split(':').pop();
+              if (matchId) {
+                const r2 = await fetch(`${HARMONIC_BASE}/search/similar_companies/${matchId}?size=100`, { headers: { apikey: harmonicKey } });
+                if (r2.ok) {
+                  const data = await r2.json();
+                  rawResults = Array.isArray(data) ? data : (data.results || data.similar_companies || data.companies || []);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[DeepSearch] Harmonic similar error for ${baseline.name}:`, e.message);
+      }
+
+      // Extract IDs and dedup
+      const alreadyFull = rawResults[0] && typeof rawResults[0] === 'object' && rawResults[0].name;
+      if (alreadyFull) {
+        for (const c of rawResults) {
+          const n = (c.name || '').toLowerCase().trim();
+          if (n && !seenNames.has(n)) { seenNames.add(n); allSimilar.push(gqlToCard(c)); }
+        }
+      } else {
+        const ids = rawResults.map(r => {
+          if (typeof r === 'string') return r.includes(':') ? r.split(':').pop() : r;
+          if (typeof r === 'number') return r;
+          return r.id || (r.entity_urn || r.entityUrn || '').split(':').pop() || null;
+        }).filter(Boolean);
+        if (ids.length > 0) {
+          const enriched = await gqlEnrichCompanies(ids, harmonicKey);
+          for (const c of enriched) {
+            const card = gqlToCard(c);
+            const n = (card.name || '').toLowerCase().trim();
+            if (n && !seenNames.has(n)) { seenNames.add(n); allSimilar.push(card); }
+          }
+        }
+      }
+
+      sendProgress(`Found ${allSimilar.length} similar companies so far...`, 'import', 15);
+    }
+
+    console.log(`[DeepSearch] Collected ${allSimilar.length} unique similar companies`);
+    sendProgress(`${allSimilar.length} companies from Harmonic. Starting AI screening...`, 'screen', 20);
+
+    // Build context string for user criteria
+    const contextParts = [];
+    if (keywords) contextParts.push(`Keywords/themes: ${keywords}`);
+    if (industries) contextParts.push(`Industries/sectors: ${industries}`);
+    if (notes) contextParts.push(`Additional criteria: ${notes}`);
+    const userContext = contextParts.length > 0 ? contextParts.join('\n') : '';
+    const baselineDesc = baselines.map(b => b.name).join(', ');
+
+    // STEP 2: AI Pre-screen (Sonnet for quick/standard, Sonnet for deep/max)
+    const screenModel = tierKey === 'quick' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-20250514';
+    const BATCH_SIZE = 50;
+    const passedCompanies = [];
+
+    for (let i = 0; i < Math.ceil(allSimilar.length / BATCH_SIZE); i++) {
+      const batch = allSimilar.slice(i * BATCH_SIZE, (i + 1) * BATCH_SIZE);
+      const batchText = batch.map((c, idx) => {
+        const parts = [`${i * BATCH_SIZE + idx + 1}. ${c.name}`];
+        if (c.description) parts.push(`   ${(c.description || '').slice(0, 100)}`);
+        if (c.funding_stage) parts.push(`   Stage: ${c.funding_stage}${c.funding_total ? ' $' + (c.funding_total/1e6).toFixed(1) + 'M' : ''}`);
+        if (c.headcount) parts.push(`   Team: ${c.headcount}`);
+        if (c.location) parts.push(`   Location: ${c.location}`);
+        return parts.join('\n');
+      }).join('\n\n');
+
+      const screenPrompt = `You are screening companies for similarity to: ${baselineDesc}.
+
+${userContext ? `USER CRITERIA:\n${userContext}\n\n` : ''}TASK: For each company, verdict: PASS (similar/relevant) or CUT (not similar/not relevant).
+Format: CompanyName — PASS — [brief reason] or CompanyName — CUT — [brief reason]
+
+Focus on: business model similarity, market/industry overlap, stage fit, technology alignment.
+Target ~30-40% pass rate. When in doubt, PASS (we'll score more carefully later).
+
+COMPANIES:
+${batchText}`;
+
+      try {
+        const sRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: screenModel, max_tokens: 3000, messages: [{ role: 'user', content: screenPrompt }] }),
+        });
+
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          const sText = sData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+          const passNames = new Set();
+          for (const m of sText.matchAll(/([^\n—\-]+?)\s*[—\-–]\s*PASS/gi)) {
+            passNames.add(m[1].trim().replace(/\*\*/g, '').replace(/^\d+\.\s*/, '').toLowerCase().trim());
+          }
+          for (const c of batch) {
+            const n = (c.name || '').toLowerCase().trim();
+            const nClean = n.replace(/\s*\(.*?\)\s*/g, '').trim();
+            if (passNames.has(n) || passNames.has(nClean) || (nClean.length >= 5 && [...passNames].some(p => p.length >= 5 && (p === nClean || p.startsWith(nClean) || nClean.startsWith(p))))) {
+              passedCompanies.push(c);
+            }
+          }
+        } else {
+          // On failure, pass all through
+          passedCompanies.push(...batch);
+        }
+      } catch (e) {
+        passedCompanies.push(...batch);
+      }
+
+      const pct = 20 + Math.round((i + 1) / Math.ceil(allSimilar.length / BATCH_SIZE) * 30);
+      sendProgress(`Screened ${Math.min((i + 1) * BATCH_SIZE, allSimilar.length)}/${allSimilar.length} — ${passedCompanies.length} passed`, 'screen', pct);
+    }
+
+    console.log(`[DeepSearch] Screening: ${allSimilar.length} → ${passedCompanies.length} passed`);
+
+    // STEP 3: Deep scoring with Claude
+    const scoreModel = (tierKey === 'quick' || tierKey === 'standard') ? 'claude-sonnet-4-20250514' : 'claude-opus-4-6';
+    const maxToScore = tierKey === 'quick' ? 20 : tierKey === 'standard' ? 30 : tierKey === 'deep' ? 50 : 80;
+    const toScore = passedCompanies.slice(0, maxToScore);
+
+    sendProgress(`Scoring top ${toScore.length} companies with ${scoreModel.includes('opus') ? 'Opus' : 'Sonnet'}...`, 'score', 55);
+
+    const SCORE_BATCH = 15;
+    const scoredCompanies = [];
+
+    for (let i = 0; i < Math.ceil(toScore.length / SCORE_BATCH); i++) {
+      const batch = toScore.slice(i * SCORE_BATCH, (i + 1) * SCORE_BATCH);
+      const batchText = batch.map((c, idx) => {
+        const parts = [`### ${i * SCORE_BATCH + idx + 1}. ${c.name}`];
+        if (c.description) parts.push(`Description: ${(c.description || '').slice(0, 200)}`);
+        if (c.website) parts.push(`Website: ${c.website}`);
+        if (c.funding_stage) parts.push(`Stage: ${c.funding_stage}`);
+        if (c.funding_total) parts.push(`Funding: $${(c.funding_total/1e6).toFixed(1)}M`);
+        if (c.headcount) parts.push(`Team size: ${c.headcount}`);
+        if (c.location) parts.push(`Location: ${c.location}`);
+        if (c.founders?.length) parts.push(`Founders: ${c.founders.map(f => typeof f === 'string' ? f : f.name).filter(Boolean).join(', ')}`);
+        return parts.join('\n');
+      }).join('\n\n');
+
+      const scorePrompt = `You are evaluating companies for how similar and relevant they are to: ${baselineDesc}.
+
+${userContext ? `USER CRITERIA:\n${userContext}\n\n` : ''}For each company, provide:
+1. A relevance score from 1-10 (10 = extremely similar/relevant to the baselines)
+2. A brief 1-2 sentence analysis explaining the score
+
+Format your response EXACTLY like:
+COMPANY: [name]
+SCORE: [1-10]
+ANALYSIS: [brief analysis]
+---
+
+Score based on: business model similarity, market overlap, technology alignment, stage fit, team quality, traction signals.
+
+COMPANIES TO SCORE:
+${batchText}`;
+
+      try {
+        const sRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: scoreModel, max_tokens: 4000, messages: [{ role: 'user', content: scorePrompt }] }),
+        });
+
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          const sText = sData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+
+          // Parse scores
+          const blocks = sText.split('---').filter(b => b.trim());
+          for (const block of blocks) {
+            const nameMatch = block.match(/COMPANY:\s*(.+)/i);
+            const scoreMatch = block.match(/SCORE:\s*(\d+(?:\.\d+)?)/i);
+            const analysisMatch = block.match(/ANALYSIS:\s*(.+)/is);
+            if (nameMatch && scoreMatch) {
+              const scoredName = nameMatch[1].trim().toLowerCase();
+              const score = parseFloat(scoreMatch[1]);
+              const analysis = analysisMatch ? analysisMatch[1].trim().split('\n')[0].trim() : '';
+              // Find matching company
+              const match = batch.find(c => (c.name || '').toLowerCase().trim() === scoredName || (c.name || '').toLowerCase().includes(scoredName) || scoredName.includes((c.name || '').toLowerCase()));
+              if (match) {
+                scoredCompanies.push({ ...match, _score: score, _analysis: analysis });
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[DeepSearch] Scoring error batch ${i}:`, e.message);
+      }
+
+      const pct = 55 + Math.round((i + 1) / Math.ceil(toScore.length / SCORE_BATCH) * 35);
+      sendProgress(`Scored ${Math.min((i + 1) * SCORE_BATCH, toScore.length)}/${toScore.length} companies`, 'score', pct);
+    }
+
+    // Add unscored companies that passed screening but weren't scored
+    const scoredNames = new Set(scoredCompanies.map(c => (c.name || '').toLowerCase()));
+    for (const c of passedCompanies) {
+      if (!scoredNames.has((c.name || '').toLowerCase())) {
+        scoredCompanies.push({ ...c, _score: 0, _analysis: 'Not scored (outside top tier)' });
+      }
+    }
+
+    // Sort by score
+    scoredCompanies.sort((a, b) => (b._score || 0) - (a._score || 0));
+
+    // STEP 4: Generate summary
+    sendProgress('Generating search summary...', 'done', 95);
+    const top5 = scoredCompanies.filter(c => (c._score || 0) > 0).slice(0, 5);
+    let summaryText = '';
+    if (top5.length > 0) {
+      try {
+        const summaryPrompt = `Briefly summarize (3-4 sentences) the results of a company similarity search.
+Baselines: ${baselineDesc}
+${userContext ? `Criteria: ${userContext}` : ''}
+Top results: ${top5.map(c => `${c.name} (${c._score}/10)`).join(', ')}
+Total companies screened: ${allSimilar.length}, passed: ${passedCompanies.length}, scored: ${scoredCompanies.filter(c => c._score > 0).length}
+
+Focus on patterns, common themes among top matches, and any standout companies.`;
+
+        const sumRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 500, messages: [{ role: 'user', content: summaryPrompt }] }),
+        });
+        if (sumRes.ok) {
+          const sumData = await sumRes.json();
+          summaryText = sumData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+        }
+      } catch (e) {}
+    }
+
+    console.log(`[DeepSearch] Complete: ${scoredCompanies.length} results, top score: ${scoredCompanies[0]?._score || 0}`);
+
+    sendResult({
+      results: scoredCompanies.slice(0, 200),
+      analysis: summaryText,
+      funnel: {
+        similar: allSimilar.length,
+        screened: passedCompanies.length,
+        scored: scoredCompanies.filter(c => c._score > 0).length,
+      },
+      baselines: baselines.map(b => b.name),
+      tier: tierKey,
+    });
+
+  } catch (e) {
+    clearInterval(keepAlive);
+    console.error(`[DeepSearch] Fatal error:`, e.message);
+    sendResult({ error: e.message });
+  }
+});
+
 app.post('/api/autoscan', async (req, res) => {
   // Use SSE-style streaming to keep connection alive through Railway's proxy
   res.setHeader('Access-Control-Allow-Origin', '*');
