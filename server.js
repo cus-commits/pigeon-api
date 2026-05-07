@@ -5291,17 +5291,27 @@ app.post('/api/signals/super', async (req, res) => {
           `[${batchStart + i + 1}] SOURCE:${s.source.toUpperCase()} | ${s.title} (${s.subtitle}) | Followers:${s.followers} Engagement:${s.engagement}\n${s.text}`
         ).join('\n\n');
 
-        const prompt = `You are a crypto deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
+        const prompt = `You are a deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks). Crypto/AI/fintech focus, but evaluate any sector on merit.
 
 You're reviewing ${batch.length} signals from MULTIPLE sources: Twitter/X, Farcaster, GitHub repos, Product Hunt, and Harmonic company database.
-${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nGive HIGHER ratings to signals matching these anchor patterns. Companies similar to baselines/portfolio anchors should bias toward HIGH.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (use this to shape your scoring — pay attention to what they say to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 8000)}\n` : ''}
-RATE EACH SIGNAL:
-- HIGH: Clearly investable — founder building something specific, raising a round, launching a product, early team with real traction${anchorContext ? ' OR strongly matches the anchor pattern (similar business model, market, stage)' : ''}
-- MEDIUM: Interesting but needs context — could be a lead worth following
-- LOW: Not relevant — commentary, memes, established projects, noise
+${anchorContext ? `\nSEARCH SCOPE — User asked us to find companies similar to these baselines (this defines WHAT to look for, NOT how to rate):\n${anchorContext}\nThese signals are ALREADY filtered to be similar — do not give similarity bonus points. Rate each company purely on its own investment merit (see criteria below).\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (apply this to your scoring — what to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 8000)}\n` : ''}
+RATE EACH SIGNAL on INVESTMENT MERIT — not on similarity to anchors. The signals are already similar; the question is which would actually be a good investment.
 
-BE STRICT. Most should be LOW. Only HIGH if clearly investable.
-STEALTH COMPANIES: Always rate LOW unless exceptional repeat founder.
+INVESTMENT MERIT CRITERIA (in priority order):
+1. Founder pedigree — repeat founder, prior exit, top-tier company alumni, technical depth, domain expertise
+2. Idea quality — solving a real problem, novel angle, defensible moat, clear "why now"
+3. Traction signals — revenue, real user growth, GitHub stars/forks, web growth, headcount growth
+4. Stage/valuation fit — Pre-Seed/Seed checks, not over-funded, not too late
+5. Undervaluation — overlooked thesis, contrarian timing, mispriced relative to traction
+
+RATING:
+- HIGH: Clear investment merit — strong founder + good idea + traction OR overlooked gem at right stage
+- MEDIUM: Has 1-2 of the criteria but missing others — worth a follow-up
+- LOW: Weak on merit — generic idea, no traction, wrong stage, established/mature, or noise
+
+BE STRICT. Default to LOW. Don't inflate scores because a company is "similar to the baseline" — that's a given. We're hunting for companies that would be a good investment on their OWN merit.
+STEALTH COMPANIES (named "Stealth Company (Person)"): Default LOW unless founder has clearly exceptional pedigree (prior $10M+ exit + crypto/fintech).
+Companies with $10M+ funding: bias toward LOW unless exceptional fit at this stage.
 
 IMPORTANT: Respond ONLY with a JSON block. Numbers must match the signal numbers shown.
 ${'```'}json
@@ -5392,21 +5402,32 @@ ${signalText}`;
         console.log(`[Super] Opus pool: ${topForOpus.length} signals (tier=${superTier}, fillToN=${opusFillToN}, opusTopN=${opusTopN})`);
         if (topForOpus.length > 0) {
           sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
-          const opusPrompt = `You are a crypto/tech deal scout for Daxos Capital (Pre-Seed/Seed, $100K-$250K checks).
-${anchorContext ? `\nSEARCH ANCHORS — User wants companies similar to these:\n${anchorContext}\nWeight similarity to these anchor patterns heavily in your scoring. A strong match on baseline/portfolio similarity should boost the score by 1-2 points.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (use this to shape your scoring — pay attention to what they say to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 12000)}\n` : ''}
-Score each company/signal 1-10 based on investability. Consider: founder quality, product traction, market timing, uniqueness, funding stage fit${anchorContext ? ', AND similarity to the anchor companies above' : ''}.
+          const opusPrompt = `You are a senior deal partner at Daxos Capital evaluating Pre-Seed/Seed investments ($100K-$250K checks).
+${anchorContext ? `\nSEARCH SCOPE — User asked for companies similar to these baselines. These define WHAT we searched for, NOT how to score:\n${anchorContext}\n⚠ CRITICAL: These signals are ALREADY filtered to be similar to the baselines. Similarity is a given — do NOT give similarity bonus points. Rate each company on its OWN investment merit.\nA company that is "very similar to a baseline rated 6.5" is NOT automatically a 9. Score on absolute investment quality, not relative similarity.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (apply to scoring — what to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 12000)}\n` : ''}
+SCORE 1-10 on INVESTMENT MERIT — the question is "would this be a good investment?" not "how similar is this to the baseline?"
 
-SCORING GUIDE:
-- 9-10: Exceptional — clear product, strong founder, right timing, must-meet
-- 7-8: Strong — good signal, worth a call
-- 5-6: Interesting but unclear — needs more research
-- 1-4: Not investable — noise, too early, wrong fit
+We are looking for companies that are:
+• LIKELY TO BE SUCCESSFUL — strong founders, real traction, clear path to scale
+• GREAT PEDIGREE — repeat founder, prior exit, top-tier alumni, deep domain expertise
+• GOOD IDEA — solving a real problem, sound business model
+• NOVEL — differentiated angle, defensible moat, contrarian timing
+• UNDERVALUED — overlooked at this stage, mispriced relative to traction
 
-STEALTH COMPANIES: Apply -90% score penalty. Only score above 5 if exceptional repeat founder.
+SCORING ANCHOR (be calibrated, not inflated):
+- 9-10: Top 1-2% — exceptional founder + novel idea + real traction + right stage. Rare.
+- 7-8: Top 10% — has 3 of {pedigree, idea, traction, undervalued}. Worth an intro call.
+- 5-6: Average — competent execution but missing the standout factor. Generic similar-to-baseline lands here by default.
+- 3-4: Weak — wrong stage, no traction, generic idea, or wrong fit
+- 1-2: Pass — noise, mature company, fundamental issues
 
-Respond with a JSON block then brief analysis per company:
+DEFAULT: most companies should land 4-6. Reserve 7+ for genuinely exceptional. A 9 means "I'd write the check now." Being similar to a baseline does NOT earn a 9 — it earns the right to be evaluated.
+
+STEALTH COMPANIES: -3 score penalty unless founder has $10M+ prior exit + thesis fit.
+Over-funded ($10M+): max score 6 unless extraordinary.
+
+Respond with a JSON block, then 1-sentence reasoning per company. Reasoning must explain MERIT (founder, traction, idea, valuation), NOT similarity:
 ${'`'.repeat(3)}json
-{"CompanyName": {"score": 8, "reason": "brief reason"}, ...}
+{"CompanyName": {"score": 6, "reason": "Solo founder ex-Stripe, $200K ARR at seed, defensible UX angle but crowded category."}, ...}
 ${'`'.repeat(3)}
 
 SIGNALS TO SCORE:
