@@ -4755,7 +4755,8 @@ app.post('/api/signals/super', async (req, res) => {
     // Merit-mode triggers full 5-dim rating + anchor sanity check. Active when baselines present.
     const meritMode = baselines.length > 0;
     const useOpus = ['opus20', 'opus80', 'extreme'].includes(superTier);
-    const opusTopN = { opus20: 20, opus80: 80, extreme: 200 }[superTier] || 0;
+    // Extreme rates 300 — big pool from multi-hop deserves deep coverage
+    const opusTopN = { opus20: 20, opus80: 80, extreme: 300 }[superTier] || 0;
     const useHaikuScreen = superTier === 'haiku';
     const screenModel = useHaikuScreen ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-20250514';
     // For Max/Extreme tiers, guarantee Opus runs by falling back to top-N by engagement
@@ -5244,6 +5245,115 @@ app.post('/api/signals/super', async (req, res) => {
       }
 
       sendProgress(`Anchors loaded — ${sourceStats.harmonic || 0} similar companies from Harmonic`, 'import', { source: 'anchors' });
+
+      // ── MULTI-HOP EXPANSION (Max/Extreme tiers) ──
+      // Harmonic Similar API caps at 100 per call. To get a pool of 1000+ candidates
+      // for deep tiers, we expand: take top N from initial pool, fetch THEIR similar,
+      // dedup, repeat. This is what the user is paying for in Max/Extreme tiers.
+      const enableMultiHop = ['opus80', 'extreme'].includes(superTier);
+      if (enableMultiHop) {
+        const hopDepth = superTier === 'extreme' ? 2 : 1;
+        const seedsPerHop = superTier === 'extreme' ? 15 : 5;
+        const harmonicHdrs = { apikey: harmonicKey };
+        const buildSignalFromCard = (c, anchorMeta) => {
+          const tm = c.tractionMetrics || {};
+          const founders = Array.isArray(c.founders) ? c.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
+          return {
+            source: 'harmonic',
+            id: `hm-${c.id || c.entity_id || ''}`,
+            title: c.name || '?',
+            subtitle: c.funding_stage || c.stage || 'Unknown',
+            text: (c.description || '').slice(0, 300),
+            url: c.website?.url || c.website?.domain || c.website || '',
+            pfp: c.logo_url || c.logoUrl || '',
+            followers: c.headcount || 0,
+            engagement: c.funding_total || 0,
+            likes: 0,
+            timestamp: c.created_at || c.founded_date || null,
+            meta: {
+              funding: c.funding_total || 0,
+              stage: c.funding_stage || c.stage,
+              headcount: c.headcount,
+              website: c.website?.url || c.website || '',
+              founders,
+              webGrowth: tm.webTraffic?.ago30d?.percentChange || null,
+              hcGrowth: tm.headcount?.ago90d?.percentChange || null,
+            },
+            _anchor: anchorMeta,
+          };
+        };
+
+        let seedSignals = allSignals
+          .filter(s => s.source === 'harmonic')
+          .sort((a, b) => (b.engagement || 0) - (a.engagement || 0))
+          .slice(0, seedsPerHop);
+
+        for (let hop = 0; hop < hopDepth; hop++) {
+          if (seedSignals.length === 0) break;
+          sendProgress(`Multi-hop expansion ${hop + 1}/${hopDepth} — expanding from ${seedSignals.length} seeds (pool: ${sourceStats.harmonic})...`, 'import', { source: 'multihop', hop: hop + 1 });
+          const newSignalsThisHop = [];
+          let skippedFunding = 0;
+
+          for (const seed of seedSignals) {
+            const seedId = String(seed.id || '').replace('hm-', '');
+            if (!seedId) continue;
+            try {
+              const r = await fetch(`${HARMONIC_BASE}/search/similar_companies/${seedId}?size=100`, { headers: harmonicHdrs });
+              if (!r.ok) continue;
+              const data = await r.json();
+              const raw = Array.isArray(data) ? data : (data.results || data.similar_companies || data.companies || []);
+              if (!raw.length) continue;
+
+              const alreadyFull = raw[0] && typeof raw[0] === 'object' && raw[0].name;
+              let companies = [];
+              if (alreadyFull) {
+                companies = raw.map(c => gqlToCard(c));
+              } else {
+                const ids = raw.map(rr => {
+                  if (typeof rr === 'string') return rr.includes(':') ? rr.split(':').pop() : rr;
+                  if (typeof rr === 'number') return rr;
+                  return rr.id || (rr.entity_urn || rr.entityUrn || '').split(':').pop() || null;
+                }).filter(Boolean);
+                if (ids.length > 0) {
+                  const enriched = await gqlEnrichCompanies(ids, harmonicKey);
+                  companies = enriched.map(c => gqlToCard(c));
+                }
+              }
+              for (const c of companies) {
+                const cid = String(c.id || c.entity_id || '');
+                const nameKey = (c.name || '').toLowerCase().trim();
+                if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
+                if ((c.funding_total || 0) > fundingCap) { skippedFunding++; continue; }
+                seenAnchorIds.add(cid);
+                seenAnchorIds.add(nameKey);
+
+                const sig = buildSignalFromCard(c, {
+                  type: 'expansion',
+                  weight: seed._anchor?.weight || 50,
+                  baseline: seed._anchor?.baseline || seed.title,
+                  hop: hop + 1,
+                  via: seed.title,
+                });
+                allSignals.push(sig);
+                sourceStats.harmonic++;
+                newSignalsThisHop.push(sig);
+              }
+            } catch (e) {
+              console.error(`[Super/MultiHop] hop ${hop + 1} seed "${seed.title}" error:`, e.message);
+            }
+            await sleep(50);
+          }
+          console.log(`[Super/MultiHop] hop ${hop + 1}: +${newSignalsThisHop.length} new (${skippedFunding} dropped by funding filter). Pool: ${sourceStats.harmonic}`);
+          sendProgress(`Hop ${hop + 1} added ${newSignalsThisHop.length} companies (${skippedFunding} over funding cap, dropped). Pool: ${sourceStats.harmonic}`, 'import', { source: 'multihop', hop: hop + 1, added: newSignalsThisHop.length, skippedFunding, total: sourceStats.harmonic });
+
+          // Seeds for next hop = top of newly-added (so we expand outward, not in circles)
+          if (hop < hopDepth - 1) {
+            seedSignals = newSignalsThisHop
+              .sort((a, b) => (b.engagement || 0) - (a.engagement || 0))
+              .slice(0, seedsPerHop);
+          }
+        }
+      }
     }
 
     // ---- HARMONIC ----
