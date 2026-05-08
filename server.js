@@ -28,6 +28,95 @@ function saveReachoutsCreds(creds) {
 const HARMONIC_BASE = 'https://api.harmonic.ai';
 const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
 
+// ───────── MERIT SCORING (5-dimension framework) ─────────
+// Spec: anchor is a SEARCH filter, not a scoring template. Score on absolute
+// investment merit: pedigree, traction, capital efficiency, investor quality,
+// defensibility. Auto-modifiers applied deterministically. Anchor sanity-check
+// ceiling prevents doppelganger inflation.
+const MERIT_WEIGHTS = { pedigree: 0.25, traction: 0.25, capital: 0.20, investor: 0.15, defensibility: 0.15 };
+const MERIT_MODIFIER_VALUES = {
+  // Downgrades
+  equity_crowdfunding_only: -1.0,
+  stale_series_a: -1.0,
+  shrinking_post_seed: -1.0,
+  founder_moved: -1.5,
+  headcount_mismatch: -0.5,
+  buzzword_soup: -1.0,
+  // Upgrades
+  repeat_investor: 0.5,
+  quantified_roi: 0.5,
+  strategic_distribution: 0.5,
+  patent_lab_ip: 0.5,
+  major_award: 0.25,
+  tier1_academic_equity: 0.25,
+};
+function computeWeightedScore(v) {
+  return (v.pedigree || 0) * MERIT_WEIGHTS.pedigree
+    + (v.traction || 0) * MERIT_WEIGHTS.traction
+    + (v.capital || 0) * MERIT_WEIGHTS.capital
+    + (v.investor || 0) * MERIT_WEIGHTS.investor
+    + (v.defensibility || 0) * MERIT_WEIGHTS.defensibility;
+}
+function applyModifiers(modifiers) {
+  if (!Array.isArray(modifiers)) return 0;
+  const sum = modifiers.reduce((s, m) => s + (MERIT_MODIFIER_VALUES[m] || 0), 0);
+  return Math.max(-2, Math.min(2, sum));
+}
+// Anchor sanity check: company can only exceed anchor if it beats anchor on
+// at least one sub-dimension by >=1 point. Otherwise cap to anchor score.
+function applyAnchorCeiling(companyDims, finalScore, anchorRating) {
+  if (!anchorRating || finalScore <= anchorRating.final) return { final: finalScore, capped: false };
+  const beatsAnchor = ['pedigree', 'traction', 'capital', 'investor', 'defensibility']
+    .some(d => (companyDims[d] || 0) >= (anchorRating[d] || 0) + 1);
+  if (beatsAnchor) return { final: finalScore, capped: false };
+  return { final: anchorRating.final, capped: true };
+}
+function buildMeritPrompt({ companies, anchorContext, additionalInfo, isAnchorSelfRating, anchorName, anchorRatings }) {
+  const anchorBlock = isAnchorSelfRating
+    ? `You are rating the ANCHOR company "${anchorName}" itself, on its own standalone investment merit. This score becomes the sanity-check ceiling for similar companies.`
+    : (anchorContext ? `\nSEARCH SCOPE — User asked us to find companies similar to these baselines. This defines WHAT we searched for, NOT how to score:\n${anchorContext}\n⚠ CRITICAL: These signals are ALREADY filtered to be similar. Similarity is a given — do NOT give similarity bonus points. Score each company on its OWN absolute merit.` : '');
+
+  const anchorRatingsBlock = (!isAnchorSelfRating && anchorRatings && Object.keys(anchorRatings).length > 0)
+    ? `\nANCHOR STANDALONE RATINGS (sanity-check ceilings):\n${Object.entries(anchorRatings).map(([k, v]) => `${k}: ${v.final.toFixed(1)}/10 (P${v.pedigree} T${v.traction} C${v.capital} I${v.investor} D${v.defensibility})`).join('\n')}\nA company that merely resembles the anchor cannot exceed the anchor's score. Score on merit; the code will enforce the ceiling.`
+    : '';
+
+  return `You are a senior deal partner at Daxos Capital evaluating Pre-Seed/Seed investments ($100K-$250K checks).
+${anchorBlock}${anchorRatingsBlock}${additionalInfo ? `\n\nADDITIONAL CONTEXT FROM USER:\n${additionalInfo}\n` : ''}
+
+Rate each company below on 5 DIMENSIONS (0-10 each), then list applicable AUTO-MODIFIERS, then give a 2-3 sentence bottom line.
+
+DIMENSIONS:
+1. Founder Pedigree (25% weight) — repeat founder/prior exit (9-10), top-tier alumni + technical co-founder (7-8), notable accelerator/family operator (5-6), generic credentials (3-4), solo no track record (1-2). If team data is unavailable, score 4 (NEUTRAL — do NOT penalize when company is otherwise sound/novel).
+2. Customer Traction (25% weight) — documented multi-$M ROI in trade press (9-10), named blue-chip enterprises + quantified outcomes (7-8), multiple paying customers + public testimonials (5-6), pilots in progress (3-4), pre-revenue (1-2), no commercial customers visible (0).
+3. Capital Efficiency (20% weight) — real revenue + named customers on small raise (9-10), reasonable headcount + multi-country + verifiable revenue (7-8), proportionate burn (5-6), red flags like high HC no revenue (3-4), unsustainable burn (1-2).
+4. Investor Quality (15% weight) — Tier-1 specialist VC (a16z, Founders Fund, Sequoia, First Round) or strategic corporate where the corporate's portfolio IS the distribution (9-10), reputable regional VC + multiple institutional follow-ons (7-8), solid regional VC/accelerators/gov funds (5-6), angel rounds + small accelerators (3-4), EQUITY CROWDFUNDING WITHOUT INSTITUTIONAL ROUND (1-2 — this means VCs declined). Friends/family or undisclosed (0).
+5. Defensibility/Moat (15% weight) — patent-protected proprietary tech rooted in top-tier university lab (9-10), strong IP + technical first-mover + hard-to-replicate data assets (7-8), differentiated product but commodity hardware (5-6), generic IoT/cloud no IP (3-4), pure aggregation no defensible asset (1-2).
+
+CALIBRATION: Most companies should land 4-6 on most dimensions. Reserve 8+ for genuinely exceptional. A 9 means "I'd write the check now."
+
+AUTO-MODIFIERS — list applicable string IDs in a "modifiers" array. Code applies the math.
+DOWNGRADES: equity_crowdfunding_only (-1.0), stale_series_a (-1.0), shrinking_post_seed (-1.0), founder_moved (-1.5), headcount_mismatch (-0.5), buzzword_soup (-1.0)
+UPGRADES: repeat_investor (+0.5), quantified_roi (+0.5), strategic_distribution (+0.5), patent_lab_ip (+0.5), major_award (+0.25), tier1_academic_equity (+0.25)
+
+OUTPUT — strict JSON in a code block, then nothing else:
+${'```'}json
+{
+  "ExactCompanyName": {
+    "pedigree": 6, "pedigree_reason": "one-line justification",
+    "traction": 5, "traction_reason": "...",
+    "capital": 6, "capital_reason": "...",
+    "investor": 4, "investor_reason": "...",
+    "defensibility": 5, "defensibility_reason": "...",
+    "modifiers": ["equity_crowdfunding_only"],
+    "bottom_line": "2-3 sentences on the actual investment thesis. What's the case to write a check? What's the case to pass?"
+  }
+}
+${'```'}
+
+COMPANIES TO RATE:
+${companies.join('\n\n---\n\n')}`;
+}
+
 function domainsConflict(domainA, domainB) {
   if (!domainA || !domainB) return false;
   if (domainA === domainB) return false;
@@ -4656,7 +4745,15 @@ app.post('/api/signals/super', async (req, res) => {
       portfolioCompanies = [],
       portfolioImportance = 50,   // 0-100
       additionalInfo = '',        // freeform extra context
+      fundingFilter = 'auto',     // 'under_2m' | 'under_10m' | 'under_25m' | 'all' | 'auto'
     } = req.body;
+    // Auto: under_10m when any anchor present, else 'all'
+    const effectiveFundingFilter = fundingFilter === 'auto'
+      ? (baselines.length > 0 || portfolioCompanies.length > 0 ? 'under_10m' : 'all')
+      : fundingFilter;
+    const fundingCap = { under_2m: 2_000_000, under_10m: 10_000_000, under_25m: 25_000_000, all: Infinity }[effectiveFundingFilter] || Infinity;
+    // Merit-mode triggers full 5-dim rating + anchor sanity check. Active when baselines present.
+    const meritMode = baselines.length > 0;
     const useOpus = ['opus20', 'opus80', 'extreme'].includes(superTier);
     const opusTopN = { opus20: 20, opus80: 80, extreme: 200 }[superTier] || 0;
     const useHaikuScreen = superTier === 'haiku';
@@ -5050,13 +5147,17 @@ app.post('/api/signals/super', async (req, res) => {
             }
           }
 
-          let added = 0;
+          let added = 0, skippedByFunding = 0;
           for (const c of companies) {
             const cid = String(c.id || c.entity_id || '');
             const nameKey = (c.name || '').toLowerCase().trim();
             if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
             seenAnchorIds.add(cid);
             seenAnchorIds.add(nameKey);
+
+            // Apply funding cap (deprioritize/exclude over-funded for sub-$250K checks)
+            const fundingTotal = c.funding_total || 0;
+            if (fundingTotal > fundingCap) { skippedByFunding++; continue; }
 
             const tm = c.tractionMetrics || {};
             const webGrowth = tm.webTraffic?.ago30d?.percentChange || null;
@@ -5263,6 +5364,67 @@ app.post('/api/signals/super', async (req, res) => {
     sendProgress(`${deduped.length} unique signals — sorting by engagement...`, 'filter', { deduped: deduped.length });
     const sorted = [...deduped].sort((a, b) => b.engagement - a.engagement);
     const forClaude = sorted; // Process ALL — no cap
+
+    // ── ANCHOR SELF-RATING (merit mode) ──
+    // Rate each baseline anchor on the 5-dim framework so we have a sanity-check
+    // ceiling. A surfaced company that just resembles the anchor cannot exceed
+    // the anchor's own score unless it materially outperforms on >=1 dimension.
+    const anchorRatings = {}; // { baselineName: { final, pedigree, traction, capital, investor, defensibility } }
+    if (meritMode && anthropicKey && baselines.length > 0) {
+      sendProgress('Rating anchor companies for sanity-check ceiling...', 'screen', { stage: 'anchor-rating' });
+      // Fetch enriched anchor data
+      const anchorIds = baselines.map(b => b.id).filter(Boolean);
+      let anchorEnriched = [];
+      try {
+        anchorEnriched = await gqlEnrichCompanies(anchorIds, harmonicKey);
+      } catch (e) { console.error('[Super/Merit] Anchor enrich error:', e.message); }
+      const anchorCards = anchorEnriched.map(c => gqlToCard(c));
+
+      for (const a of anchorCards) {
+        const profile = `${a.name}
+Funding: ${a.funding_total ? '$' + (a.funding_total/1e6).toFixed(1) + 'M' : 'undisclosed'} | Stage: ${a.funding_stage || 'unknown'}
+Headcount: ${a.headcount || '?'} | Location: ${a.location || '?'}
+Founders: ${(a.founders || []).map(f => typeof f === 'string' ? f : f.name).filter(Boolean).join(', ') || 'unknown'}
+Investors: ${(a.investors || []).map(i => i.name || i).join(', ').slice(0, 300) || 'undisclosed'}
+Description: ${(a.description || '').slice(0, 600)}`;
+
+        const anchorPrompt = buildMeritPrompt({
+          companies: [profile],
+          anchorContext: '',  // anchor itself — no anchor context
+          additionalInfo: additionalInfo.slice(0, 4000),
+          isAnchorSelfRating: true,
+          anchorName: a.name,
+        });
+
+        try {
+          const ar = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 1500, messages: [{ role: 'user', content: anchorPrompt }] }),
+          });
+          if (ar.ok) {
+            const ad = await ar.json();
+            recordUsage('claude-opus-4-6', ad.usage);
+            const txt = ad.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+            const m = txt.match(/```json\s*\n?([\s\S]*?)\n?```/);
+            if (m) {
+              const parsed = JSON.parse(m[1]);
+              const v = parsed[a.name] || Object.values(parsed)[0];
+              if (v) {
+                const final = computeWeightedScore(v) + applyModifiers(v.modifiers);
+                anchorRatings[a.name.toLowerCase()] = {
+                  final: Math.max(0, Math.min(10, final)),
+                  pedigree: v.pedigree || 5, traction: v.traction || 5,
+                  capital: v.capital || 5, investor: v.investor || 5, defensibility: v.defensibility || 5,
+                  bottom_line: v.bottom_line || '',
+                };
+                console.log(`[Super/Merit] Anchor ${a.name} self-rated: ${anchorRatings[a.name.toLowerCase()].final.toFixed(2)}/10`);
+              }
+            }
+          }
+        } catch (e) { console.error(`[Super/Merit] Anchor rating error for ${a.name}:`, e.message); }
+      }
+    }
     
     const estSonnetCost = forClaude.length * 0.001;
     const estOpusCost = useOpus ? Math.min(opusTopN, forClaude.length) * 0.015 : 0;
@@ -5382,6 +5544,110 @@ ${signalText}`;
       // OPTIONAL: Opus deep scoring on top signals
       let opusAnalysis = '';
       if (useOpus && anthropicKey) {
+        // ── MERIT-MODE 5-DIM SCORING (when anchors are present) ──
+        if (meritMode) {
+          // Pool: top N signals by signal/engagement, must be harmonic-source companies
+          const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+          const meritPool = rated
+            .filter(s => s.source === 'harmonic')  // company-source signals only
+            .sort((a, b) => {
+              const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
+              if (sigDiff !== 0) return sigDiff;
+              return (b.engagement || 0) - (a.engagement || 0);
+            })
+            .slice(0, opusTopN);
+
+          sendProgress(`Merit-scoring ${meritPool.length} companies on 5 dimensions...`, 'meritscore', { total: meritPool.length });
+          const MERIT_BATCH_SIZE = 7;  // Output budget: ~600 tokens × 7 = 4200, fits in 4096 with compression
+          const meritBatches = Math.ceil(meritPool.length / MERIT_BATCH_SIZE);
+
+          for (let bi = 0; bi < meritBatches; bi++) {
+            const batch = meritPool.slice(bi * MERIT_BATCH_SIZE, (bi + 1) * MERIT_BATCH_SIZE);
+            const profiles = batch.map(s => {
+              const m = s.meta || {};
+              const founders = m.founders || '';
+              const fundingStr = m.funding ? '$' + (m.funding/1e6).toFixed(1) + 'M' : 'undisclosed';
+              return `${s.title}
+Funding: ${fundingStr} | Stage: ${m.stage || s.subtitle || '?'} | Headcount: ${m.headcount || '?'}
+Founders: ${founders || 'unknown'}
+Web: ${s.url || m.website || '—'}
+Description: ${(s.text || '').slice(0, 500)}`;
+            });
+
+            const prompt = buildMeritPrompt({
+              companies: profiles,
+              anchorContext,
+              additionalInfo: additionalInfo.slice(0, 6000),
+              isAnchorSelfRating: false,
+              anchorRatings,
+            });
+
+            sendProgress(`Merit batch ${bi + 1}/${meritBatches} — ${batch.length} companies`, 'meritscore', { batch: bi + 1, totalBatches: meritBatches });
+
+            try {
+              const opusRes = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+                body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+              });
+              if (opusRes.ok) {
+                const opusData = await opusRes.json();
+                recordUsage('claude-opus-4-6', opusData.usage);
+                const txt = opusData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+                const m = txt.match(/```json\s*\n?([\s\S]*?)\n?```/);
+                if (m) {
+                  try {
+                    const parsed = JSON.parse(m[1]);
+                    for (const s of batch) {
+                      const name = s.companyName || s.title || '';
+                      const v = parsed[name]
+                        || Object.entries(parsed).find(([k]) => k.toLowerCase().trim() === name.toLowerCase().trim())?.[1]
+                        || Object.entries(parsed).find(([k]) => k.toLowerCase().includes(name.toLowerCase().slice(0, 12)))?.[1];
+                      if (!v) continue;
+                      const dims = {
+                        pedigree: v.pedigree || 0, traction: v.traction || 0,
+                        capital: v.capital || 0, investor: v.investor || 0, defensibility: v.defensibility || 0,
+                      };
+                      const weighted = computeWeightedScore(dims);
+                      const modAdjust = applyModifiers(v.modifiers);
+                      const rawFinal = Math.max(0, Math.min(10, weighted + modAdjust));
+
+                      // Apply anchor sanity-check ceiling
+                      let anchorRating = null;
+                      if (s._anchor?.baseline) anchorRating = anchorRatings[s._anchor.baseline.toLowerCase()];
+                      if (!anchorRating && Object.values(anchorRatings).length > 0) anchorRating = Object.values(anchorRatings)[0];
+                      const ceilingResult = applyAnchorCeiling(dims, rawFinal, anchorRating);
+
+                      s._merit = {
+                        ...dims,
+                        pedigree_reason: v.pedigree_reason || '',
+                        traction_reason: v.traction_reason || '',
+                        capital_reason: v.capital_reason || '',
+                        investor_reason: v.investor_reason || '',
+                        defensibility_reason: v.defensibility_reason || '',
+                        modifiers: Array.isArray(v.modifiers) ? v.modifiers : [],
+                        modifier_total: modAdjust,
+                        weighted_raw: weighted,
+                        bottom_line: v.bottom_line || '',
+                        final: ceilingResult.final,
+                        capped_to_anchor: ceilingResult.capped,
+                        anchor_used: anchorRating ? Object.keys(anchorRatings).find(k => anchorRatings[k] === anchorRating) : null,
+                      };
+                      s._opusScore = ceilingResult.final;
+                    }
+                  } catch (e) { console.error(`[Super/Merit] Batch ${bi+1} JSON parse error:`, e.message); }
+                }
+              } else {
+                console.error(`[Super/Merit] Batch ${bi+1} HTTP ${opusRes.status}`);
+              }
+            } catch (e) { console.error(`[Super/Merit] Batch ${bi+1} error:`, e.message); }
+            if (bi + 1 < meritBatches) await sleep(300);
+          }
+          const meritCount = rated.filter(s => s._merit).length;
+          console.log(`[Super/Merit] Scored ${meritCount} companies on 5 dimensions`);
+          sendProgress(`Merit-scored ${meritCount} companies`, 'meritscore', { scored: meritCount });
+        } else {
+        // ── LEGACY OPUS PATH (no anchors — uses simple 1-10 scoring) ──
         // Build the candidate pool for Opus.
         // For Max/Extreme: guarantee Opus runs by filling up to opusTopN with top-engagement
         //   signals when HIGH/MEDIUM is short. User paid for deep scoring — give it to them.
@@ -5460,6 +5726,7 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
             }
           } catch (e) { console.error('[Super] Opus error:', e.message); }
         }
+        }  // end legacy-Opus else branch
       }
 
       // Re-sort: Opus scores first (if available), then HIGH/MEDIUM/LOW
@@ -5525,6 +5792,10 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
         sourcesActual,
         sourcesSkipped,
         opusScoredCount: opusRanCount,
+        meritMode,
+        anchorRatings,
+        fundingFilter: effectiveFundingFilter,
+        meritScoredCount: rated.filter(s => s._merit).length,
       });
     }
 
