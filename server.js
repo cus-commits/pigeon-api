@@ -5098,6 +5098,7 @@ app.post('/api/signals/super', async (req, res) => {
     // and inject them as harmonic-source signals with anchor metadata.
     let anchorContext = ''; // Used in scoring prompts
     let anchorCompanyNames = []; // For matching during scoring
+    let anchorCards = [];   // Enriched baseline companies (for AI Query Expansion + self-rating)
 
     if (hasAnchors && harmonicKey) {
       sendProgress('Fetching anchor companies (baselines/portfolio)...', 'import', { source: 'anchors' });
@@ -5204,6 +5205,16 @@ app.post('/api/signals/super', async (req, res) => {
           console.log(`[Super/Anchor] baseline "${b.name}" → ${n} similar companies`);
         }
         anchorContext += `BASELINE COMPANIES (importance ${baselineImportance}%): ${baselines.map(b => b.name).join(', ')}\n`;
+
+        // Enrich baseline companies themselves (rich data for AI Query Expansion + self-rating)
+        try {
+          const baselineIds = baselines.map(b => b.id).filter(Boolean);
+          if (baselineIds.length > 0) {
+            const enriched = await gqlEnrichCompanies(baselineIds, harmonicKey);
+            anchorCards = enriched.map(c => gqlToCard(c));
+            console.log(`[Super/Anchor] enriched ${anchorCards.length} baseline companies for query gen`);
+          }
+        } catch (e) { console.error('[Super/Anchor] baseline enrich error:', e.message); }
       }
 
       // Process portfolio
@@ -5246,111 +5257,157 @@ app.post('/api/signals/super', async (req, res) => {
 
       sendProgress(`Anchors loaded — ${sourceStats.harmonic || 0} similar companies from Harmonic`, 'import', { source: 'anchors' });
 
-      // ── MULTI-HOP EXPANSION (Max/Extreme tiers) ──
-      // Harmonic Similar API caps at 100 per call. To get a pool of 1000+ candidates
-      // for deep tiers, we expand: take top N from initial pool, fetch THEIR similar,
-      // dedup, repeat. This is what the user is paying for in Max/Extreme tiers.
-      const enableMultiHop = ['opus80', 'extreme'].includes(superTier);
-      if (enableMultiHop) {
-        const hopDepth = superTier === 'extreme' ? 2 : 1;
-        const seedsPerHop = superTier === 'extreme' ? 15 : 5;
-        const harmonicHdrs = { apikey: harmonicKey };
-        const buildSignalFromCard = (c, anchorMeta) => {
-          const tm = c.tractionMetrics || {};
-          const founders = Array.isArray(c.founders) ? c.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
-          return {
-            source: 'harmonic',
-            id: `hm-${c.id || c.entity_id || ''}`,
-            title: c.name || '?',
-            subtitle: c.funding_stage || c.stage || 'Unknown',
-            text: (c.description || '').slice(0, 300),
-            url: c.website?.url || c.website?.domain || c.website || '',
-            pfp: c.logo_url || c.logoUrl || '',
-            followers: c.headcount || 0,
-            engagement: c.funding_total || 0,
-            likes: 0,
-            timestamp: c.created_at || c.founded_date || null,
-            meta: {
-              funding: c.funding_total || 0,
-              stage: c.funding_stage || c.stage,
-              headcount: c.headcount,
-              website: c.website?.url || c.website || '',
-              founders,
-              webGrowth: tm.webTraffic?.ago30d?.percentChange || null,
-              hcGrowth: tm.headcount?.ago90d?.percentChange || null,
-            },
-            _anchor: anchorMeta,
-          };
-        };
+      // ── AI QUERY EXPANSION (Max/Extreme tiers) ──
+      // Harmonic Similar caps at 100 per anchor. To leverage Harmonic's full 1M+ DB,
+      // we have Claude analyze the baselines + additional info, then generate diverse
+      // natural-language queries that hit Harmonic's search_agent endpoint (which can
+      // return up to 1000 per query). Each query approaches from a different angle —
+      // sector, business model, technology, geography, customer type, adjacent verticals.
+      // Result: 1000-3000+ candidates from across the database, NOT just narrow archetypes.
+      const enableQueryExpansion = ['opus80', 'extreme'].includes(superTier);
+      if (enableQueryExpansion && anthropicKey) {
+        const numQueries = superTier === 'extreme' ? 30 : 12;
+        const querySize = superTier === 'extreme' ? 300 : 150;
 
-        let seedSignals = allSignals
-          .filter(s => s.source === 'harmonic')
-          .sort((a, b) => (b.engagement || 0) - (a.engagement || 0))
-          .slice(0, seedsPerHop);
+        // Step 1: Build context from baselines + additional info
+        const baselineDescs = anchorCards && anchorCards.length > 0
+          ? anchorCards.map(a => `- ${a.name}: ${(a.description || '').slice(0, 250)}\n  Stage: ${a.funding_stage || '?'} | Funding: ${a.funding_total ? '$' + (a.funding_total/1e6).toFixed(1) + 'M' : '?'} | Location: ${a.location || '?'} | Founders: ${(a.founders||[]).map(f => f.name || f).filter(Boolean).slice(0,3).join(', ') || '?'}`).join('\n')
+          : baselines.map(b => `- ${b.name}`).join('\n');
 
-        for (let hop = 0; hop < hopDepth; hop++) {
-          if (seedSignals.length === 0) break;
-          sendProgress(`Multi-hop expansion ${hop + 1}/${hopDepth} — expanding from ${seedSignals.length} seeds (pool: ${sourceStats.harmonic})...`, 'import', { source: 'multihop', hop: hop + 1 });
-          const newSignalsThisHop = [];
-          let skippedFunding = 0;
+        sendProgress(`Generating ${numQueries} diverse search queries via Claude...`, 'import', { source: 'ai-query-gen' });
 
-          for (const seed of seedSignals) {
-            const seedId = String(seed.id || '').replace('hm-', '');
-            if (!seedId) continue;
-            try {
-              const r = await fetch(`${HARMONIC_BASE}/search/similar_companies/${seedId}?size=100`, { headers: harmonicHdrs });
-              if (!r.ok) continue;
-              const data = await r.json();
-              const raw = Array.isArray(data) ? data : (data.results || data.similar_companies || data.companies || []);
-              if (!raw.length) continue;
+        const queryGenPrompt = `You are designing a Harmonic database search to find companies relevant to these baseline anchors:
 
-              const alreadyFull = raw[0] && typeof raw[0] === 'object' && raw[0].name;
-              let companies = [];
-              if (alreadyFull) {
-                companies = raw.map(c => gqlToCard(c));
-              } else {
-                const ids = raw.map(rr => {
-                  if (typeof rr === 'string') return rr.includes(':') ? rr.split(':').pop() : rr;
-                  if (typeof rr === 'number') return rr;
-                  return rr.id || (rr.entity_urn || rr.entityUrn || '').split(':').pop() || null;
-                }).filter(Boolean);
-                if (ids.length > 0) {
-                  const enriched = await gqlEnrichCompanies(ids, harmonicKey);
-                  companies = enriched.map(c => gqlToCard(c));
-                }
-              }
-              for (const c of companies) {
-                const cid = String(c.id || c.entity_id || '');
-                const nameKey = (c.name || '').toLowerCase().trim();
-                if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
-                if ((c.funding_total || 0) > fundingCap) { skippedFunding++; continue; }
-                seenAnchorIds.add(cid);
-                seenAnchorIds.add(nameKey);
+${baselineDescs}
+${additionalInfo ? `\nADDITIONAL CONTEXT:\n${additionalInfo.slice(0, 6000)}\n` : ''}
+Generate ${numQueries} DIVERSE natural-language search queries that approach from DIFFERENT angles:
+- Core sector/subsector terms
+- Business model variants (B2B SaaS, hardware+SaaS, marketplace, infra, etc.)
+- Technology category (LLM, sensor, blockchain, edge compute, etc.)
+- Customer/market type (SMB, enterprise, prosumer, etc.)
+- Geographic variants (US, EU, Asia, LatAm, MENA)
+- Adjacent verticals (companies serving similar customers but with different products)
+- Competitor/replacement archetypes
+- Stage-fit terms (seed-stage, early-stage, bootstrapped)
+- Specific use cases / problems being solved
+- Founder backgrounds (deep tech, ex-FAANG, repeat founder)
 
-                const sig = buildSignalFromCard(c, {
-                  type: 'expansion',
-                  weight: seed._anchor?.weight || 50,
-                  baseline: seed._anchor?.baseline || seed.title,
-                  hop: hop + 1,
-                  via: seed.title,
-                });
-                allSignals.push(sig);
-                sourceStats.harmonic++;
-                newSignalsThisHop.push(sig);
-              }
-            } catch (e) {
-              console.error(`[Super/MultiHop] hop ${hop + 1} seed "${seed.title}" error:`, e.message);
+Each query: 3-9 words, optimized for Harmonic's semantic search agent. Be CREATIVE — these queries will be UNIONED to maximize recall across Harmonic's 1M+ company database. Prefer diverse over redundant.
+
+Output STRICT JSON only:
+${'```'}json
+{"queries": ["query 1", "query 2", "..."]}
+${'```'}`;
+
+        let queries = [];
+        try {
+          const qr = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 2000, messages: [{ role: 'user', content: queryGenPrompt }] }),
+          });
+          if (qr.ok) {
+            const qd = await qr.json();
+            recordUsage('claude-haiku-4-5-20251001', qd.usage);
+            const txt = qd.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+            const m = txt.match(/```json\s*\n?([\s\S]*?)\n?```/);
+            if (m) {
+              const parsed = JSON.parse(m[1]);
+              queries = (parsed.queries || []).filter(q => typeof q === 'string' && q.trim()).slice(0, numQueries);
             }
-            await sleep(50);
           }
-          console.log(`[Super/MultiHop] hop ${hop + 1}: +${newSignalsThisHop.length} new (${skippedFunding} dropped by funding filter). Pool: ${sourceStats.harmonic}`);
-          sendProgress(`Hop ${hop + 1} added ${newSignalsThisHop.length} companies (${skippedFunding} over funding cap, dropped). Pool: ${sourceStats.harmonic}`, 'import', { source: 'multihop', hop: hop + 1, added: newSignalsThisHop.length, skippedFunding, total: sourceStats.harmonic });
+        } catch (e) { console.error('[Super/AIExpand] query-gen error:', e.message); }
 
-          // Seeds for next hop = top of newly-added (so we expand outward, not in circles)
-          if (hop < hopDepth - 1) {
-            seedSignals = newSignalsThisHop
-              .sort((a, b) => (b.engagement || 0) - (a.engagement || 0))
-              .slice(0, seedsPerHop);
+        console.log(`[Super/AIExpand] generated ${queries.length} queries:`, queries);
+        if (queries.length > 0) {
+          sendProgress(`Running ${queries.length} Harmonic queries (size=${querySize} each, full DB)...`, 'import', { source: 'ai-query-run', queries: queries.length });
+
+          // Step 2: Run each query via search_agent, accumulate IDs
+          const harmonicHdrs = { apikey: harmonicKey };
+          const expansionIds = new Set();
+          let queriesRun = 0;
+          for (const q of queries) {
+            try {
+              // Cap individual call at 1000 (Harmonic max), use querySize as our target
+              const url = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(q)}&size=${Math.min(querySize, 1000)}`;
+              const r = await fetch(url, { headers: harmonicHdrs });
+              if (r.ok) {
+                const data = await r.json();
+                const results = data.results || data.companies || data.data || [];
+                let added = 0;
+                for (const rr of results) {
+                  const id = typeof rr === 'string'
+                    ? (rr.includes(':') ? rr.split(':').pop() : rr)
+                    : (typeof rr === 'number' ? String(rr) : (rr.id || (rr.urn || rr.entity_urn || '').split(':').pop()));
+                  if (id && !seenAnchorIds.has(String(id))) {
+                    expansionIds.add(String(id));
+                    added++;
+                  }
+                }
+                queriesRun++;
+                if (queriesRun % 5 === 0 || queriesRun === queries.length) {
+                  sendProgress(`Query ${queriesRun}/${queries.length} — pool: ${expansionIds.size + sourceStats.harmonic} unique candidates`, 'import', { source: 'ai-query-run', queriesRun, total: expansionIds.size + sourceStats.harmonic });
+                }
+                console.log(`[Super/AIExpand] query "${q}" → ${results.length} results, +${added} new (pool: ${expansionIds.size})`);
+              } else {
+                console.error(`[Super/AIExpand] query "${q}" HTTP ${r.status}`);
+              }
+            } catch (e) { console.error(`[Super/AIExpand] query error:`, e.message); }
+            await sleep(80);
+          }
+
+          // Step 3: Enrich expansion IDs in batches via GQL
+          if (expansionIds.size > 0) {
+            sendProgress(`Enriching ${expansionIds.size} new candidates from Harmonic...`, 'import', { source: 'ai-query-enrich', total: expansionIds.size });
+            const idArr = [...expansionIds];
+            const ENRICH_BATCH = 100;
+            let enrichedCount = 0, skippedFunding = 0;
+            for (let i = 0; i < idArr.length; i += ENRICH_BATCH) {
+              const batch = idArr.slice(i, i + ENRICH_BATCH);
+              try {
+                const enriched = await gqlEnrichCompanies(batch, harmonicKey);
+                for (const c of enriched) {
+                  const card = gqlToCard(c);
+                  const cid = String(card.id || card.entity_id || '');
+                  const nameKey = (card.name || '').toLowerCase().trim();
+                  if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
+                  if ((card.funding_total || 0) > fundingCap) { skippedFunding++; continue; }
+                  seenAnchorIds.add(cid);
+                  seenAnchorIds.add(nameKey);
+
+                  const tm = card.tractionMetrics || {};
+                  const founders = Array.isArray(card.founders) ? card.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
+                  allSignals.push({
+                    source: 'harmonic',
+                    id: `hm-${cid}`,
+                    title: card.name || '?',
+                    subtitle: card.funding_stage || card.stage || 'Unknown',
+                    text: (card.description || '').slice(0, 300),
+                    url: card.website?.url || card.website?.domain || card.website || '',
+                    pfp: card.logo_url || card.logoUrl || '',
+                    followers: card.headcount || 0,
+                    engagement: card.funding_total || 0,
+                    likes: 0,
+                    timestamp: card.created_at || card.founded_date || null,
+                    meta: {
+                      funding: card.funding_total || 0,
+                      stage: card.funding_stage || card.stage,
+                      headcount: card.headcount,
+                      website: card.website?.url || card.website || '',
+                      founders,
+                      webGrowth: tm.webTraffic?.ago30d?.percentChange || null,
+                      hcGrowth: tm.headcount?.ago90d?.percentChange || null,
+                    },
+                    _anchor: { type: 'ai-expansion', weight: baselineImportance, baseline: baselines[0]?.name || '' },
+                  });
+                  sourceStats.harmonic++;
+                  enrichedCount++;
+                }
+                sendProgress(`Enriched ${Math.min(i + ENRICH_BATCH, idArr.length)}/${idArr.length} — pool now ${sourceStats.harmonic}`, 'import', { source: 'ai-query-enrich', done: i + batch.length, total: idArr.length });
+              } catch (e) { console.error(`[Super/AIExpand] enrich batch ${i} error:`, e.message); }
+            }
+            console.log(`[Super/AIExpand] AI Query Expansion COMPLETE: +${enrichedCount} new (${skippedFunding} dropped by funding cap). Total pool: ${sourceStats.harmonic}`);
+            sendProgress(`AI expansion complete: +${enrichedCount} candidates (${skippedFunding} over funding cap). Total pool: ${sourceStats.harmonic}`, 'import', { source: 'ai-query-done', added: enrichedCount, skippedFunding, totalPool: sourceStats.harmonic });
           }
         }
       }
@@ -5482,13 +5539,14 @@ app.post('/api/signals/super', async (req, res) => {
     const anchorRatings = {}; // { baselineName: { final, pedigree, traction, capital, investor, defensibility } }
     if (meritMode && anthropicKey && baselines.length > 0) {
       sendProgress('Rating anchor companies for sanity-check ceiling...', 'screen', { stage: 'anchor-rating' });
-      // Fetch enriched anchor data
-      const anchorIds = baselines.map(b => b.id).filter(Boolean);
-      let anchorEnriched = [];
-      try {
-        anchorEnriched = await gqlEnrichCompanies(anchorIds, harmonicKey);
-      } catch (e) { console.error('[Super/Merit] Anchor enrich error:', e.message); }
-      const anchorCards = anchorEnriched.map(c => gqlToCard(c));
+      // Re-use enriched anchor data from the anchor-fetch phase (no duplicate GQL call)
+      if (anchorCards.length === 0) {
+        try {
+          const anchorIds = baselines.map(b => b.id).filter(Boolean);
+          const anchorEnriched = await gqlEnrichCompanies(anchorIds, harmonicKey);
+          anchorCards = anchorEnriched.map(c => gqlToCard(c));
+        } catch (e) { console.error('[Super/Merit] Anchor enrich error:', e.message); }
+      }
 
       for (const a of anchorCards) {
         const profile = `${a.name}
