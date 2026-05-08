@@ -5266,8 +5266,8 @@ app.post('/api/signals/super', async (req, res) => {
       // Result: 1000-3000+ candidates from across the database, NOT just narrow archetypes.
       const enableQueryExpansion = ['opus80', 'extreme'].includes(superTier);
       if (enableQueryExpansion && anthropicKey) {
-        const numQueries = superTier === 'extreme' ? 30 : 12;
-        const querySize = superTier === 'extreme' ? 300 : 150;
+        const numQueries = superTier === 'extreme' ? 50 : 20;
+        const querySize = superTier === 'extreme' ? 1000 : 500;  // Harmonic max is 1000
 
         // Step 1: Build context from baselines + additional info
         const baselineDescs = anchorCards && anchorCards.length > 0
@@ -5320,95 +5320,123 @@ ${'```'}`;
 
         console.log(`[Super/AIExpand] generated ${queries.length} queries:`, queries);
         if (queries.length > 0) {
-          sendProgress(`Running ${queries.length} Harmonic queries (size=${querySize} each, full DB)...`, 'import', { source: 'ai-query-run', queries: queries.length });
+          sendProgress(`Running ${queries.length} Harmonic queries × size=${querySize} (search_agent + keyword filter)...`, 'import', { source: 'ai-query-run', queries: queries.length });
 
-          // Step 2: Run each query via search_agent, accumulate IDs
+          // Step 2: Run each query via BOTH search_agent (semantic) AND companies_by_keywords
+          // (keyword filter). Two endpoints hit different distributions of the database.
+          // Capture rich data from response — skip GQL enrichment for non-survivors (huge speedup).
           const harmonicHdrs = { apikey: harmonicKey };
-          const expansionIds = new Set();
+          const liteCompanyMap = new Map();  // id → lite company (for Sonnet screening)
           let queriesRun = 0;
-          for (const q of queries) {
-            try {
-              // Cap individual call at 1000 (Harmonic max), use querySize as our target
-              const url = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(q)}&size=${Math.min(querySize, 1000)}`;
-              const r = await fetch(url, { headers: harmonicHdrs });
-              if (r.ok) {
-                const data = await r.json();
-                const results = data.results || data.companies || data.data || [];
-                let added = 0;
-                for (const rr of results) {
-                  const id = typeof rr === 'string'
-                    ? (rr.includes(':') ? rr.split(':').pop() : rr)
-                    : (typeof rr === 'number' ? String(rr) : (rr.id || (rr.urn || rr.entity_urn || '').split(':').pop()));
-                  if (id && !seenAnchorIds.has(String(id))) {
-                    expansionIds.add(String(id));
-                    added++;
-                  }
-                }
-                queriesRun++;
-                if (queriesRun % 5 === 0 || queriesRun === queries.length) {
-                  sendProgress(`Query ${queriesRun}/${queries.length} — pool: ${expansionIds.size + sourceStats.harmonic} unique candidates`, 'import', { source: 'ai-query-run', queriesRun, total: expansionIds.size + sourceStats.harmonic });
-                }
-                console.log(`[Super/AIExpand] query "${q}" → ${results.length} results, +${added} new (pool: ${expansionIds.size})`);
-              } else {
-                console.error(`[Super/AIExpand] query "${q}" HTTP ${r.status}`);
-              }
-            } catch (e) { console.error(`[Super/AIExpand] query error:`, e.message); }
-            await sleep(80);
-          }
 
-          // Step 3: Enrich expansion IDs in batches via GQL
-          if (expansionIds.size > 0) {
-            sendProgress(`Enriching ${expansionIds.size} new candidates from Harmonic...`, 'import', { source: 'ai-query-enrich', total: expansionIds.size });
-            const idArr = [...expansionIds];
-            const ENRICH_BATCH = 100;
-            let enrichedCount = 0, skippedFunding = 0;
-            for (let i = 0; i < idArr.length; i += ENRICH_BATCH) {
-              const batch = idArr.slice(i, i + ENRICH_BATCH);
-              try {
-                const enriched = await gqlEnrichCompanies(batch, harmonicKey);
-                for (const c of enriched) {
-                  const card = gqlToCard(c);
-                  const cid = String(card.id || card.entity_id || '');
-                  const nameKey = (card.name || '').toLowerCase().trim();
-                  if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
-                  if ((card.funding_total || 0) > fundingCap) { skippedFunding++; continue; }
-                  seenAnchorIds.add(cid);
-                  seenAnchorIds.add(nameKey);
+          // Helper: extract lite company data from a search_agent result row
+          const extractLite = (rr) => {
+            if (typeof rr === 'string') return { id: rr.includes(':') ? rr.split(':').pop() : rr };
+            if (typeof rr === 'number') return { id: String(rr) };
+            const id = rr.id || (rr.urn || rr.entity_urn || '').split(':').pop();
+            if (!id) return null;
+            return {
+              id: String(id),
+              name: rr.name || rr.company_name || rr.display_name || '',
+              description: rr.description || rr.short_description || rr.tagline || '',
+              website: rr.website?.url || rr.website?.domain || rr.homepage_url || '',
+              funding_total: rr.funding_total || rr.total_funding_amount || rr.funding?.fundingTotal || 0,
+              funding_stage: rr.stage || rr.funding_stage || rr.funding?.fundingStage || '',
+              headcount: rr.headcount || null,
+              location: rr.location?.city ? `${rr.location.city}, ${rr.location.country || ''}`.trim() : (rr.location || ''),
+              logo_url: rr.logo_url || rr.logoUrl || '',
+              founders: rr.founders || [],
+            };
+          };
 
-                  const tm = card.tractionMetrics || {};
-                  const founders = Array.isArray(card.founders) ? card.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
-                  allSignals.push({
-                    source: 'harmonic',
-                    id: `hm-${cid}`,
-                    title: card.name || '?',
-                    subtitle: card.funding_stage || card.stage || 'Unknown',
-                    text: (card.description || '').slice(0, 300),
-                    url: card.website?.url || card.website?.domain || card.website || '',
-                    pfp: card.logo_url || card.logoUrl || '',
-                    followers: card.headcount || 0,
-                    engagement: card.funding_total || 0,
-                    likes: 0,
-                    timestamp: card.created_at || card.founded_date || null,
-                    meta: {
-                      funding: card.funding_total || 0,
-                      stage: card.funding_stage || card.stage,
-                      headcount: card.headcount,
-                      website: card.website?.url || card.website || '',
-                      founders,
-                      webGrowth: tm.webTraffic?.ago30d?.percentChange || null,
-                      hcGrowth: tm.headcount?.ago90d?.percentChange || null,
-                    },
-                    _anchor: { type: 'ai-expansion', weight: baselineImportance, baseline: baselines[0]?.name || '' },
-                  });
-                  sourceStats.harmonic++;
-                  enrichedCount++;
-                }
-                sendProgress(`Enriched ${Math.min(i + ENRICH_BATCH, idArr.length)}/${idArr.length} — pool now ${sourceStats.harmonic}`, 'import', { source: 'ai-query-enrich', done: i + batch.length, total: idArr.length });
-              } catch (e) { console.error(`[Super/AIExpand] enrich batch ${i} error:`, e.message); }
+          const collect = (results, queryStr) => {
+            let added = 0;
+            for (const rr of (results || [])) {
+              const lite = extractLite(rr);
+              if (!lite || !lite.id || seenAnchorIds.has(lite.id) || liteCompanyMap.has(lite.id)) continue;
+              // Apply funding cap during pool building if rich data available; if no funding info, INCLUDE (pre-funding/undisclosed)
+              if (lite.funding_total > 0 && lite.funding_total > fundingCap) continue;
+              liteCompanyMap.set(lite.id, { ...lite, _foundVia: queryStr });
+              added++;
             }
-            console.log(`[Super/AIExpand] AI Query Expansion COMPLETE: +${enrichedCount} new (${skippedFunding} dropped by funding cap). Total pool: ${sourceStats.harmonic}`);
-            sendProgress(`AI expansion complete: +${enrichedCount} candidates (${skippedFunding} over funding cap). Total pool: ${sourceStats.harmonic}`, 'import', { source: 'ai-query-done', added: enrichedCount, skippedFunding, totalPool: sourceStats.harmonic });
+            return added;
+          };
+
+          for (const q of queries) {
+            // Endpoint 1: search_agent (semantic) — size up to 1000
+            try {
+              const url1 = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(q)}&size=${Math.min(querySize, 1000)}`;
+              const r1 = await fetch(url1, { headers: harmonicHdrs });
+              if (r1.ok) {
+                const data = await r1.json();
+                const results = data.results || data.companies || data.data || [];
+                const added = collect(results, q);
+                console.log(`[Super/AIExpand] search_agent "${q}" → ${results.length} raw, +${added} new (pool: ${liteCompanyMap.size})`);
+              } else {
+                console.error(`[Super/AIExpand] search_agent "${q}" HTTP ${r1.status}`);
+              }
+            } catch (e) { console.error(`[Super/AIExpand] search_agent error:`, e.message); }
+            await sleep(60);
+
+            // Endpoint 2: companies_by_keywords (keyword filter) — different distribution
+            try {
+              const params = new URLSearchParams({ size: '500', include_ids_only: 'false' });
+              params.set('contains_any_of_keywords', q);
+              const r2 = await fetch(`${HARMONIC_BASE}/search/companies_by_keywords?${params}`, {
+                method: 'POST', headers: { ...harmonicHdrs, 'Content-Type': 'application/json' }
+              });
+              if (r2.ok) {
+                const data = await r2.json();
+                const results = data.results || data.companies || data.data || [];
+                const added = collect(results, q);
+                console.log(`[Super/AIExpand] keywords "${q}" → ${results.length} raw, +${added} new (pool: ${liteCompanyMap.size})`);
+              }
+            } catch (e) { /* keyword endpoint is best-effort */ }
+            await sleep(60);
+
+            queriesRun++;
+            if (queriesRun % 5 === 0 || queriesRun === queries.length) {
+              sendProgress(`Query ${queriesRun}/${queries.length} — pool: ${liteCompanyMap.size} unique candidates`, 'import', { source: 'ai-query-run', queriesRun, total: liteCompanyMap.size });
+            }
           }
+
+          // Step 3: Push lite signals into allSignals (skip enrichment for now — done after Sonnet)
+          // Sonnet can screen on lite data alone (name + description + funding).
+          // Only top survivors get GQL-enriched right before Opus 5-dim scoring.
+          let pushedLite = 0;
+          for (const [, c] of liteCompanyMap) {
+            const nameKey = (c.name || '').toLowerCase().trim();
+            if (!c.name || seenAnchorIds.has(c.id) || seenAnchorIds.has(nameKey)) continue;
+            seenAnchorIds.add(c.id);
+            seenAnchorIds.add(nameKey);
+            allSignals.push({
+              source: 'harmonic',
+              id: `hm-${c.id}`,
+              title: c.name,
+              subtitle: c.funding_stage || 'Unknown',
+              text: (c.description || '').slice(0, 300),
+              url: c.website || '',
+              pfp: c.logo_url || '',
+              followers: c.headcount || 0,
+              engagement: c.funding_total || 0,
+              likes: 0,
+              timestamp: null,
+              meta: {
+                funding: c.funding_total || 0,
+                stage: c.funding_stage,
+                headcount: c.headcount,
+                website: c.website,
+                founders: Array.isArray(c.founders) ? c.founders.map(f => f.name || f).filter(Boolean).join(', ') : '',
+                location: c.location,
+                _lite: true,  // marker — not yet GQL-enriched
+              },
+              _anchor: { type: 'ai-expansion', weight: baselineImportance, baseline: baselines[0]?.name || '' },
+            });
+            sourceStats.harmonic++;
+            pushedLite++;
+          }
+          console.log(`[Super/AIExpand] AI Query Expansion COMPLETE: ${queries.length} queries × 2 endpoints, +${pushedLite} lite signals. Total pool: ${sourceStats.harmonic}`);
+          sendProgress(`AI expansion complete: +${pushedLite} candidates (lite). Total pool: ${sourceStats.harmonic}`, 'import', { source: 'ai-query-done', added: pushedLite, totalPool: sourceStats.harmonic });
         }
       }
     }
@@ -5724,6 +5752,49 @@ ${signalText}`;
               return (b.engagement || 0) - (a.engagement || 0);
             })
             .slice(0, opusTopN);
+
+          // ON-DEMAND ENRICHMENT — only the top-N survivors get full GQL data.
+          // Lite signals from AI Query Expansion need rich data for Opus to score founders/investors/IP properly.
+          const liteToEnrich = meritPool.filter(s => s.meta?._lite).map(s => String(s.id || '').replace('hm-', '')).filter(Boolean);
+          if (liteToEnrich.length > 0) {
+            sendProgress(`Enriching top ${liteToEnrich.length} survivors with full Harmonic data...`, 'meritscore', { phase: 'enrich-survivors', total: liteToEnrich.length });
+            const ENRICH_BATCH = 100;
+            for (let i = 0; i < liteToEnrich.length; i += ENRICH_BATCH) {
+              const batchIds = liteToEnrich.slice(i, i + ENRICH_BATCH);
+              try {
+                const enriched = await gqlEnrichCompanies(batchIds, harmonicKey);
+                for (const c of enriched) {
+                  const card = gqlToCard(c);
+                  const cid = String(card.id || card.entity_id || '');
+                  // Find matching signal in meritPool and replace its lite data with rich data
+                  const sig = meritPool.find(s => String(s.id || '').replace('hm-', '') === cid);
+                  if (!sig) continue;
+                  const tm = card.tractionMetrics || {};
+                  const founders = Array.isArray(card.founders) ? card.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
+                  sig.text = (card.description || sig.text || '').slice(0, 500);
+                  sig.url = card.website?.url || card.website?.domain || sig.url || '';
+                  sig.pfp = card.logo_url || card.logoUrl || sig.pfp || '';
+                  sig.subtitle = card.funding_stage || card.stage || sig.subtitle;
+                  sig.engagement = card.funding_total || sig.engagement || 0;
+                  sig.followers = card.headcount || sig.followers || 0;
+                  sig.meta = {
+                    ...sig.meta,
+                    funding: card.funding_total || sig.meta.funding || 0,
+                    stage: card.funding_stage || card.stage,
+                    headcount: card.headcount,
+                    website: card.website?.url || card.website || sig.meta.website || '',
+                    founders,
+                    investors: (card.investors || []).map(i => i.name || i).filter(Boolean).slice(0, 8).join(', '),
+                    location: card.location || sig.meta.location || '',
+                    webGrowth: tm.webTraffic?.ago30d?.percentChange || null,
+                    hcGrowth: tm.headcount?.ago90d?.percentChange || null,
+                    _lite: false,
+                  };
+                }
+              } catch (e) { console.error(`[Super/Merit] enrich-survivors batch ${i} error:`, e.message); }
+            }
+            console.log(`[Super/Merit] Enriched ${liteToEnrich.length} survivors before Opus scoring`);
+          }
 
           sendProgress(`Merit-scoring ${meritPool.length} companies on 5 dimensions...`, 'meritscore', { total: meritPool.length });
           const MERIT_BATCH_SIZE = 7;  // Output budget: ~600 tokens × 7 = 4200, fits in 4096 with compression
