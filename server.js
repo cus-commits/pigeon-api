@@ -4684,6 +4684,23 @@ app.get('/api/signals/super/status', (req, res) => {
   res.json(status);
 });
 
+app.post('/api/signals/super/cancel', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { scanId } = req.body || {};
+  if (!global._superSearchStatus) global._superSearchStatus = {};
+  if (scanId && global._superSearchStatus[scanId]) {
+    global._superSearchStatus[scanId].cancelled = true;
+    console.log(`[Super] Scan ${scanId} marked cancelled by user`);
+    return res.json({ success: true, scanId, cancelled: true });
+  }
+  // No scanId or unknown — cancel ALL running scans (best-effort)
+  let count = 0;
+  for (const [k, v] of Object.entries(global._superSearchStatus)) {
+    if (v.status === 'scanning') { v.cancelled = true; count++; }
+  }
+  res.json({ success: true, cancelledCount: count });
+});
+
 app.post('/api/signals/super/clear-status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   global._superSearchStatus = {};
@@ -4698,7 +4715,12 @@ app.post('/api/signals/super', async (req, res) => {
   res.flushHeaders();
 
   const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
-  const scanId = 'super_' + Date.now();
+  const scanId = (req.body && req.body.scanId) || ('super_' + Date.now());
+  // Track client connection — scan continues server-side even if client drops
+  let clientConnected = true;
+  req.on('close', () => { clientConnected = false; });
+  // Helper: check if this scan was cancelled (called between expensive operations)
+  const isCancelled = () => !!(global._superSearchStatus?.[scanId]?.cancelled);
   const sendProgress = (msg, stage, meta) => { 
     res.write(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`);
     // Also update global status for reconnection
@@ -4715,7 +4737,9 @@ app.post('/api/signals/super', async (req, res) => {
   };
   const startTime = Date.now();
   if (!global._superSearchStatus) global._superSearchStatus = {};
-  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime };
+  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false };
+  // Send scanId to frontend immediately so Cancel can target this scan
+  res.write(`data: ${JSON.stringify({ scanId })}\n\n`);
 
   try {
     const _hdrKey = (req.headers['x-anthropic-key'] || '').trim();
@@ -5363,6 +5387,11 @@ ${'```'}`;
           };
 
           for (const q of queries) {
+            if (isCancelled()) {
+              clearInterval(keepAlive);
+              console.log(`[Super] Cancelled during AI Query Expansion (queries ran: ${queriesRun})`);
+              return sendResult({ error: 'Cancelled by user', cancelled: true, signals: [], totalSignals: 0 });
+            }
             // Endpoint 1: search_agent (semantic) — size up to 1000
             try {
               const url1 = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(q)}&size=${Math.min(querySize, 1000)}`;
@@ -5638,11 +5667,16 @@ Description: ${(a.description || '').slice(0, 600)}`;
       sendProgress(`Screening ${forClaude.length} signals with Sonnet (${totalBatches} batch${totalBatches > 1 ? 'es' : ''})...`, 'screen', { total: forClaude.length, batches: totalBatches });
 
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+        if (isCancelled()) {
+          clearInterval(keepAlive);
+          console.log(`[Super] Cancelled during Sonnet screening (batch ${batchIdx}/${totalBatches})`);
+          return sendResult({ error: 'Cancelled by user', cancelled: true, signals: forClaude.slice(0, batchStart || 0), totalSignals });
+        }
         const batchStart = batchIdx * BATCH_SIZE;
         const batch = forClaude.slice(batchStart, batchStart + BATCH_SIZE);
-        
-        sendProgress(`Sonnet batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(allRatings).length} rated, ${totalHigh} HIGH so far`, 'screen', { 
-          batch: batchIdx + 1, totalBatches, rated: Object.keys(allRatings).length, high: totalHigh 
+
+        sendProgress(`Sonnet batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(allRatings).length} rated, ${totalHigh} HIGH so far`, 'screen', {
+          batch: batchIdx + 1, totalBatches, rated: Object.keys(allRatings).length, high: totalHigh
         });
 
         const signalText = batch.map((s, i) =>
@@ -5801,6 +5835,11 @@ ${signalText}`;
           const meritBatches = Math.ceil(meritPool.length / MERIT_BATCH_SIZE);
 
           for (let bi = 0; bi < meritBatches; bi++) {
+            if (isCancelled()) {
+              clearInterval(keepAlive);
+              console.log(`[Super] Cancelled during merit scoring (batch ${bi}/${meritBatches})`);
+              return sendResult({ error: 'Cancelled by user', cancelled: true, signals: rated, totalSignals, sourceStats, anchorRatings, meritMode, partial: true });
+            }
             const batch = meritPool.slice(bi * MERIT_BATCH_SIZE, (bi + 1) * MERIT_BATCH_SIZE);
             const profiles = batch.map(s => {
               const m = s.meta || {};
