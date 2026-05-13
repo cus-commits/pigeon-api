@@ -28,6 +28,214 @@ function saveReachoutsCreds(creds) {
 const HARMONIC_BASE = 'https://api.harmonic.ai';
 const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
 
+// ───────── SUPER SEARCH STATE PERSISTENCE ─────────
+// Without this, every Railway redeploy wipes _superSearchStatus and any
+// in-progress or recently-completed scan results vanish. We persist to
+// Railway's mounted volume (survives redeploys) so users don't lose work.
+const SUPER_STATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'super_search_state.json');
+let _superSaveTimer = null;
+function saveSuperStateDebounced() {
+  if (_superSaveTimer) return;
+  _superSaveTimer = setTimeout(() => {
+    try {
+      const state = global._superSearchStatus || {};
+      // Only persist scans <30 min old; clean up older
+      const now = Date.now();
+      const fresh = {};
+      for (const [k, v] of Object.entries(state)) {
+        const t = v.finishedAt || v.startedAt || 0;
+        if (now - t < 30 * 60 * 1000) fresh[k] = v;
+      }
+      fs.writeFileSync(SUPER_STATE_FILE, JSON.stringify(fresh));
+    } catch (e) { console.error('[Super/persist] save error:', e.message); }
+    _superSaveTimer = null;
+  }, 2000); // debounce 2s — protects against write storms during fast progress updates
+}
+function restoreSuperState() {
+  try {
+    const raw = fs.readFileSync(SUPER_STATE_FILE, 'utf8');
+    const state = JSON.parse(raw);
+    // Mark any 'scanning' as 'interrupted' — they were definitely killed by the restart
+    let interrupted = 0;
+    for (const [k, v] of Object.entries(state)) {
+      if (v.status === 'scanning') {
+        v.status = 'interrupted';
+        v.message = 'Scan was interrupted by a server restart. Please re-run with the same settings.';
+        v.finishedAt = Date.now();
+        interrupted++;
+      }
+    }
+    global._superSearchStatus = state;
+    console.log(`[Super/persist] Restored ${Object.keys(state).length} scan records (${interrupted} marked interrupted)`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('[Super/persist] restore error:', e.message);
+    global._superSearchStatus = {};
+  }
+}
+// Restore on module load (once per process start)
+restoreSuperState();
+
+// ───────── BACKBURN INDEX ─────────
+// Global filter: companies marked "Backburn" never appear in any search result.
+// Source-of-truth merged from three places:
+//   1. Airtable CRM Stage = "Backburn"            (canonical, partner-facing)
+//   2. backburn_registry.json (this file)         (everything sent through /api/vetting/backburn)
+//   3. vetting_pipeline.json companies with c.backburned/c.dismissed (legacy)
+// In-memory index = three Sets: normalized names, apex domains, harmonic IDs.
+// Refresh: boot + every 5 min + on every mutation.
+const BACKBURN_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'backburn_registry.json');
+const _backburnIdx = { names: new Set(), domains: new Set(), ids: new Set() };
+let _backburnLoadedAt = 0;
+let _backburnRefreshing = false;
+
+function normalizeBackburnName(s) {
+  return (s || '').toString().toLowerCase().normalize('NFKD').replace(/[^a-z0-9]/g, '').trim();
+}
+function extractApexDomain(s) {
+  if (!s) return '';
+  let d = String(s).trim().toLowerCase();
+  d = d.replace(/^https?:\/\//, '').replace(/^www\./, '');
+  d = d.split('/')[0].split('?')[0].split('#')[0];
+  // Strip a trailing port if present
+  d = d.split(':')[0];
+  return d;
+}
+function loadBackburnRegistry() {
+  try {
+    if (fs.existsSync(BACKBURN_FILE)) return JSON.parse(fs.readFileSync(BACKBURN_FILE, 'utf8'));
+  } catch (e) { console.error('[Backburn] registry load error:', e.message); }
+  return { companies: [] };
+}
+function saveBackburnRegistry(data) {
+  try { fs.writeFileSync(BACKBURN_FILE, JSON.stringify(data)); }
+  catch (e) { console.error('[Backburn] registry save error:', e.message); }
+}
+function addToBackburnIndex(entry) {
+  if (!entry) return;
+  const n = normalizeBackburnName(entry.name);
+  if (n) _backburnIdx.names.add(n);
+  const d = extractApexDomain(entry.website || entry.domain || '');
+  if (d) _backburnIdx.domains.add(d);
+  const id = String(entry.harmonic_id || entry.id || '').trim();
+  if (id) _backburnIdx.ids.add(id);
+}
+function recordBackburn(entry) {
+  // Persist to registry + warm in-memory index immediately.
+  try {
+    const reg = loadBackburnRegistry();
+    const nameKey = normalizeBackburnName(entry.name);
+    const exists = (reg.companies || []).find(c => normalizeBackburnName(c.name) === nameKey);
+    if (!exists) {
+      reg.companies.push({
+        name: entry.name || '',
+        harmonic_id: entry.harmonic_id || entry.id || null,
+        website: entry.website || '',
+        source: entry.source || 'vetting/backburn',
+        backburnedBy: entry.backburnedBy || null,
+        backburnedAt: Date.now(),
+      });
+      saveBackburnRegistry(reg);
+    }
+  } catch (e) { console.error('[Backburn] recordBackburn error:', e.message); }
+  addToBackburnIndex(entry);
+}
+async function refreshBackburnIndex() {
+  if (_backburnRefreshing) return;
+  _backburnRefreshing = true;
+  try {
+    const names = new Set(), domains = new Set(), ids = new Set();
+    // 1. Local registry
+    try {
+      const reg = loadBackburnRegistry();
+      for (const c of (reg.companies || [])) {
+        const n = normalizeBackburnName(c.name); if (n) names.add(n);
+        const d = extractApexDomain(c.website || c.domain || ''); if (d) domains.add(d);
+        const id = String(c.harmonic_id || c.id || '').trim(); if (id) ids.add(id);
+      }
+    } catch (e) { console.error('[Backburn] local registry merge error:', e.message); }
+    // 2. Vetting pipeline backburned/dismissed (legacy)
+    try {
+      const vetRaw = fs.existsSync(path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'vetting_pipeline.json'))
+        ? JSON.parse(fs.readFileSync(path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'vetting_pipeline.json'), 'utf8'))
+        : { companies: [] };
+      for (const c of (vetRaw.companies || [])) {
+        if (!c.backburned && !c.dismissed) continue;
+        const n = normalizeBackburnName(c.name); if (n) names.add(n);
+        const d = extractApexDomain(c.website || c.domain || ''); if (d) domains.add(d);
+        const id = String(c.harmonic_id || c.id || '').trim(); if (id) ids.add(id);
+      }
+    } catch (e) { /* file may not exist on fresh boot — fine */ }
+    // 3. Airtable CRM Stage = "Backburn" (canonical)
+    const token = process.env.AIRTABLE_TOKEN;
+    const baseId = process.env.AIRTABLE_BASE_ID;
+    if (token && baseId) {
+      try {
+        const tableName = encodeURIComponent(process.env.AIRTABLE_TABLE_NAME || 'All Companies');
+        const formula = encodeURIComponent('{CRM Stage} = "Backburn"');
+        // Page through (Airtable max 100 per page)
+        let offset = null, page = 0, total = 0;
+        do {
+          let url = `https://api.airtable.com/v0/${baseId}/${tableName}?pageSize=100&filterByFormula=${formula}`;
+          if (offset) url += `&offset=${encodeURIComponent(offset)}`;
+          const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+          if (!r.ok) { console.warn('[Backburn] Airtable refresh HTTP', r.status); break; }
+          const data = await r.json();
+          for (const rec of (data.records || [])) {
+            const name = (rec.fields['Company'] || '').trim();
+            const site = rec.fields['Company Link'] || rec.fields['Website'] || '';
+            const hid = rec.fields['Harmonic ID'] || null;
+            const n = normalizeBackburnName(name); if (n) names.add(n);
+            const d = extractApexDomain(site); if (d) domains.add(d);
+            const id = String(hid || '').trim(); if (id) ids.add(id);
+            total++;
+          }
+          offset = data.offset || null;
+          page++;
+          if (page > 20) break; // hard safety
+        } while (offset);
+        console.log(`[Backburn] Airtable refresh: ${total} Backburn-stage records`);
+      } catch (e) { console.warn('[Backburn] Airtable refresh error:', e.message); }
+    }
+    _backburnIdx.names = names;
+    _backburnIdx.domains = domains;
+    _backburnIdx.ids = ids;
+    _backburnLoadedAt = Date.now();
+    console.log(`[Backburn] Index refreshed: ${names.size} names / ${domains.size} domains / ${ids.size} ids`);
+  } finally {
+    _backburnRefreshing = false;
+  }
+}
+function isBackburned(card) {
+  if (!card) return false;
+  const n = normalizeBackburnName(card.name || card.title || card.companyName);
+  if (n && _backburnIdx.names.has(n)) return true;
+  const site = card.website || card.url || card.domain || card.meta?.website || '';
+  const d = extractApexDomain(site);
+  if (d && _backburnIdx.domains.has(d)) return true;
+  // Harmonic IDs may appear as bare id, or hm-12345 (super search signal id), or hash_id
+  let rawId = card.harmonic_id ?? card.id ?? card.harmonicId ?? null;
+  if (rawId != null) {
+    const idStr = String(rawId);
+    if (_backburnIdx.ids.has(idStr)) return true;
+    if (idStr.startsWith('hm-') && _backburnIdx.ids.has(idStr.slice(3))) return true;
+  }
+  return false;
+}
+function filterBackburn(cards) {
+  if (!Array.isArray(cards) || cards.length === 0) return cards || [];
+  if (_backburnIdx.names.size + _backburnIdx.domains.size + _backburnIdx.ids.size === 0) return cards;
+  const out = [];
+  let dropped = 0;
+  for (const c of cards) {
+    if (isBackburned(c)) { dropped++; continue; }
+    out.push(c);
+  }
+  if (dropped > 0) console.log(`[Backburn] Filtered ${dropped}/${cards.length} backburned from results`);
+  return out;
+}
+// Background refresh every 5 min (Airtable is the only externally-mutated source)
+setInterval(() => { refreshBackburnIndex().catch(e => console.error('[Backburn] periodic refresh error:', e.message)); }, 5 * 60 * 1000);
+
 // ───────── MERIT SCORING (5-dimension framework) ─────────
 // Spec: anchor is a SEARCH filter, not a scoring template. Score on absolute
 // investment merit: pedigree, traction, capital efficiency, investor quality,
@@ -1405,7 +1613,7 @@ app.get('/api/harmonic/similar/:id', async (req, res) => {
     const alreadyFull = rawResults[0] && typeof rawResults[0] === 'object' && rawResults[0].name;
     if (alreadyFull) {
       console.log(`[Similar] Results already enriched, mapping ${rawResults.length} directly`);
-      const companies = rawResults.map(c => gqlToCard(c));
+      const companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
       return res.json({ companies });
     }
 
@@ -1420,9 +1628,13 @@ app.get('/api/harmonic/similar/:id', async (req, res) => {
 
     if (ids.length === 0) return res.json({ companies: [], message: 'No similar companies found' });
 
+    // Pre-filter by Harmonic ID before paying for GQL enrichment
+    const idsAfterBurn = ids.filter(id => !_backburnIdx.ids.has(String(id)));
+    if (idsAfterBurn.length < ids.length) console.log(`[Similar/Backburn] Dropped ${ids.length - idsAfterBurn.length} IDs pre-enrich`);
+
     // Enrich via GraphQL
-    const enriched = await gqlEnrichCompanies(ids, harmonicKey);
-    const companies = enriched.map(c => gqlToCard(c));
+    const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
+    const companies = filterBackburn(enriched.map(c => gqlToCard(c)));
     console.log(`[Similar] Enriched ${companies.length} companies`);
     res.json({ companies });
   } catch (e) {
@@ -1480,7 +1692,7 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
     // Check if already full objects
     const alreadyFull = rawResults[0] && typeof rawResults[0] === 'object' && rawResults[0].name;
     if (alreadyFull) {
-      const companies = rawResults.map(c => gqlToCard(c));
+      const companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
       console.log(`[FindSimilar] Already enriched: ${companies.length}`);
       return res.json({ companies, targetName: target.name });
     }
@@ -1494,9 +1706,13 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
 
     if (ids.length === 0) return res.json({ error: 'No similar companies found', companies: [] });
 
+    // Pre-filter by Harmonic ID before GQL enrichment cost
+    const idsAfterBurn = ids.filter(id => !_backburnIdx.ids.has(String(id)));
+    if (idsAfterBurn.length < ids.length) console.log(`[FindSimilar/Backburn] Dropped ${ids.length - idsAfterBurn.length} IDs pre-enrich`);
+
     // Step 3: Enrich via GraphQL
-    const enriched = await gqlEnrichCompanies(ids, harmonicKey);
-    const companies = enriched.map(c => gqlToCard(c));
+    const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
+    const companies = filterBackburn(enriched.map(c => gqlToCard(c)));
     console.log(`[FindSimilar] Enriched ${companies.length} similar to "${target.name}"`);
     res.json({ companies, targetName: target.name });
   } catch (e) {
@@ -1817,6 +2033,15 @@ app.post('/api/vetting/backburn', (req, res) => {
     });
     saveSeen(seenData);
   } catch (e) {}
+
+  // Persist to backburn registry so all future searches filter this company out
+  recordBackburn({
+    name: removed.name,
+    harmonic_id: removed.harmonic_id || removed.id,
+    website: removed.website || removed.url || '',
+    source: 'vetting/backburn',
+    backburnedBy: personId || null,
+  });
 
   console.log(`[Vetting] "${companyName}" backburned + removed from DD by ${personId || 'unknown'}`);
   res.json({ success: true, removed: true });
@@ -2625,6 +2850,13 @@ app.post('/api/deep-search', async (req, res) => {
       sendProgress(`Found ${allSimilar.length} similar companies so far...`, 'import', 15);
     }
 
+    // Drop backburned companies before AI pre-screen — saves token spend and prevents them from ever ranking
+    const beforeBurn = allSimilar.length;
+    allSimilar = filterBackburn(allSimilar);
+    if (beforeBurn !== allSimilar.length) {
+      console.log(`[DeepSearch/Backburn] Dropped ${beforeBurn - allSimilar.length} backburned (${allSimilar.length} remain)`);
+    }
+
     console.log(`[DeepSearch] Collected ${allSimilar.length} unique similar companies`);
     sendProgress(`${allSimilar.length} companies from Harmonic. Starting AI screening...`, 'screen', 20);
 
@@ -2943,6 +3175,13 @@ app.post('/api/autoscan', async (req, res) => {
     }
     console.log(`[AutoScan] Seen-set: ${allSeen[personId]?.length || 0} dismissed + ${(vetting.companies || []).length} in DD = ${seenSet.size} total excluded`);
   } catch (e) {}
+
+  // Also exclude all backburned companies — they should NEVER reappear in scans.
+  // seenSet checks are by Harmonic ID (lines using `seenSet.has(id)`). Name/domain matches
+  // get caught later by the final filterBackburn() pass on results.
+  let _backburnSeenAdded = 0;
+  for (const id of _backburnIdx.ids) { if (id) { seenSet.add(String(id)); _backburnSeenAdded++; } }
+  console.log(`[AutoScan/Backburn] +${_backburnSeenAdded} backburn IDs added to seen-set (${_backburnIdx.names.size} names / ${_backburnIdx.domains.size} domains in final filter)`);
 
   let companyIds = [];
   let allUrns = new Set();
@@ -3956,6 +4195,14 @@ ${batchDataText}`;
       console.log(`[AutoScan] Merged results: ${companyCards.length} enriched + ${remaining.length} raw = ${allResults.length} total`);
     }
 
+    // Final backburn safety pass — covers anything that slipped past the ID-based seenSet
+    // (e.g. matched by domain or normalized name only).
+    const beforeBurnFinal = allResults.length;
+    allResults = filterBackburn(allResults);
+    if (beforeBurnFinal !== allResults.length) {
+      console.log(`[AutoScan/Backburn] Final filter dropped ${beforeBurnFinal - allResults.length} results`);
+    }
+
     return sendResult({
       results: allResults,
       analysis,
@@ -4690,6 +4937,7 @@ app.post('/api/signals/super/cancel', (req, res) => {
   if (!global._superSearchStatus) global._superSearchStatus = {};
   if (scanId && global._superSearchStatus[scanId]) {
     global._superSearchStatus[scanId].cancelled = true;
+    saveSuperStateDebounced();
     console.log(`[Super] Scan ${scanId} marked cancelled by user`);
     return res.json({ success: true, scanId, cancelled: true });
   }
@@ -4698,6 +4946,7 @@ app.post('/api/signals/super/cancel', (req, res) => {
   for (const [k, v] of Object.entries(global._superSearchStatus)) {
     if (v.status === 'scanning') { v.cancelled = true; count++; }
   }
+  saveSuperStateDebounced();
   res.json({ success: true, cancelledCount: count });
 });
 
@@ -4725,19 +4974,24 @@ app.post('/api/signals/super', async (req, res) => {
     res.write(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`);
     // Also update global status for reconnection
     if (!global._superSearchStatus) global._superSearchStatus = {};
-    global._superSearchStatus[scanId] = { status: 'scanning', progress: msg, stage: stage || null, startedAt: global._superSearchStatus[scanId]?.startedAt || Date.now() };
+    const prev = global._superSearchStatus[scanId] || {};
+    global._superSearchStatus[scanId] = { ...prev, status: 'scanning', progress: msg, stage: stage || prev.stage || null, startedAt: prev.startedAt || Date.now() };
+    saveSuperStateDebounced();
   };
-  const sendResult = (data) => { 
-    clearInterval(keepAlive); 
-    res.write(`data: ${JSON.stringify(data)}\n\n`); 
-    res.end();
-    // Store results in global status for reconnection
+  const sendResult = (data) => {
+    clearInterval(keepAlive);
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+    try { res.end(); } catch (e) {}
+    // Store results in global status for reconnection (and persist to disk)
     if (!global._superSearchStatus) global._superSearchStatus = {};
-    global._superSearchStatus[scanId] = { status: 'done', finishedAt: Date.now(), results: data };
+    const prev = global._superSearchStatus[scanId] || {};
+    global._superSearchStatus[scanId] = { ...prev, status: data.cancelled ? 'cancelled' : 'done', finishedAt: Date.now(), results: data };
+    saveSuperStateDebounced();
   };
   const startTime = Date.now();
   if (!global._superSearchStatus) global._superSearchStatus = {};
   global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false };
+  saveSuperStateDebounced();
   // Send scanId to frontend immediately so Cancel can target this scan
   res.write(`data: ${JSON.stringify({ scanId })}\n\n`);
 
@@ -5173,13 +5427,16 @@ app.post('/api/signals/super', async (req, res) => {
             }
           }
 
-          let added = 0, skippedByFunding = 0;
+          let added = 0, skippedByFunding = 0, skippedByBackburn = 0;
           for (const c of companies) {
             const cid = String(c.id || c.entity_id || '');
             const nameKey = (c.name || '').toLowerCase().trim();
             if (!cid || seenAnchorIds.has(cid) || seenAnchorIds.has(nameKey)) continue;
             seenAnchorIds.add(cid);
             seenAnchorIds.add(nameKey);
+
+            // Skip backburned companies — never surface them in any search
+            if (isBackburned(c)) { skippedByBackburn++; continue; }
 
             // Apply funding cap (deprioritize/exclude over-funded for sub-$250K checks)
             const fundingTotal = c.funding_total || 0;
@@ -5577,12 +5834,19 @@ ${'```'}`;
     // Dedupe by similar text
     sendProgress(`Filtering ${totalSignals} signals — deduplicating...`, 'filter', { total: totalSignals });
     const seen = new Set();
-    const deduped = allSignals.filter(s => {
+    let deduped = allSignals.filter(s => {
       const key = s.text.slice(0, 80).toLowerCase();
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
+    // Final backburn pass — catches signals from non-anchor sources (Twitter/PH/Farcaster/GH)
+    // that mention a backburned company by handle/url/name.
+    const beforeBurn = deduped.length;
+    deduped = filterBackburn(deduped);
+    if (beforeBurn !== deduped.length) {
+      console.log(`[Super/Backburn] Dropped ${beforeBurn - deduped.length} signals matching backburn (${deduped.length} remain)`);
+    }
 
     // Process ALL deduped signals through Sonnet in batches (no cap)
     sendProgress(`${deduped.length} unique signals — sorting by engagement...`, 'filter', { deduped: deduped.length });
@@ -6201,8 +6465,11 @@ app.get('/api/harmonic/saved-searches/:id/results', async (req, res) => {
       return null;
     }).filter(Boolean).slice(0, size);
 
-    const enriched = await gqlEnrichCompanies(companyIds, harmonicKey);
-    const companies = enriched.map(c => gqlToCard(c));
+    // Drop backburned IDs before paying GQL enrichment cost
+    const idsAfterBurn = companyIds.filter(id => !_backburnIdx.ids.has(String(id)));
+
+    const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
+    const companies = filterBackburn(enriched.map(c => gqlToCard(c)));
 
     res.json({
       companies,
@@ -6273,11 +6540,12 @@ app.post('/api/harmonic/enhanced-search', async (req, res) => {
     console.log(`[EnhSearch] Query: "${query.slice(0, 60)}" size=${maxSize}`);
 
     // Run enhanced search
-    const results = await enhancedSearch(query, harmonicKey, {
+    let results = await enhancedSearch(query, harmonicKey, {
       size: maxSize,
       keywords: keywords || null,
       antiKeywords: antiKeywords || null,
     });
+    results = filterBackburn(results);
 
     // Optionally save as Harmonic saved search
     let savedSearchId = null;
@@ -6762,6 +7030,12 @@ app.post('/api/airtable/update-stage', async (req, res) => {
     });
     if (!ur.ok) return res.json({ error: `Update error: ${ur.status}` });
     console.log(`[Airtable] Updated "${company}" → ${stage}`);
+    // Backburn-aware: warm the in-memory index instantly when a company moves into Backburn.
+    // Out-of-Backburn moves are caught by the 5-min periodic refresh — acceptable lag for a rare action.
+    if (stage === 'Backburn') {
+      addToBackburnIndex({ name: company, website: record.fields?.['Company Link'] || '', harmonic_id: record.fields?.['Harmonic ID'] || null });
+      setImmediate(() => { refreshBackburnIndex().catch(() => {}); });
+    }
     res.json({ success: true, company, stage });
   } catch (e) {
     res.json({ error: e.message });
@@ -8476,6 +8750,9 @@ app.post('/api/recurring-scan', async (req, res) => {
     const seenIds = new Set();
     const seenSet = new Set();
 
+    // Exclude backburned companies from import phase (cheapest — never enter the funnel)
+    for (const id of _backburnIdx.ids) { if (id) seenSet.add(String(id)); }
+
     // Only filter companies dismissed by THIS user, not all users
     try {
       const SEEN_FILE = path.join(SCAN_VOLUME, 'autoscan_seen.json');
@@ -8541,6 +8818,19 @@ app.post('/api/recurring-scan', async (req, res) => {
         } while (page < 50);
       } catch (e) {
         console.error(`[RecurringScan] Search "${searchName}" error:`, e.message);
+      }
+    }
+
+    // Backburn safety pass — drop anything matched by name/domain that slipped the ID seen-set
+    {
+      const beforeBurn = allCompanies.length;
+      for (let i = allCompanies.length - 1; i >= 0; i--) {
+        if (isBackburned(allCompanies[i])) allCompanies.splice(i, 1);
+      }
+      if (beforeBurn !== allCompanies.length) {
+        const dropped = beforeBurn - allCompanies.length;
+        console.log(`[RecurringScan/Backburn] Dropped ${dropped} backburned (${allCompanies.length} remain)`);
+        safeWrite(`: 🚫 Backburn filter removed ${dropped} companies\n\n`);
       }
     }
 
@@ -9128,11 +9418,13 @@ ${batchText}`;
     scan.stats.ddPushed = ddPushed;
 
     // Flatten card data into each result so frontend can access company.id, company.website etc directly
-    const flattenedResults = deepResults.map(r => {
+    let flattenedResults = deepResults.map(r => {
       if (!r.card) return r;
       const { card, ...rest } = r;
       return { ...card, ...rest, name: (rest.name || card.name || '').replace(/^\d+\.\s*/, ''), _score: r.score, score: r.score, confidence: r.confidence, analysis: r.analysis, _sourceSearch: r._sourceSearch };
     });
+    // Final backburn pass (defense-in-depth — covers Backburn flips mid-scan)
+    flattenedResults = filterBackburn(flattenedResults);
 
     const finalResults = {
       results: flattenedResults,
@@ -9812,6 +10104,9 @@ app.get('/api/reachouts/status', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Pigeon Finder API running on port ${PORT}`);
+
+  // Warm backburn index — non-blocking, retries on failure
+  refreshBackburnIndex().catch(e => console.error('[Backburn] initial refresh failed:', e.message));
 
   // Auto-reconnect saved credentials on startup
   if (reachoutsCredentials.gmail) {
