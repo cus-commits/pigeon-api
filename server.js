@@ -236,6 +236,77 @@ function filterBackburn(cards) {
 // Background refresh every 5 min (Airtable is the only externally-mutated source)
 setInterval(() => { refreshBackburnIndex().catch(e => console.error('[Backburn] periodic refresh error:', e.message)); }, 5 * 60 * 1000);
 
+// ───────── PER-USER HIDE-FOR-ME ─────────
+// User-scoped opt-out. Whereas Backburn removes a company for everyone, hide-for-me
+// only hides it from THAT user's future search results.
+// Stored separately from `autoscan_seen.json` (which is for dismissed scan candidates)
+// so the two semantics don't collide.
+const USER_HIDDEN_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'user_hidden.json');
+const _userHiddenCache = { data: null, loadedAt: 0 };
+function loadUserHidden() {
+  // 30-second cache — re-read on demand to pick up new hides without restart
+  if (_userHiddenCache.data && Date.now() - _userHiddenCache.loadedAt < 30 * 1000) return _userHiddenCache.data;
+  try {
+    if (fs.existsSync(USER_HIDDEN_FILE)) {
+      _userHiddenCache.data = JSON.parse(fs.readFileSync(USER_HIDDEN_FILE, 'utf8'));
+    } else {
+      _userHiddenCache.data = {};
+    }
+  } catch (e) {
+    console.error('[UserHidden] load error:', e.message);
+    _userHiddenCache.data = {};
+  }
+  _userHiddenCache.loadedAt = Date.now();
+  return _userHiddenCache.data;
+}
+function saveUserHidden(data) {
+  try { fs.writeFileSync(USER_HIDDEN_FILE, JSON.stringify(data)); _userHiddenCache.data = data; _userHiddenCache.loadedAt = Date.now(); }
+  catch (e) { console.error('[UserHidden] save error:', e.message); }
+}
+function buildUserHideIndex(personId) {
+  if (!personId) return null;
+  const all = loadUserHidden();
+  const entries = all[personId.toLowerCase()] || [];
+  const names = new Set(), domains = new Set(), ids = new Set();
+  for (const e of entries) {
+    const n = normalizeBackburnName(e.name); if (n) names.add(n);
+    const d = extractApexDomain(e.website || ''); if (d) domains.add(d);
+    const id = String(e.harmonic_id || '').trim(); if (id) ids.add(id);
+  }
+  return { names, domains, ids, count: entries.length };
+}
+function isHiddenForUser(card, hideIdx) {
+  if (!hideIdx || (hideIdx.names.size + hideIdx.domains.size + hideIdx.ids.size === 0)) return false;
+  const n = normalizeBackburnName(card.name || card.title || card.companyName);
+  if (n && hideIdx.names.has(n)) return true;
+  const site = card.website || card.url || card.domain || card.meta?.website || '';
+  const d = extractApexDomain(site);
+  if (d && hideIdx.domains.has(d)) return true;
+  let rawId = card.harmonic_id ?? card.id ?? card.harmonicId ?? null;
+  if (rawId != null) {
+    const idStr = String(rawId);
+    if (hideIdx.ids.has(idStr)) return true;
+    if (idStr.startsWith('hm-') && hideIdx.ids.has(idStr.slice(3))) return true;
+  }
+  return false;
+}
+function filterUserHidden(cards, hideIdx) {
+  if (!hideIdx || !Array.isArray(cards) || cards.length === 0) return cards || [];
+  if (hideIdx.names.size + hideIdx.domains.size + hideIdx.ids.size === 0) return cards;
+  const out = [];
+  let dropped = 0;
+  for (const c of cards) {
+    if (isHiddenForUser(c, hideIdx)) { dropped++; continue; }
+    out.push(c);
+  }
+  if (dropped > 0) console.log(`[UserHidden] Filtered ${dropped}/${cards.length} hidden for user`);
+  return out;
+}
+// Resolve personId from request: header `x-user-id` > query `personId` > body `personId`
+function resolvePersonId(req) {
+  return (req.headers['x-user-id'] || req.query.personId || req.body?.personId || '').toString().trim() || null;
+}
+
 // ───────── MERIT SCORING (5-dimension framework) ─────────
 // Spec: anchor is a SEARCH filter, not a scoring template. Score on absolute
 // investment merit: pedigree, traction, capital efficiency, investor quality,
@@ -1609,11 +1680,14 @@ app.get('/api/harmonic/similar/:id', async (req, res) => {
     
     if (rawResults.length === 0) return res.json({ companies: [], message: 'No similar companies found' });
 
+    const hideIdx = buildUserHideIndex(resolvePersonId(req));
+
     // Check if results are already full company objects (have name field)
     const alreadyFull = rawResults[0] && typeof rawResults[0] === 'object' && rawResults[0].name;
     if (alreadyFull) {
       console.log(`[Similar] Results already enriched, mapping ${rawResults.length} directly`);
-      const companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
+      let companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
+      companies = filterUserHidden(companies, hideIdx);
       return res.json({ companies });
     }
 
@@ -1628,13 +1702,15 @@ app.get('/api/harmonic/similar/:id', async (req, res) => {
 
     if (ids.length === 0) return res.json({ companies: [], message: 'No similar companies found' });
 
-    // Pre-filter by Harmonic ID before paying for GQL enrichment
-    const idsAfterBurn = ids.filter(id => !_backburnIdx.ids.has(String(id)));
-    if (idsAfterBurn.length < ids.length) console.log(`[Similar/Backburn] Dropped ${ids.length - idsAfterBurn.length} IDs pre-enrich`);
+    // Pre-filter by Harmonic ID before paying for GQL enrichment (backburn + per-user hide)
+    let idsAfterBurn = ids.filter(id => !_backburnIdx.ids.has(String(id)));
+    if (hideIdx) idsAfterBurn = idsAfterBurn.filter(id => !hideIdx.ids.has(String(id)));
+    if (idsAfterBurn.length < ids.length) console.log(`[Similar/Filter] Dropped ${ids.length - idsAfterBurn.length} IDs pre-enrich`);
 
     // Enrich via GraphQL
     const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
-    const companies = filterBackburn(enriched.map(c => gqlToCard(c)));
+    let companies = filterBackburn(enriched.map(c => gqlToCard(c)));
+    companies = filterUserHidden(companies, hideIdx);
     console.log(`[Similar] Enriched ${companies.length} companies`);
     res.json({ companies });
   } catch (e) {
@@ -1689,10 +1765,13 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
     console.log(`[FindSimilar] Raw results: ${rawResults.length}`);
     if (rawResults.length === 0) return res.json({ error: 'No similar companies found', companies: [] });
 
+    const hideIdx = buildUserHideIndex(resolvePersonId(req));
+
     // Check if already full objects
     const alreadyFull = rawResults[0] && typeof rawResults[0] === 'object' && rawResults[0].name;
     if (alreadyFull) {
-      const companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
+      let companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
+      companies = filterUserHidden(companies, hideIdx);
       console.log(`[FindSimilar] Already enriched: ${companies.length}`);
       return res.json({ companies, targetName: target.name });
     }
@@ -1706,13 +1785,15 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
 
     if (ids.length === 0) return res.json({ error: 'No similar companies found', companies: [] });
 
-    // Pre-filter by Harmonic ID before GQL enrichment cost
-    const idsAfterBurn = ids.filter(id => !_backburnIdx.ids.has(String(id)));
-    if (idsAfterBurn.length < ids.length) console.log(`[FindSimilar/Backburn] Dropped ${ids.length - idsAfterBurn.length} IDs pre-enrich`);
+    // Pre-filter by Harmonic ID before GQL enrichment (backburn + per-user hide)
+    let idsAfterBurn = ids.filter(id => !_backburnIdx.ids.has(String(id)));
+    if (hideIdx) idsAfterBurn = idsAfterBurn.filter(id => !hideIdx.ids.has(String(id)));
+    if (idsAfterBurn.length < ids.length) console.log(`[FindSimilar/Filter] Dropped ${ids.length - idsAfterBurn.length} IDs pre-enrich`);
 
     // Step 3: Enrich via GraphQL
     const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
-    const companies = filterBackburn(enriched.map(c => gqlToCard(c)));
+    let companies = filterBackburn(enriched.map(c => gqlToCard(c)));
+    companies = filterUserHidden(companies, hideIdx);
     console.log(`[FindSimilar] Enriched ${companies.length} similar to "${target.name}"`);
     res.json({ companies, targetName: target.name });
   } catch (e) {
@@ -2008,23 +2089,27 @@ app.post('/api/vetting/remove', (req, res) => {
 });
 
 // Backburn a company (mark as dismissed for ALL users, stays in data)
-app.post('/api/vetting/backburn', (req, res) => {
+// Backburn a company — works whether or not it's already in the DD pipeline.
+// Upserts to Airtable (CRM Stage = Backburn) so it's globally hidden across all search workflows.
+// Body: { companyName, personId, harmonicId?, website?, description?, sector? }
+app.post('/api/vetting/backburn', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { companyName, personId } = req.body;
+  const { companyName, personId, harmonicId, website, description, sector } = req.body;
   if (!companyName) return res.status(400).json({ error: 'companyName required' });
 
+  // 1. If in DD pipeline, remove. (Not an error if absent.)
   const data = loadVetting();
   const companyIdx = data.companies.findIndex(c => (c.name || '').toLowerCase() === companyName.toLowerCase());
-  if (companyIdx === -1) return res.status(404).json({ error: 'Company not found' });
+  let removed = null;
+  if (companyIdx !== -1) {
+    removed = data.companies.splice(companyIdx, 1)[0];
+    saveVetting(data);
+  }
 
-  // Fully remove from DD pipeline — backburn means gone for everyone
-  const removed = data.companies.splice(companyIdx, 1)[0];
-  saveVetting(data);
-
-  // Also mark as seen/dismissed so it doesn't re-import on future scans
+  // 2. Mark as seen for every partner so future per-user scans skip it
   try {
     const seenData = loadSeen();
-    const companyId = String(removed.id || removed.name);
+    const companyId = String((removed && (removed.id || removed.name)) || harmonicId || companyName);
     const PARTNERS = ['mark', 'joe', 'liam', 'carlo', 'jake'];
     PARTNERS.forEach(p => {
       const existing = new Set(seenData[p] || []);
@@ -2034,17 +2119,109 @@ app.post('/api/vetting/backburn', (req, res) => {
     saveSeen(seenData);
   } catch (e) {}
 
-  // Persist to backburn registry so all future searches filter this company out
-  recordBackburn({
-    name: removed.name,
-    harmonic_id: removed.harmonic_id || removed.id,
-    website: removed.website || removed.url || '',
+  // 3. Persist to local backburn registry + warm in-memory index synchronously
+  const payload = {
+    name: (removed && removed.name) || companyName,
+    harmonic_id: (removed && (removed.harmonic_id || removed.id)) || harmonicId || null,
+    website: (removed && (removed.website || removed.url)) || website || '',
     source: 'vetting/backburn',
     backburnedBy: personId || null,
-  });
+  };
+  recordBackburn(payload);
 
-  console.log(`[Vetting] "${companyName}" backburned + removed from DD by ${personId || 'unknown'}`);
-  res.json({ success: true, removed: true });
+  // 4. Upsert to Airtable as CRM Stage = "Backburn" (source-of-truth for partner-facing CRM)
+  let airtableStatus = 'skipped';
+  try {
+    const hdrs = airtableHeaders();
+    const baseId = process.env.AIRTABLE_BASE_ID;
+    if (hdrs && baseId) {
+      const formula = encodeURIComponent(`{Company} = "${companyName.replace(/"/g, '\\"')}"`);
+      const findUrl = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=1`;
+      const findRes = await fetch(findUrl, { headers: hdrs });
+      const findData = findRes.ok ? await findRes.json() : { records: [] };
+      const existing = (findData.records || [])[0];
+      if (existing) {
+        // PATCH stage
+        const patchRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${existing.id}`, {
+          method: 'PATCH', headers: hdrs,
+          body: JSON.stringify({ fields: { 'CRM Stage': 'Backburn' } }),
+        });
+        airtableStatus = patchRes.ok ? 'patched' : `patch_failed_${patchRes.status}`;
+      } else {
+        // Create as Backburn
+        const fields = {
+          'Company': companyName,
+          'CRM Stage': 'Backburn',
+          'Source': 'Pigeon Finder',
+        };
+        if (website) fields['Company Link'] = website;
+        if (sector) fields['Sector'] = sector;
+        if (description) fields['Original Notes + Ongoing Negotiation Notes'] = (description || '').slice(0, 500);
+        if (harmonicId) fields['Harmonic ID'] = String(harmonicId);
+        const createRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}`, {
+          method: 'POST', headers: hdrs,
+          body: JSON.stringify({ fields }),
+        });
+        airtableStatus = createRes.ok ? 'created' : `create_failed_${createRes.status}`;
+      }
+    }
+  } catch (e) {
+    console.error('[Vetting/backburn] Airtable upsert error:', e.message);
+    airtableStatus = `error: ${e.message}`;
+  }
+
+  console.log(`[Vetting] "${companyName}" backburned (removed_from_dd: ${!!removed}, airtable: ${airtableStatus}) by ${personId || 'unknown'}`);
+  res.json({ success: true, removed: !!removed, airtable: airtableStatus });
+});
+
+// Hide a company from a specific user's FUTURE SEARCH RESULTS only.
+// Distinct from `/api/vetting/hide` (DD-pipeline-scoped) — this works for any company.
+// Body: { companyName, personId, harmonicId?, website? }
+app.post('/api/hide-for-user', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { companyName, personId, harmonicId, website } = req.body;
+  if (!companyName || !personId) return res.status(400).json({ error: 'companyName and personId required' });
+  const all = loadUserHidden();
+  const key = personId.toLowerCase();
+  if (!all[key]) all[key] = [];
+  // Dedupe by normalized name + harmonic_id
+  const nameKey = normalizeBackburnName(companyName);
+  const exists = all[key].find(e => normalizeBackburnName(e.name) === nameKey);
+  if (!exists) {
+    all[key].push({
+      name: companyName,
+      harmonic_id: harmonicId || null,
+      website: website || '',
+      hiddenAt: Date.now(),
+    });
+    // Cap per-user list at 5000 to bound memory
+    if (all[key].length > 5000) all[key] = all[key].slice(-5000);
+    saveUserHidden(all);
+  }
+  console.log(`[HideForUser] ${personId}: "${companyName}" (total: ${all[key].length})`);
+  res.json({ success: true, total: all[key].length });
+});
+
+app.post('/api/unhide-for-user', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { companyName, personId } = req.body;
+  if (!companyName || !personId) return res.status(400).json({ error: 'companyName and personId required' });
+  const all = loadUserHidden();
+  const key = personId.toLowerCase();
+  if (all[key]) {
+    const nameKey = normalizeBackburnName(companyName);
+    all[key] = all[key].filter(e => normalizeBackburnName(e.name) !== nameKey);
+    saveUserHidden(all);
+  }
+  res.json({ success: true });
+});
+
+app.get('/api/hide-for-user', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const personId = (req.query.personId || '').toString().toLowerCase();
+  if (!personId) return res.status(400).json({ error: 'personId required' });
+  const all = loadUserHidden();
+  res.json({ companies: all[personId] || [], total: (all[personId] || []).length });
 });
 
 // Hide a company for a specific user only (doesn't affect others)
@@ -2850,11 +3027,13 @@ app.post('/api/deep-search', async (req, res) => {
       sendProgress(`Found ${allSimilar.length} similar companies so far...`, 'import', 15);
     }
 
-    // Drop backburned companies before AI pre-screen — saves token spend and prevents them from ever ranking
+    // Drop backburned companies AND per-user-hidden before AI pre-screen — saves token spend
     const beforeBurn = allSimilar.length;
     allSimilar = filterBackburn(allSimilar);
+    const deepHideIdx = buildUserHideIndex(resolvePersonId(req));
+    allSimilar = filterUserHidden(allSimilar, deepHideIdx);
     if (beforeBurn !== allSimilar.length) {
-      console.log(`[DeepSearch/Backburn] Dropped ${beforeBurn - allSimilar.length} backburned (${allSimilar.length} remain)`);
+      console.log(`[DeepSearch/Filter] Dropped ${beforeBurn - allSimilar.length} (backburn+user-hide), ${allSimilar.length} remain`);
     }
 
     console.log(`[DeepSearch] Collected ${allSimilar.length} unique similar companies`);
@@ -3183,6 +3362,14 @@ app.post('/api/autoscan', async (req, res) => {
   for (const id of _backburnIdx.ids) { if (id) { seenSet.add(String(id)); _backburnSeenAdded++; } }
   console.log(`[AutoScan/Backburn] +${_backburnSeenAdded} backburn IDs added to seen-set (${_backburnIdx.names.size} names / ${_backburnIdx.domains.size} domains in final filter)`);
 
+  // Per-user hide-for-me list — same treatment as backburn
+  const _autoscanHideIdx = buildUserHideIndex(personId);
+  if (_autoscanHideIdx) {
+    let _userHideSeenAdded = 0;
+    for (const id of _autoscanHideIdx.ids) { if (id) { seenSet.add(String(id)); _userHideSeenAdded++; } }
+    console.log(`[AutoScan/UserHide] +${_userHideSeenAdded} per-user hidden IDs added to seen-set`);
+  }
+
   let companyIds = [];
   let allUrns = new Set();
   let queries = [];
@@ -3233,6 +3420,17 @@ app.post('/api/autoscan', async (req, res) => {
       _isStealth: (c.name || '').toLowerCase().startsWith('stealth company'),
     }));
     
+    // Early backburn + per-user hide filter — drop before Sonnet pre-screen pays for the tokens.
+    // ID-based seenSet covers most cases; this catches name/domain-only matches.
+    const _beforeBurnRaw = rawCards.length;
+    let _filteredBurn = filterBackburn(rawCards);
+    _filteredBurn = filterUserHidden(_filteredBurn, _autoscanHideIdx);
+    if (_filteredBurn.length < _beforeBurnRaw) {
+      safeWrite(`: 🚫 Filter removed ${_beforeBurnRaw - _filteredBurn.length} (backburn+hide) before screening\n\n`);
+    }
+    rawCards.length = 0;
+    rawCards.push(..._filteredBurn);
+
     // Save all raw cards for progressive browsing (before any filtering)
     allRawCards = [...rawCards];
 
@@ -3524,6 +3722,15 @@ ${batchText}`;
 
   // === PRE-FILTER: Apply hard criteria before sending to Opus ===
   let preFiltered = filteredCompanies;
+
+  // Backburn + per-user hide early-cut — before VC/anti-keyword/Opus. Same defense-in-depth.
+  const _beforeBurnPre = preFiltered.length;
+  preFiltered = filterBackburn(preFiltered);
+  preFiltered = filterUserHidden(preFiltered, _autoscanHideIdx);
+  if (preFiltered.length < _beforeBurnPre) {
+    safeWrite(`: 🚫 Filter cut ${_beforeBurnPre - preFiltered.length} (backburn+hide) before scoring\n\n`);
+  }
+
   const antiKeywords = (profile.antiKeywords || '').split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
   
   // Hard exclusion: VC firms, investment funds, hedge funds (not investable startups)
@@ -4195,12 +4402,13 @@ ${batchDataText}`;
       console.log(`[AutoScan] Merged results: ${companyCards.length} enriched + ${remaining.length} raw = ${allResults.length} total`);
     }
 
-    // Final backburn safety pass — covers anything that slipped past the ID-based seenSet
-    // (e.g. matched by domain or normalized name only).
+    // Final backburn + per-user hide safety pass — covers anything that slipped past
+    // the ID-based seenSet (e.g. matched by domain or normalized name only).
     const beforeBurnFinal = allResults.length;
     allResults = filterBackburn(allResults);
+    allResults = filterUserHidden(allResults, _autoscanHideIdx);
     if (beforeBurnFinal !== allResults.length) {
-      console.log(`[AutoScan/Backburn] Final filter dropped ${beforeBurnFinal - allResults.length} results`);
+      console.log(`[AutoScan/Filter] Final pass dropped ${beforeBurnFinal - allResults.length} results (backburn+user-hide)`);
     }
 
     return sendResult({
@@ -5382,6 +5590,7 @@ app.post('/api/signals/super', async (req, res) => {
       sendProgress('Fetching anchor companies (baselines/portfolio)...', 'import', { source: 'anchors' });
       const harmonicHeaders = { apikey: harmonicKey };
       const seenAnchorIds = new Set();
+      const _anchorHideIdx = buildUserHideIndex(resolvePersonId(req));
 
       // Determine fetch sizes based on importance (0-100 scale)
       // Importance 50 = ~50 similar, 100 = ~100 similar, 10 = ~10 similar
@@ -5437,6 +5646,8 @@ app.post('/api/signals/super', async (req, res) => {
 
             // Skip backburned companies — never surface them in any search
             if (isBackburned(c)) { skippedByBackburn++; continue; }
+            // Skip per-user hidden
+            if (isHiddenForUser(c, _anchorHideIdx)) { skippedByBackburn++; continue; }
 
             // Apply funding cap (deprioritize/exclude over-funded for sub-$250K checks)
             const fundingTotal = c.funding_total || 0;
@@ -5840,12 +6051,13 @@ ${'```'}`;
       seen.add(key);
       return true;
     });
-    // Final backburn pass — catches signals from non-anchor sources (Twitter/PH/Farcaster/GH)
-    // that mention a backburned company by handle/url/name.
+    // Final backburn + per-user-hide pass — catches signals from non-anchor sources (Twitter/PH/Farcaster/GH)
     const beforeBurn = deduped.length;
     deduped = filterBackburn(deduped);
+    const _superHideIdx = buildUserHideIndex(resolvePersonId(req));
+    deduped = filterUserHidden(deduped, _superHideIdx);
     if (beforeBurn !== deduped.length) {
-      console.log(`[Super/Backburn] Dropped ${beforeBurn - deduped.length} signals matching backburn (${deduped.length} remain)`);
+      console.log(`[Super/Filter] Dropped ${beforeBurn - deduped.length} signals (backburn+user-hide), ${deduped.length} remain`);
     }
 
     // Process ALL deduped signals through Sonnet in batches (no cap)
@@ -6465,11 +6677,15 @@ app.get('/api/harmonic/saved-searches/:id/results', async (req, res) => {
       return null;
     }).filter(Boolean).slice(0, size);
 
-    // Drop backburned IDs before paying GQL enrichment cost
-    const idsAfterBurn = companyIds.filter(id => !_backburnIdx.ids.has(String(id)));
+    const hideIdx = buildUserHideIndex(resolvePersonId(req));
+
+    // Drop backburned (+ per-user hidden) IDs before paying GQL enrichment cost
+    let idsAfterBurn = companyIds.filter(id => !_backburnIdx.ids.has(String(id)));
+    if (hideIdx) idsAfterBurn = idsAfterBurn.filter(id => !hideIdx.ids.has(String(id)));
 
     const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
-    const companies = filterBackburn(enriched.map(c => gqlToCard(c)));
+    let companies = filterBackburn(enriched.map(c => gqlToCard(c)));
+    companies = filterUserHidden(companies, hideIdx);
 
     res.json({
       companies,
@@ -6546,6 +6762,7 @@ app.post('/api/harmonic/enhanced-search', async (req, res) => {
       antiKeywords: antiKeywords || null,
     });
     results = filterBackburn(results);
+    results = filterUserHidden(results, buildUserHideIndex(resolvePersonId(req)));
 
     // Optionally save as Harmonic saved search
     let savedSearchId = null;
@@ -8752,6 +8969,11 @@ app.post('/api/recurring-scan', async (req, res) => {
 
     // Exclude backburned companies from import phase (cheapest — never enter the funnel)
     for (const id of _backburnIdx.ids) { if (id) seenSet.add(String(id)); }
+    // Per-user hide-for-me
+    const _recurringHideIdx = buildUserHideIndex((scanUser || '').toLowerCase());
+    if (_recurringHideIdx) {
+      for (const id of _recurringHideIdx.ids) { if (id) seenSet.add(String(id)); }
+    }
 
     // Only filter companies dismissed by THIS user, not all users
     try {
@@ -8821,16 +9043,16 @@ app.post('/api/recurring-scan', async (req, res) => {
       }
     }
 
-    // Backburn safety pass — drop anything matched by name/domain that slipped the ID seen-set
+    // Backburn + per-user hide safety pass — drop anything matched by name/domain that slipped the ID seen-set
     {
       const beforeBurn = allCompanies.length;
       for (let i = allCompanies.length - 1; i >= 0; i--) {
-        if (isBackburned(allCompanies[i])) allCompanies.splice(i, 1);
+        if (isBackburned(allCompanies[i]) || isHiddenForUser(allCompanies[i], _recurringHideIdx)) allCompanies.splice(i, 1);
       }
       if (beforeBurn !== allCompanies.length) {
         const dropped = beforeBurn - allCompanies.length;
-        console.log(`[RecurringScan/Backburn] Dropped ${dropped} backburned (${allCompanies.length} remain)`);
-        safeWrite(`: 🚫 Backburn filter removed ${dropped} companies\n\n`);
+        console.log(`[RecurringScan/Filter] Dropped ${dropped} (backburn+user-hide), ${allCompanies.length} remain`);
+        safeWrite(`: 🚫 Filter removed ${dropped} companies (backburn + hide)\n\n`);
       }
     }
 
@@ -9423,8 +9645,9 @@ ${batchText}`;
       const { card, ...rest } = r;
       return { ...card, ...rest, name: (rest.name || card.name || '').replace(/^\d+\.\s*/, ''), _score: r.score, score: r.score, confidence: r.confidence, analysis: r.analysis, _sourceSearch: r._sourceSearch };
     });
-    // Final backburn pass (defense-in-depth — covers Backburn flips mid-scan)
+    // Final backburn + per-user-hide pass (defense-in-depth — covers Backburn/hide flips mid-scan)
     flattenedResults = filterBackburn(flattenedResults);
+    flattenedResults = filterUserHidden(flattenedResults, _recurringHideIdx);
 
     const finalResults = {
       results: flattenedResults,
