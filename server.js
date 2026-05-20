@@ -796,7 +796,7 @@ Keep responses mobile-friendly — short paragraphs, no walls of text. Lead with
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-harmonic-key', 'x-anthropic-key', 'x-scan-tier'],
+  allowedHeaders: ['Content-Type', 'x-harmonic-key', 'x-anthropic-key', 'x-scan-tier', 'x-user-id'],
 }));
 app.use(express.json({ limit: '5mb' }));
 
@@ -5212,7 +5212,7 @@ app.post('/api/signals/super', async (req, res) => {
 
     console.log('[Super] Anthropic key source:', _hdrKey.startsWith('sk-') ? 'header' : 'env', '| key starts:', (anthropicKey || '').slice(0, 8) + '...');
 
-    const {
+    let {
       sectors = [],
       chains = [],
       sources = ['twitter', 'farcaster', 'github', 'harmonic'],
@@ -5233,6 +5233,16 @@ app.post('/api/signals/super', async (req, res) => {
       additionalInfo = '',        // freeform extra context
       fundingFilter = 'auto',     // 'under_2m' | 'under_10m' | 'under_25m' | 'all' | 'auto'
     } = req.body;
+    // Defensive coercion — destructure defaults only apply for `undefined`, not for `null` or
+    // wrong-shaped values (object/string). Stale localStorage saved-searches or partial
+    // payloads have been observed sending these as null → crash on spread/.includes/.length.
+    if (!Array.isArray(sectors)) sectors = [];
+    if (!Array.isArray(chains)) chains = [];
+    if (!Array.isArray(sources) || sources.length === 0) sources = ['twitter', 'farcaster', 'github', 'harmonic'];
+    if (!Array.isArray(stage)) stage = [];
+    if (!Array.isArray(baselines)) baselines = [];
+    if (!Array.isArray(crmStages)) crmStages = [];
+    if (!Array.isArray(portfolioCompanies)) portfolioCompanies = [];
     // Auto: under_10m when any anchor present, else 'all'
     const effectiveFundingFilter = fundingFilter === 'auto'
       ? (baselines.length > 0 || portfolioCompanies.length > 0 ? 'under_10m' : 'all')
