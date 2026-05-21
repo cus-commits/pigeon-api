@@ -2094,7 +2094,9 @@ app.post('/api/vetting/remove', (req, res) => {
 // Body: { companyName, personId, harmonicId?, website?, description?, sector? }
 app.post('/api/vetting/backburn', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const { companyName, personId, harmonicId, website, description, sector } = req.body;
+  try {
+  const body = req.body || {};
+  const { companyName, personId, harmonicId, website, description, sector } = body;
   if (!companyName) return res.status(400).json({ error: 'companyName required' });
 
   // 1. If in DD pipeline, remove. (Not an error if absent.)
@@ -2172,6 +2174,10 @@ app.post('/api/vetting/backburn', async (req, res) => {
 
   console.log(`[Vetting] "${companyName}" backburned (removed_from_dd: ${!!removed}, airtable: ${airtableStatus}) by ${personId || 'unknown'}`);
   res.json({ success: true, removed: !!removed, airtable: airtableStatus });
+  } catch (e) {
+    console.error('[Vetting/backburn] Unhandled error:', e.message, e.stack?.slice(0, 500));
+    if (!res.headersSent) res.status(500).json({ error: e.message || 'backburn failed' });
+  }
 });
 
 // Hide a company from a specific user's FUTURE SEARCH RESULTS only.
@@ -5171,15 +5177,17 @@ app.post('/api/signals/super', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
   const scanId = (req.body && req.body.scanId) || ('super_' + Date.now());
   // Track client connection — scan continues server-side even if client drops
   let clientConnected = true;
-  req.on('close', () => { clientConnected = false; });
+  req.on('close', () => { clientConnected = false; clearInterval(keepAlive); });
+  // Guarded write — swallows ERR_STREAM_WRITE_AFTER_END after client disconnects
+  const safeWrite = (data) => { if (!clientConnected) return; try { res.write(data); } catch (e) { clientConnected = false; } };
+  const keepAlive = setInterval(() => { safeWrite(': keepalive\n\n'); }, 5000);
   // Helper: check if this scan was cancelled (called between expensive operations)
   const isCancelled = () => !!(global._superSearchStatus?.[scanId]?.cancelled);
-  const sendProgress = (msg, stage, meta) => { 
-    res.write(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`);
+  const sendProgress = (msg, stage, meta) => {
+    safeWrite(`data: ${JSON.stringify({ progress: msg, stage: stage || null, meta: meta || null })}\n\n`);
     // Also update global status for reconnection
     if (!global._superSearchStatus) global._superSearchStatus = {};
     const prev = global._superSearchStatus[scanId] || {};
@@ -5243,6 +5251,14 @@ app.post('/api/signals/super', async (req, res) => {
     if (!Array.isArray(baselines)) baselines = [];
     if (!Array.isArray(crmStages)) crmStages = [];
     if (!Array.isArray(portfolioCompanies)) portfolioCompanies = [];
+    // String fields — destructure defaults also don't trigger on null, so a stale payload
+    // sending customKeywords: null hits `null.trim()` → crash with SSE error "Cannot read
+    // properties of null (reading 'trim')". This is why Super Search "silently fails".
+    if (typeof customKeywords !== 'string') customKeywords = '';
+    if (typeof additionalInfo !== 'string') additionalInfo = '';
+    if (typeof superTier !== 'string') superTier = 'sonnet';
+    if (typeof timeRange !== 'string') timeRange = 'week';
+    if (typeof fundingFilter !== 'string') fundingFilter = 'auto';
     // Auto: under_10m when any anchor present, else 'all'
     const effectiveFundingFilter = fundingFilter === 'auto'
       ? (baselines.length > 0 || portfolioCompanies.length > 0 ? 'under_10m' : 'all')
@@ -8813,6 +8829,7 @@ app.post('/api/recurring-scan', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders(); // CRITICAL — without this, Railway's proxy buffers the SSE stream
 
   let clientConnected = true;
   req.on('close', () => { clientConnected = false; });
