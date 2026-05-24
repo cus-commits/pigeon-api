@@ -4456,8 +4456,21 @@ app.post('/api/signals/github', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
-  const sendResult = (data) => { clearInterval(keepAlive); res.write(`data: ${JSON.stringify(data)}\n\n`); res.end(); };
+  // Guarded keepalive — without this, writing to a closed socket after client
+  // disconnect can crash the Node process (no global uncaughtException handler).
+  let _ssConnected = true;
+  const keepAlive = setInterval(() => {
+    if (!_ssConnected) return;
+    try { res.write(': keepalive\n\n'); } catch (e) { _ssConnected = false; clearInterval(keepAlive); }
+  }, 5000);
+  req.on('close', () => { _ssConnected = false; clearInterval(keepAlive); });
+  const sendResult = (data) => {
+    clearInterval(keepAlive);
+    if (_ssConnected) {
+      try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+      try { res.end(); } catch (e) {}
+    }
+  };
 
   try {
     const ghToken = process.env.GITHUB_TOKEN;
@@ -4671,8 +4684,21 @@ app.post('/api/signals/farcaster', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
-  const sendResult = (data) => { clearInterval(keepAlive); res.write(`data: ${JSON.stringify(data)}\n\n`); res.end(); };
+  // Guarded keepalive — without this, writing to a closed socket after client
+  // disconnect can crash the Node process (no global uncaughtException handler).
+  let _ssConnected = true;
+  const keepAlive = setInterval(() => {
+    if (!_ssConnected) return;
+    try { res.write(': keepalive\n\n'); } catch (e) { _ssConnected = false; clearInterval(keepAlive); }
+  }, 5000);
+  req.on('close', () => { _ssConnected = false; clearInterval(keepAlive); });
+  const sendResult = (data) => {
+    clearInterval(keepAlive);
+    if (_ssConnected) {
+      try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+      try { res.end(); } catch (e) {}
+    }
+  };
 
   try {
     const neynarKey = process.env.NEYNAR_API_KEY;
@@ -4902,8 +4928,21 @@ app.post('/api/signals/twitter', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
-  const sendResult = (data) => { clearInterval(keepAlive); res.write(`data: ${JSON.stringify(data)}\n\n`); res.end(); };
+  // Guarded keepalive — without this, writing to a closed socket after client
+  // disconnect can crash the Node process (no global uncaughtException handler).
+  let _ssConnected = true;
+  const keepAlive = setInterval(() => {
+    if (!_ssConnected) return;
+    try { res.write(': keepalive\n\n'); } catch (e) { _ssConnected = false; clearInterval(keepAlive); }
+  }, 5000);
+  req.on('close', () => { _ssConnected = false; clearInterval(keepAlive); });
+  const sendResult = (data) => {
+    clearInterval(keepAlive);
+    if (_ssConnected) {
+      try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+      try { res.end(); } catch (e) {}
+    }
+  };
 
   try {
     const rapidApiKey = process.env.RAPIDAPI_KEY;
@@ -5981,7 +6020,10 @@ ${'```'}`;
       const hKws = uniqueKeywords.slice(0, 6);
       for (const kw of hKws) {
         try {
-          const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(kw + ' crypto startup')}&size=15`;
+          // Don't hardcode "crypto startup" — that killed every non-crypto scan
+          // (aerospace, defense, fintech, etc) by appending it to the Harmonic query.
+          // Use the user's keyword verbatim; sector/anchor context already filters.
+          const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(kw)}&size=15`;
           console.log('[Super] Harmonic search:', kw);
           const r = await fetch(searchUrl, {
             headers: harmonicHeaders,
@@ -6776,8 +6818,21 @@ app.post('/api/harmonic/enhanced-search', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const keepAlive = setInterval(() => { res.write(': keepalive\n\n'); }, 5000);
-  const sendResult = (data) => { clearInterval(keepAlive); res.write(`data: ${JSON.stringify(data)}\n\n`); res.end(); };
+  // Guarded keepalive — without this, writing to a closed socket after client
+  // disconnect can crash the Node process (no global uncaughtException handler).
+  let _ssConnected = true;
+  const keepAlive = setInterval(() => {
+    if (!_ssConnected) return;
+    try { res.write(': keepalive\n\n'); } catch (e) { _ssConnected = false; clearInterval(keepAlive); }
+  }, 5000);
+  req.on('close', () => { _ssConnected = false; clearInterval(keepAlive); });
+  const sendResult = (data) => {
+    clearInterval(keepAlive);
+    if (_ssConnected) {
+      try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+      try { res.end(); } catch (e) {}
+    }
+  };
 
   const harmonicKey = req.headers['x-harmonic-key'] || process.env.HARMONIC_API_KEY;
   const anthropicKey = req.headers['x-anthropic-key'] || process.env.ANTHROPIC_API_KEY;
