@@ -6068,11 +6068,20 @@ ${'```'}`;
       return sendResult({ signals: [], analysis: null, sourceStats, totalSignals: 0, error: 'No signals found. Try broader topics or enable more sources.' });
     }
 
-    // Dedupe by similar text
+    // Dedupe by stable identifier, falling back to text only when no id/url/title exists.
+    // Text-prefix-only dedupe (the old way) collapsed Jake's 757 Farcaster signals + many
+    // Harmonic cards with empty descriptions down to 4 visible results — the prefix was
+    // identical across legitimately distinct signals.
     sendProgress(`Filtering ${totalSignals} signals — deduplicating...`, 'filter', { total: totalSignals });
     const seen = new Set();
     let deduped = allSignals.filter(s => {
-      const key = s.text.slice(0, 80).toLowerCase();
+      const idKey = s.id ? `id:${s.id}` : null;
+      const urlKey = s.url ? `url:${(s.url || '').toLowerCase().replace(/[?#].*$/, '')}` : null;
+      const titleKey = s.title ? `title:${(s.title || '').toLowerCase().trim()}` : null;
+      const textKey = (s.text || '').slice(0, 80).toLowerCase().trim();
+      // Pick the strongest key available — id > url > title > text. Empty text falls back
+      // to a per-row unique sentinel so blank-description signals don't collapse to one.
+      const key = idKey || urlKey || titleKey || (textKey || `nokey:${Math.random()}`);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -6169,12 +6178,12 @@ Description: ${(a.description || '').slice(0, 600)}`;
       sendProgress(`Screening ${forClaude.length} signals with Sonnet (${totalBatches} batch${totalBatches > 1 ? 'es' : ''})...`, 'screen', { total: forClaude.length, batches: totalBatches });
 
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+        const batchStart = batchIdx * BATCH_SIZE;
         if (isCancelled()) {
           clearInterval(keepAlive);
           console.log(`[Super] Cancelled during Sonnet screening (batch ${batchIdx}/${totalBatches})`);
-          return sendResult({ error: 'Cancelled by user', cancelled: true, signals: forClaude.slice(0, batchStart || 0), totalSignals });
+          return sendResult({ error: 'Cancelled by user', cancelled: true, signals: forClaude.slice(0, batchStart), totalSignals });
         }
-        const batchStart = batchIdx * BATCH_SIZE;
         const batch = forClaude.slice(batchStart, batchStart + BATCH_SIZE);
 
         sendProgress(`Sonnet batch ${batchIdx + 1}/${totalBatches} — ${Object.keys(allRatings).length} rated, ${totalHigh} HIGH so far`, 'screen', {
