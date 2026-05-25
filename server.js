@@ -7435,19 +7435,73 @@ app.post('/api/airtable/dedupe', async (req, res) => {
         + (f['Original Notes + Ongoing Negotiation Notes'] ? 1 : 0);
     };
 
+    // Fields we'll merge: union for arrays (votes!), prefer non-empty for scalars.
+    // This way, even when records have EQUAL scores, no data is lost — votes from
+    // the deleted record get unioned into the keeper's votes.
+    const SCALAR_FIELDS = ['Company Link', 'Twitter Link', 'CB Link', 'Harmonic ID', 'Total Funding', 'Initial Rating', 'Sector', 'Source', 'Initial Reachout Notes', 'Original Notes + Ongoing Negotiation Notes', 'Intro Call Notes'];
+
     const plan = [];
-    let deleted = 0;
+    let deleted = 0, merged = 0;
     for (const [key, recs] of dupGroups) {
       recs.sort((a, b) => score(b) - score(a));
       const keep = recs[0];
       const toDelete = recs.slice(1);
+
+      // Union votes across all records into the keeper.
+      const keepFields = keep.fields || {};
+      const allVotes = new Set(Array.isArray(keepFields['IN or OUT']) ? keepFields['IN or OUT'] : []);
+      const mergeUpdates = {};
+      for (const r of toDelete) {
+        const f = r.fields || {};
+        if (Array.isArray(f['IN or OUT'])) {
+          for (const v of f['IN or OUT']) allVotes.add(v);
+        }
+        for (const sf of SCALAR_FIELDS) {
+          if (!keepFields[sf] && f[sf] && !mergeUpdates[sf]) mergeUpdates[sf] = f[sf];
+        }
+      }
+      const keeperVotesBefore = (keepFields['IN or OUT'] || []).length;
+      if (allVotes.size > keeperVotesBefore) mergeUpdates['IN or OUT'] = [...allVotes];
+
+      // KEEP the highest-stage if any duplicate has progressed further than the keeper.
+      // Stage order: BORO-SM > BORO > BO > Warm > Backburn > '' (we don't promote OUT of Backburn).
+      const STAGE_RANK = { 'BORO-SM': 5, 'BORO': 4, 'BO': 3, 'Warm': 2, 'Backburn': 1 };
+      const keepStage = keepFields['CRM Stage'] || '';
+      let bestStage = keepStage;
+      let bestRank = STAGE_RANK[keepStage] || 0;
+      for (const r of toDelete) {
+        const s = (r.fields || {})['CRM Stage'] || '';
+        const rank = STAGE_RANK[s] || 0;
+        // Don't auto-promote OUT of Backburn — that's a deliberate user action
+        if (rank > bestRank && keepStage !== 'Backburn') { bestStage = s; bestRank = rank; }
+      }
+      if (bestStage !== keepStage) mergeUpdates['CRM Stage'] = bestStage;
+
       plan.push({
         name: keep.fields.Company,
         keep: keep.id,
         keepScore: score(keep),
         delete: toDelete.map(r => ({ id: r.id, score: score(r) })),
+        votesUnioned: [...allVotes],
+        votesBefore: keeperVotesBefore,
+        votesAfter: allVotes.size,
+        fieldsBackfilled: Object.keys(mergeUpdates).filter(k => k !== 'IN or OUT' && k !== 'CRM Stage'),
+        stageChange: mergeUpdates['CRM Stage'] ? `${keepStage} → ${mergeUpdates['CRM Stage']}` : null,
       });
+
       if (!dryRun) {
+        // 1. PATCH the keeper with merged data
+        if (Object.keys(mergeUpdates).length > 0) {
+          try {
+            const mr = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${keep.id}`, {
+              method: 'PATCH', headers: hdrs,
+              body: JSON.stringify({ fields: mergeUpdates }),
+            });
+            if (mr.ok) merged++;
+            else console.error(`[Dedupe] merge PATCH failed for ${keep.id}: ${mr.status}`);
+          } catch (e) { console.error('[Dedupe] merge error:', e.message); }
+        }
+        // 2. DELETE the duplicates
         for (const r of toDelete) {
           try {
             const dr = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${r.id}`, { method: 'DELETE', headers: hdrs });
@@ -7462,6 +7516,7 @@ app.post('/api/airtable/dedupe', async (req, res) => {
       dryRun,
       totalRecords: all.length,
       duplicateGroups: dupGroups.length,
+      merged: dryRun ? 0 : merged,
       deleted: dryRun ? 0 : deleted,
       plan,
     });
