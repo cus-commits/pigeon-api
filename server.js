@@ -5521,7 +5521,12 @@ app.post('/api/signals/super', async (req, res) => {
   };
   const startTime = Date.now();
   if (!global._superSearchStatus) global._superSearchStatus = {};
-  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false };
+  // Persist tier so recovery on page reload can restore ETA + cost display correctly.
+  // Without this, frontend's superTier resets to its useState default ('opus20') and the
+  // ETA calculation uses the wrong tier ceiling → "0 min remaining" forever for any
+  // scan whose elapsed > 5 min. Read directly from req.body since destructure hasn't run yet.
+  const _initialTier = (req.body && typeof req.body.superTier === 'string') ? req.body.superTier : 'sonnet';
+  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false, tier: _initialTier };
   saveSuperStateDebounced();
   // Send scanId to frontend immediately so Cancel can target this scan
   res.write(`data: ${JSON.stringify({ scanId })}\n\n`);
