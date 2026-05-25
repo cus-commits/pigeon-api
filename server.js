@@ -5192,6 +5192,27 @@ app.post('/api/signals/twitter', async (req, res) => {
 // Super Search status tracking
 if (!global._superSearchStatus) global._superSearchStatus = {};
 
+// ───── PER-USER SCAN OWNERSHIP ─────
+// Each Super Search is tagged with the requester's user id (from x-user-id header
+// or body.userId). /status filters per-user when requested; cancel refuses
+// cross-user destruction. Without this, Jake opening /super would auto-attach
+// to Mark's in-flight scan (5 cascading bugs documented in May 25 audit).
+const getUserId = (req) => {
+  const src = (req.headers['x-user-id'] || '') ||
+              (req.body && req.body.userId) ||
+              (req.query && (req.query.userId || req.query.crm_user)) || '';
+  return String(src).trim().toLowerCase();
+};
+// Back-compat: scans written before this deploy have no userId. During the
+// grace window, treat them as "owned by everyone" so users don't lose access.
+const SUPER_OWNER_GRACE_UNTIL = Date.now() + 24 * 60 * 60 * 1000;
+const scanIsOwnedBy = (scan, userId) => {
+  if (!scan) return false;
+  if (!scan.userId) return Date.now() < SUPER_OWNER_GRACE_UNTIL;
+  if (!userId) return false;
+  return scan.userId === userId;
+};
+
 app.get('/api/signals/super/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const status = global._superSearchStatus || {};
@@ -5202,23 +5223,48 @@ app.get('/api/signals/super/status', (req, res) => {
       status[k] = { status: 'idle' };
     }
   }
+  // Filtering: if request supplies userId/x-user-id, return only THAT user's scans
+  // (personal recovery). Otherwise return ALL — used by ActiveScansPanel team view.
+  const filterRequested = !!(req.headers['x-user-id'] || (req.query && (req.query.userId || req.query.crm_user)));
+  if (filterRequested) {
+    const userId = getUserId(req);
+    const filtered = {};
+    for (const [k, v] of Object.entries(status)) {
+      if (scanIsOwnedBy(v, userId)) filtered[k] = v;
+    }
+    return res.json(filtered);
+  }
   res.json(status);
 });
 
 app.post('/api/signals/super/cancel', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { scanId } = req.body || {};
+  const userId = getUserId(req);
+  const force = req.query && (req.query.force === 'true' || req.query.force === '1');
   if (!global._superSearchStatus) global._superSearchStatus = {};
+
   if (scanId && global._superSearchStatus[scanId]) {
-    global._superSearchStatus[scanId].cancelled = true;
+    const scan = global._superSearchStatus[scanId];
+    if (!force && !scanIsOwnedBy(scan, userId)) {
+      console.log(`[Super] REFUSED cancel of ${scanId} — owner=${scan.userId || '(legacy)'} requester=${userId || '(anon)'}`);
+      return res.status(403).json({
+        success: false, error: 'forbidden',
+        message: `Scan is owned by ${scan.userId || 'another user'} — refusing cross-user cancel. Pass ?force=true to override.`,
+      });
+    }
+    scan.cancelled = true;
     saveSuperStateDebounced();
-    console.log(`[Super] Scan ${scanId} marked cancelled by user`);
+    console.log(`[Super] Scan ${scanId} cancelled by ${userId || 'anon'}${force ? ' (forced)' : ''}`);
     return res.json({ success: true, scanId, cancelled: true });
   }
-  // No scanId or unknown — cancel ALL running scans (best-effort)
+  // No scanId — only cancel scans the requester owns (unless ?force=true)
   let count = 0;
-  for (const [k, v] of Object.entries(global._superSearchStatus)) {
-    if (v.status === 'scanning') { v.cancelled = true; count++; }
+  for (const [, v] of Object.entries(global._superSearchStatus)) {
+    if (v.status !== 'scanning') continue;
+    if (!force && !scanIsOwnedBy(v, userId)) continue;
+    v.cancelled = true;
+    count++;
   }
   saveSuperStateDebounced();
   res.json({ success: true, cancelledCount: count });
@@ -5550,7 +5596,14 @@ app.post('/api/signals/super', async (req, res) => {
   // ETA calculation uses the wrong tier ceiling → "0 min remaining" forever for any
   // scan whose elapsed > 5 min. Read directly from req.body since destructure hasn't run yet.
   const _initialTier = (req.body && typeof req.body.superTier === 'string') ? req.body.superTier : 'sonnet';
-  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false, tier: _initialTier };
+  const _ownerId = getUserId(req);  // '' if anonymous
+  // ScanId collision protection — refuse if a different user already owns this scanId.
+  const _existing = global._superSearchStatus[scanId];
+  if (_existing && _existing.userId && _ownerId && _existing.userId !== _ownerId) {
+    return res.status(409).json({ error: `scanId collision with user ${_existing.userId} — retry with a new scanId` });
+  }
+  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false, tier: _initialTier, userId: _ownerId };
+  console.log(`[Super] Scan ${scanId} started by ${_ownerId || 'anon'} tier=${_initialTier}`);
   saveSuperStateDebounced();
   // Send scanId to frontend immediately so Cancel can target this scan
   res.write(`data: ${JSON.stringify({ scanId })}\n\n`);
