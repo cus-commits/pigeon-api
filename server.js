@@ -7483,14 +7483,14 @@ app.post('/api/airtable/add', async (req, res) => {
   let enrichedFunding = funding || null;
   let enrichedSector = sector || '';
   let enrichedDescription = notes || '';
+  let harmonicData = null;
 
   // Auto-enrich from Harmonic if we have the key
   if (harmonicKey) {
     try {
       console.log(`[Airtable+Harmonic] Enriching "${company}" before adding...`);
-      
+
       // Try domain lookup first if we have a website
-      let harmonicData = null;
       if (enrichedWebsite) {
         const domain = enrichedWebsite.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
         if (domain) {
