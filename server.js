@@ -5313,27 +5313,119 @@ app.post('/api/signals/super/preflight', async (req, res) => {
     const assessment = assessQueryNarrowness({ sectors, customKeywords, baselines, portfolioCompanies, sources, additionalInfo });
     const tierWantsAIExpansion = ['opus80', 'extreme'].includes(superTier);
     if (tierWantsAIExpansion && !assessment.aiExpansionWillRun) {
-      warnings.push({ severity: 'warn', message: 'AI Query Expansion will skip — needs anchors OR (sectors + keywords/additionalInfo >100 chars).', fix: 'Add a baseline anchor, or write more in additionalInfo.' });
+      warnings.push({ severity: 'high', message: 'AI Query Expansion will skip — needs anchors OR (sectors + keywords/additionalInfo >100 chars).', fix: 'Add a baseline anchor, or write more in additionalInfo.' });
     }
-    if (assessment.verdict === 'too_narrow') warnings.push({ severity: 'warn', message: `Query is narrow (breadth=${assessment.breadth}). Pool may be small — auto-widen will help if Harmonic returns thin.`, fix: 'Add another sector, more keywords, or an additional anchor.' });
-    else if (assessment.verdict === 'too_broad') warnings.push({ severity: 'info', message: `Query is broad (breadth=${assessment.breadth}). Signal-to-noise may suffer.`, fix: 'Consider tightening — drop one sector or trim keywords.' });
+    if (assessment.verdict === 'too_broad') warnings.push({ severity: 'low', message: `Query is broad (breadth=${assessment.breadth}). Signal-to-noise may suffer.`, fix: 'Consider tightening — drop one sector or trim keywords.' });
+    // narrow-query warning is folded into the signal-count thresholds below
 
-    // Rough estimates
+    // ── BETTER signal-count formula (per Agent 1 spec) ──
     const kwList = customKeywords.split(',').map(s => s.trim()).filter(Boolean);
-    const yieldsPerSource = { twitter: 30, farcaster: 15, github: 10, producthunt: 3 };
-    let estimatedSignals = 0;
+    const YIELD = { twitter: 25, farcaster: 12, github: 8, producthunt: 3, harmonic: 15 };
+    const TIER_HARMONIC_MULT = { haiku: 1, sonnet: 1, opus20: 1.5, opus80: 3, extreme: 10 };
+    const SECTOR_BREADTH_MULT = 1 + Math.min(sectors.length, 4) * 0.25;
+    const anchorCount = baselines.length + portfolioCompanies.length;
     const effectiveKw = Math.max(1, Math.min(kwList.length + sectors.length * 2, 16));
+    let estimatedSignals = 0;
     for (const s of sourcesLikelyToFire) {
-      if (s === 'harmonic') estimatedSignals += (baselines.length + portfolioCompanies.length) * 50 + effectiveKw * 15;
-      else estimatedSignals += (yieldsPerSource[s] || 5) * effectiveKw;
+      const base = (YIELD[s] || 5) * effectiveKw * SECTOR_BREADTH_MULT;
+      if (s === 'harmonic') estimatedSignals += base * (TIER_HARMONIC_MULT[superTier] || 1) + anchorCount * 50;
+      else estimatedSignals += base;
     }
-    if (tierWantsAIExpansion && assessment.aiExpansionWillRun) estimatedSignals += superTier === 'extreme' ? 8000 : 2000;
+    if (tierWantsAIExpansion && assessment.aiExpansionWillRun) {
+      estimatedSignals += superTier === 'extreme' ? (50 * 250) : (20 * 150);
+    }
+    // 25% dedup haircut across sources
+    estimatedSignals = Math.round(estimatedSignals * 0.75);
+
+    // ── SIGNAL-COUNT severity thresholds (the headline metric) ──
+    if (estimatedSignals < 50) {
+      warnings.push({ severity: 'critical', message: `Expected pool: only ~${estimatedSignals} signals. Almost certainly too thin for AI to rank meaningfully.`, fix: 'Add a sector, broaden keywords, or attach an anchor.' });
+    } else if (estimatedSignals < 200) {
+      warnings.push({ severity: 'high', message: `Expected pool: ~${estimatedSignals} signals. Small — results may be sparse.`, fix: 'Add another keyword or sector to widen.' });
+    } else if (estimatedSignals < 500) {
+      warnings.push({ severity: 'medium', message: `Expected pool: ~${estimatedSignals} signals — modest. AI will have a decent set to rank.`, fix: 'Optional: add one more sector or keyword for richer results.' });
+    } else if (estimatedSignals < 1000) {
+      warnings.push({ severity: 'low', message: `Expected pool: ~${estimatedSignals} signals — healthy.`, fix: null });
+    }
 
     const opusTopN = { opus20: 20, opus80: 80, extreme: 300 }[superTier] || 0;
     const screenCost = Math.min(estimatedSignals, 500) * (superTier === 'haiku' ? 0.0005 : 0.002);
     const opusCost = opusTopN * 0.015;
     const queryGenCost = tierWantsAIExpansion ? 0.05 : 0;
     const estimatedCostUsd = +(queryGenCost + screenCost + opusCost).toFixed(2);
+
+    // ── EDGE-CASE CHECKS (Agent 3 spec) ──
+    // Tier-vs-breadth mismatches
+    if (['opus80', 'extreme'].includes(superTier) && assessment.breadth <= 2) {
+      warnings.push({ severity: 'high', message: `Tier "${superTier}" on a very narrow query (breadth=${assessment.breadth}) wastes $15-18 on Opus scoring of low-relevance noise.`, fix: 'Drop to opus20, or add anchors/sectors first.' });
+    }
+    if (superTier === 'haiku' && assessment.breadth >= 18) {
+      warnings.push({ severity: 'medium', message: `Haiku tier on a broad query (breadth=${assessment.breadth}) under-screens — true positives may be missed.`, fix: 'Promote to sonnet, or tighten the query first.' });
+    }
+    // additionalInfo bloat
+    if (additionalInfo.length > 4000) {
+      const extraTokens = Math.round(additionalInfo.length / 4);
+      const batches = ['opus80', 'extreme'].includes(superTier) ? 50 : 20;
+      const bloatCost = +((extraTokens * batches * 3) / 1e6).toFixed(2);
+      warnings.push({ severity: 'medium', message: `additionalInfo is ${additionalInfo.length} chars (~${extraTokens} tokens × ~${batches} batches) → ~$${bloatCost} extra in token bloat.`, fix: 'Trim to <2000 chars — keep only the key thesis facts.' });
+    }
+    // Funding-filter exclusion on capital-heavy sectors
+    const fundingFilter = (req.body.fundingFilter || 'auto');
+    const heavyRaiseSectors = ['defense', 'aerospace', 'biotech', 'climate', 'energy', 'hardware', 'robotics', 'semiconductors', 'space'];
+    if (fundingFilter === 'under_2m' && sectors.some(s => heavyRaiseSectors.some(h => String(s).toLowerCase().includes(h)))) {
+      warnings.push({ severity: 'medium', message: 'under_2m funding filter on capital-heavy sectors (defense/aerospace/biotech/etc) will exclude most real targets — typical raises are $3-15M.', fix: 'Switch to under_10m or all.' });
+    }
+    // Time range too short
+    const timeRange = (req.body.timeRange || 'week');
+    if (timeRange === 'day' && (sources.includes('twitter') || sources.includes('farcaster'))) {
+      warnings.push({ severity: 'medium', message: '24h window on social sources usually yields <5 signals — most account activity is older.', fix: 'Use week or month.' });
+    }
+    // Engagement filters too restrictive
+    const minFollowers = Number(req.body.minFollowers || 0);
+    const minEngagement = Number(req.body.minEngagement || 0);
+    if (minFollowers > 10000 || minEngagement > 500) {
+      warnings.push({ severity: 'medium', message: `Engagement thresholds (followers ≥ ${minFollowers}, engagement ≥ ${minEngagement}) will eliminate ~95% of early-stage accounts.`, fix: 'Drop to 0 for early-stage discovery.' });
+    }
+    // Stuck in-flight scan from prior session
+    try {
+      const stuck = Object.entries(global._superSearchStatus || {}).filter(([, v]) =>
+        v.status === 'scanning' && v.startedAt && (Date.now() - v.startedAt) < 30 * 60_000 && !v.cancelled
+      );
+      if (stuck.length > 0) {
+        const ids = stuck.map(([k]) => k).slice(0, 3).join(', ');
+        warnings.push({ severity: 'high', message: `${stuck.length} scan(s) still in flight from prior session: ${ids}. Starting a new one competes for budget/rate-limits.`, fix: `Cancel them first: POST /api/signals/super/cancel { scanId: "${stuck[0][0]}" }` });
+      }
+    } catch (e) {}
+    // GitHub source with non-code keywords
+    const codeShaped = /\b(sdk|api|cli|framework|library|repo|github|open[- ]?source|protocol|server|client|compiler|kernel)\b/i;
+    if (sources.includes('github') && kwList.length > 0 && !codeShaped.test(customKeywords)) {
+      warnings.push({ severity: 'low', message: "GitHub source returns repos — your keywords don't look code-shaped. Expect ~0 hits from GitHub.", fix: 'Drop GitHub, or add code-shaped keywords (sdk, framework, protocol, ...).' });
+    }
+    // Crypto-sector vs non-crypto keyword drift
+    const cryptoSectorPattern = /\b(defi|web3|crypto|chain|nft|dao|stable|token|wallet|bridge)\b/i;
+    const cryptoVocab = /\b(defi|web3|crypto|chain|token|nft|dao|l1|l2|rollup|solana|eth|bitcoin|wallet)\b/i;
+    const hasCryptoSector = sectors.some(s => cryptoSectorPattern.test(String(s)));
+    const kwHasCrypto = cryptoVocab.test(customKeywords + ' ' + additionalInfo);
+    if (hasCryptoSector && kwList.length > 0 && !kwHasCrypto) {
+      warnings.push({ severity: 'low', message: "Crypto-heavy sectors + non-crypto keywords — sector keyword expansion will drift toward crypto vocab that doesn't match yours.", fix: 'Remove crypto sectors, or add crypto vocab to keywords.' });
+    }
+
+    // ── AUTO-WIDEN consent detection ──
+    // Same condition the scan itself uses: narrow + Harmonic-selected + Anthropic available
+    const harmonicSelected = sources.includes('harmonic');
+    const anthropicAvail = (req.headers['x-anthropic-key'] || '').trim().startsWith('sk-') || !!process.env.ANTHROPIC_API_KEY;
+    const widenLikely = harmonicSelected && anthropicAvail && (
+      (kwList.length <= 2 && anchorCount === 0) ||
+      assessment.verdict === 'too_narrow' ||
+      estimatedSignals < 300
+    );
+    let autoWidenSuggested = false, autoWidenEstCost = 0, autoWidenExplanation = '';
+    if (widenLikely) {
+      autoWidenSuggested = true;
+      autoWidenEstCost = 0.001;
+      const narrowList = kwList.length ? kwList.join(', ') : (sectors[0] || 'your query');
+      autoWidenExplanation = `Your narrow query ("${narrowList}") is likely to return <10 Harmonic companies. Haiku can expand to 5 broader synonyms — adds ~$0.001 and ~10s.`;
+    }
 
     // Optional Haiku keyword expansion (frontend opts in via suggestKeywords:true)
     let suggestedKeywords = null;
@@ -5362,18 +5454,28 @@ app.post('/api/signals/super/preflight', async (req, res) => {
       }
     }
 
+    // Sort warnings by severity (critical → high → medium → low → info) so the
+    // frontend renders the worst thing first without re-sorting.
+    const SEV_RANK = { critical: 0, high: 1, error: 1, medium: 2, warn: 2, low: 3, info: 4 };
+    warnings.sort((a, b) => (SEV_RANK[a.severity] ?? 99) - (SEV_RANK[b.severity] ?? 99));
+
     const elapsed = Date.now() - t0;
-    console.log(`[Preflight] ${elapsed}ms — warnings:${warnings.length} estSignals:${estimatedSignals} cost:$${estimatedCostUsd}`);
+    console.log(`[Preflight] ${elapsed}ms — warnings:${warnings.length} estSignals:${estimatedSignals} cost:$${estimatedCostUsd} widen:${autoWidenSuggested}`);
     res.json({
-      ok: !warnings.some(w => w.severity === 'error'),
+      ok: !warnings.some(w => w.severity === 'critical' || w.severity === 'error'),
       warnings,
       expected: {
         estimatedSignals,
         sourcesLikelyToFire,
         sourcesLikelyEmpty,
+        firingSources: sourcesLikelyToFire,        // alias for new frontend
+        emptySources: sourcesLikelyEmpty.map(e => `${e.source} (${e.reason})`),
         queryAssessment: assessment.verdict,
         suggestedKeywords,
         estimatedCostUsd,
+        autoWidenSuggested,
+        autoWidenEstCost,
+        autoWidenExplanation,
       },
       _meta: { elapsedMs: elapsed, anchorChecks, breadth: assessment.breadth, tier: superTier },
     });
@@ -5453,6 +5555,7 @@ app.post('/api/signals/super', async (req, res) => {
       portfolioImportance = 50,   // 0-100
       additionalInfo = '',        // freeform extra context
       fundingFilter = 'auto',     // 'under_2m' | 'under_10m' | 'under_25m' | 'all' | 'auto'
+      optedIntoWiden = null,      // null = legacy auto-on, true = explicit on, false = opt-out
     } = req.body;
     // Defensive coercion — destructure defaults only apply for `undefined`, not for `null` or
     // wrong-shaped values (object/string). Stale localStorage saved-searches or partial
@@ -6260,10 +6363,15 @@ ${'```'}`;
         await sleep(200);
       }
 
-      // Pass 2: auto-widen if pool is thin (< 10 total). One Haiku call generates broader
-      // synonyms for ALL narrow kws at once. Bounded: 1 Haiku call (~$0.001), 5 extra Harmonic queries.
+      // Pass 2: auto-widen if pool is thin (< 10 total) AND user opted in (or legacy null).
+      // optedIntoWiden: false = explicit user opt-out (frontend toggle), true = explicit on,
+      // null = legacy behavior (on by default) for back-compat with old frontends.
       const narrowKws = Object.entries(kwCounts).filter(([, n]) => n < 5).map(([k]) => k);
-      if (harmonicAddedThisPass < 10 && narrowKws.length > 0 && anthropicKey) {
+      const widenAllowed = optedIntoWiden !== false;
+      if (!widenAllowed && harmonicAddedThisPass < 10) {
+        sendProgress(`Harmonic returned only ${harmonicAddedThisPass} — auto-widen disabled by user, keeping thin pool.`, 'import', { source: 'harmonic-widen-skipped-by-user' });
+      }
+      if (widenAllowed && harmonicAddedThisPass < 10 && narrowKws.length > 0 && anthropicKey) {
         sendProgress(`Harmonic returned only ${harmonicAddedThisPass} — asking Haiku to widen "${narrowKws.join(', ')}"...`, 'import', { source: 'harmonic-widen-gen', narrow: narrowKws });
         try {
           const wprompt = `You are widening narrow Harmonic search queries to find more early-stage startups.
