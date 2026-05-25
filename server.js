@@ -4621,7 +4621,7 @@ ${repoText}`;
               for (const repo of highRepos.slice(0, 5)) {
                 try {
                   const searchTerm = repo.companyName || repo.owner;
-                  const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(searchTerm + ' crypto')}&size=3`;
+                  const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(searchTerm)}&size=3`;
                   const hRes = await fetch(searchUrl, { headers: harmonicHeaders });
                   if (hRes.ok) {
                     const hData = await hRes.json();
@@ -4868,7 +4868,7 @@ app.post('/api/signals/farcaster', async (req, res) => {
               const harmonicHeaders = { 'apikey': harmonicKey };
               for (const cast of highCasts.slice(0, 5)) {
                 try {
-                  const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(cast.companyName + ' crypto')}&size=3`;
+                  const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(cast.companyName)}&size=3`;
                   const hRes = await fetch(searchUrl, { headers: harmonicHeaders });
                   if (hRes.ok) {
                     const hData = await hRes.json();
@@ -5120,7 +5120,7 @@ app.post('/api/signals/twitter', async (req, res) => {
               const harmonicHeaders = { 'apikey': harmonicKey };
               for (const tw of highTweets.slice(0, 5)) {
                 try {
-                  const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(tw.companyName + ' crypto')}&size=3`;
+                  const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(tw.companyName)}&size=3`;
                   const hRes = await fetch(searchUrl, { headers: harmonicHeaders });
                   if (hRes.ok) {
                     const hData = await hRes.json();
@@ -5207,6 +5207,180 @@ app.post('/api/signals/super/clear-status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   global._superSearchStatus = {};
   res.json({ success: true });
+});
+
+// Reusable: assess how narrow/broad a super-search params payload is.
+// Used by /preflight AND can be called mid-scan to warn on 0-result sources.
+function assessQueryNarrowness({ sectors = [], customKeywords = '', baselines = [], portfolioCompanies = [], sources = [], additionalInfo = '' }) {
+  const kwList = (customKeywords || '').split(',').map(k => k.trim()).filter(Boolean);
+  const anchorCount = (baselines?.length || 0) + (portfolioCompanies?.length || 0);
+  const sectorCount = sectors?.length || 0;
+  const sourceCount = sources?.length || 0;
+  const addlLen = (additionalInfo || '').trim().length;
+  const breadth = (anchorCount * 2) + sectorCount + Math.min(kwList.length, 8) + Math.min(sourceCount, 4);
+  let verdict = 'ok';
+  const reasons = [];
+  if (breadth <= 2) { verdict = 'too_narrow'; reasons.push('Very few inputs — pool will be tiny'); }
+  else if (breadth >= 18) { verdict = 'too_broad'; reasons.push('Many inputs — pool may dilute signal'); }
+  const aiExpansionWillRun = (anchorCount > 0) || (sectorCount > 0 && (kwList.length > 0 || addlLen > 100));
+  return { breadth, verdict, reasons, aiExpansionWillRun, kwCount: kwList.length, anchorCount, sectorCount };
+}
+
+// ==========================================
+// SUPER SEARCH — PREFLIGHT (cheap pre-check ≤5s)
+// Returns warnings, expected sources, query-quality assessment, cost estimate.
+// User's frontend calls this BEFORE the cost-confirm modal so users can fix
+// narrow/broken queries before paying for a real scan that returns nothing.
+// ==========================================
+app.post('/api/signals/super/preflight', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const t0 = Date.now();
+  try {
+    let {
+      sectors = [], chains = [], sources = ['twitter', 'farcaster', 'github', 'harmonic'],
+      customKeywords = '', additionalInfo = '',
+      baselines = [], portfolioCompanies = [],
+      includeCRM = false, crmStages = [],
+      superTier = 'sonnet', suggestKeywords = false,
+    } = req.body || {};
+    if (!Array.isArray(sectors)) sectors = [];
+    if (!Array.isArray(sources)) sources = [];
+    if (!Array.isArray(baselines)) baselines = [];
+    if (!Array.isArray(portfolioCompanies)) portfolioCompanies = [];
+    if (!Array.isArray(crmStages)) crmStages = [];
+    if (typeof customKeywords !== 'string') customKeywords = '';
+    if (typeof additionalInfo !== 'string') additionalInfo = '';
+    if (typeof superTier !== 'string') superTier = 'sonnet';
+
+    const warnings = [];
+    const sourcesLikelyToFire = [];
+    const sourcesLikelyEmpty = [];
+
+    const hasAnchors = baselines.length > 0 || (includeCRM && crmStages.length > 0) || portfolioCompanies.length > 0;
+    if (sectors.length === 0 && !customKeywords.trim() && !hasAnchors) {
+      warnings.push({ severity: 'error', message: 'No search inputs. Pick a sector, add keywords, or attach a baseline anchor.', fix: 'Add at least one of: sector, customKeywords, or baselines[]' });
+    }
+
+    const envChecks = {
+      twitter: !!process.env.RAPIDAPI_KEY,
+      farcaster: !!process.env.NEYNAR_API_KEY,
+      github: true,
+      harmonic: !!process.env.HARMONIC_API_KEY,
+      producthunt: !!(process.env.PH_TOKEN || (process.env.PH_API_KEY && process.env.PH_API_SECRET)),
+    };
+    for (const s of sources) {
+      if (envChecks[s]) sourcesLikelyToFire.push(s);
+      else sourcesLikelyEmpty.push({ source: s, reason: `${s} API key not set on server` });
+    }
+    if (sourcesLikelyToFire.length === 0) {
+      warnings.push({ severity: 'error', message: 'No selected sources have API keys configured.', fix: 'Pick a source whose key is set (most reliably: harmonic, github).' });
+    }
+
+    // Anchor validation — parallel, capped at 8, ≤1s each typically
+    const harmonicKey = process.env.HARMONIC_API_KEY;
+    const anchorChecks = [];
+    if (harmonicKey && (baselines.length > 0 || portfolioCompanies.length > 0)) {
+      const allAnchors = [
+        ...baselines.map(b => ({ ...b, _type: 'baseline' })),
+        ...portfolioCompanies.map(p => ({ ...p, _type: 'portfolio' })),
+      ].slice(0, 8);
+      const hdrs = { apikey: harmonicKey };
+      const checkOne = async (a) => {
+        if (!a.id) return { name: a.name, type: a._type, ok: false, reason: 'no_id', similarCount: 0 };
+        try {
+          const r = await fetch(`${HARMONIC_BASE}/search/similar_companies/${a.id}?size=1`, { headers: hdrs });
+          if (r.status === 404) return { name: a.name, type: a._type, ok: false, reason: 'stale_id', similarCount: 0 };
+          if (!r.ok) return { name: a.name, type: a._type, ok: false, reason: `http_${r.status}`, similarCount: 0 };
+          const data = await r.json();
+          const raw = Array.isArray(data) ? data : (data.results || data.similar_companies || data.companies || []);
+          return { name: a.name, type: a._type, ok: true, reason: 'ok', similarCount: raw.length };
+        } catch (e) {
+          return { name: a.name, type: a._type, ok: false, reason: 'fetch_err', similarCount: 0 };
+        }
+      };
+      const results = await Promise.allSettled(allAnchors.map(checkOne));
+      results.forEach(r => anchorChecks.push(r.status === 'fulfilled' ? r.value : { ok: false, reason: 'promise_rejected' }));
+      for (const c of anchorChecks) {
+        if (!c.ok && c.reason === 'stale_id') warnings.push({ severity: 'error', message: `Stale anchor: "${c.name}" — Harmonic returned 404.`, fix: `Remove "${c.name}" and re-add from latest Harmonic search.` });
+        else if (!c.ok && c.reason === 'no_id') warnings.push({ severity: 'warn', message: `Anchor "${c.name}" has no Harmonic id — can't verify.`, fix: 'Re-select from search results so the id attaches.' });
+        else if (!c.ok) warnings.push({ severity: 'warn', message: `Anchor "${c.name}" check failed (${c.reason}).`, fix: 'Harmonic may be transient — retry in 30s.' });
+        else if (c.similarCount === 0) warnings.push({ severity: 'warn', message: `Anchor "${c.name}" has 0 similar companies in Harmonic.`, fix: 'Pick a better-known anchor — this one won\'t contribute candidates.' });
+      }
+    } else if (!harmonicKey && (baselines.length > 0 || portfolioCompanies.length > 0)) {
+      warnings.push({ severity: 'error', message: 'Anchors provided but HARMONIC_API_KEY is not set.', fix: 'Set the env var on Railway, or remove anchors.' });
+    }
+
+    const assessment = assessQueryNarrowness({ sectors, customKeywords, baselines, portfolioCompanies, sources, additionalInfo });
+    const tierWantsAIExpansion = ['opus80', 'extreme'].includes(superTier);
+    if (tierWantsAIExpansion && !assessment.aiExpansionWillRun) {
+      warnings.push({ severity: 'warn', message: 'AI Query Expansion will skip — needs anchors OR (sectors + keywords/additionalInfo >100 chars).', fix: 'Add a baseline anchor, or write more in additionalInfo.' });
+    }
+    if (assessment.verdict === 'too_narrow') warnings.push({ severity: 'warn', message: `Query is narrow (breadth=${assessment.breadth}). Pool may be small — auto-widen will help if Harmonic returns thin.`, fix: 'Add another sector, more keywords, or an additional anchor.' });
+    else if (assessment.verdict === 'too_broad') warnings.push({ severity: 'info', message: `Query is broad (breadth=${assessment.breadth}). Signal-to-noise may suffer.`, fix: 'Consider tightening — drop one sector or trim keywords.' });
+
+    // Rough estimates
+    const kwList = customKeywords.split(',').map(s => s.trim()).filter(Boolean);
+    const yieldsPerSource = { twitter: 30, farcaster: 15, github: 10, producthunt: 3 };
+    let estimatedSignals = 0;
+    const effectiveKw = Math.max(1, Math.min(kwList.length + sectors.length * 2, 16));
+    for (const s of sourcesLikelyToFire) {
+      if (s === 'harmonic') estimatedSignals += (baselines.length + portfolioCompanies.length) * 50 + effectiveKw * 15;
+      else estimatedSignals += (yieldsPerSource[s] || 5) * effectiveKw;
+    }
+    if (tierWantsAIExpansion && assessment.aiExpansionWillRun) estimatedSignals += superTier === 'extreme' ? 8000 : 2000;
+
+    const opusTopN = { opus20: 20, opus80: 80, extreme: 300 }[superTier] || 0;
+    const screenCost = Math.min(estimatedSignals, 500) * (superTier === 'haiku' ? 0.0005 : 0.002);
+    const opusCost = opusTopN * 0.015;
+    const queryGenCost = tierWantsAIExpansion ? 0.05 : 0;
+    const estimatedCostUsd = +(queryGenCost + screenCost + opusCost).toFixed(2);
+
+    // Optional Haiku keyword expansion (frontend opts in via suggestKeywords:true)
+    let suggestedKeywords = null;
+    if (suggestKeywords && (kwList.length > 0 || sectors.length > 0)) {
+      const anthropicKey = (req.headers['x-anthropic-key'] || '').trim().startsWith('sk-')
+        ? req.headers['x-anthropic-key'].trim() : process.env.ANTHROPIC_API_KEY;
+      if (anthropicKey) {
+        try {
+          const prompt = `Suggest 6 broader synonyms / adjacent search terms for these inputs (early-stage startup search). Return JSON only.\n\nSectors: ${sectors.join(', ') || 'none'}\nCurrent keywords: ${kwList.join(', ') || 'none'}\nContext: ${additionalInfo.slice(0, 400) || 'none'}\n\nJSON: {"keywords": ["term1", "term2", ...]}`;
+          const ctrl = new AbortController();
+          const timeout = setTimeout(() => ctrl.abort(), 3500);
+          const hr = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400, messages: [{ role: 'user', content: prompt }] }),
+            signal: ctrl.signal,
+          });
+          clearTimeout(timeout);
+          if (hr.ok) {
+            const hd = await hr.json();
+            const txt = hd.content.filter(b => b.type === 'text').map(b => b.text).join('');
+            const m = txt.match(/\{[\s\S]*?"keywords"[\s\S]*?\}/);
+            if (m) suggestedKeywords = (JSON.parse(m[0]).keywords || []).filter(k => typeof k === 'string').slice(0, 8);
+          }
+        } catch (e) { console.error('[Preflight] keyword expansion failed:', e.message); }
+      }
+    }
+
+    const elapsed = Date.now() - t0;
+    console.log(`[Preflight] ${elapsed}ms — warnings:${warnings.length} estSignals:${estimatedSignals} cost:$${estimatedCostUsd}`);
+    res.json({
+      ok: !warnings.some(w => w.severity === 'error'),
+      warnings,
+      expected: {
+        estimatedSignals,
+        sourcesLikelyToFire,
+        sourcesLikelyEmpty,
+        queryAssessment: assessment.verdict,
+        suggestedKeywords,
+        estimatedCostUsd,
+      },
+      _meta: { elapsedMs: elapsed, anchorChecks, breadth: assessment.breadth, tier: superTier },
+    });
+  } catch (e) {
+    console.error('[Preflight] FAILED:', e.message);
+    res.status(500).json({ ok: false, warnings: [{ severity: 'error', message: 'Preflight failed: ' + e.message }], expected: null });
+  }
 });
 
 app.post('/api/signals/super', async (req, res) => {
@@ -6018,73 +6192,136 @@ ${'```'}`;
       };
       const stageFilters = (Array.isArray(stage) ? stage : []).filter(s => s !== 'Any stage').map(s => stageMap[s] || s);
       const hKws = uniqueKeywords.slice(0, 6);
-      for (const kw of hKws) {
+      const seenHmIds = new Set();   // dedupe across original + auto-widen passes
+      const kwCounts = {};
+      let harmonicAddedThisPass = 0;
+
+      // Reusable per-query fetch — pushes into allSignals, returns count added.
+      const runHarmonicKw = async (kw, anchorTag) => {
+        let added = 0;
         try {
-          // Don't hardcode "crypto startup" — that killed every non-crypto scan
-          // (aerospace, defense, fintech, etc) by appending it to the Harmonic query.
-          // Use the user's keyword verbatim; sector/anchor context already filters.
           const searchUrl = `${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(kw)}&size=15`;
-          console.log('[Super] Harmonic search:', kw);
-          const r = await fetch(searchUrl, {
-            headers: harmonicHeaders,
-          });
-          if (r.ok) {
-            const data = await r.json();
-            const companies = data.results || data.data || data.companies || [];
-            console.log('[Super] Harmonic "' + kw + '" returned', companies.length, 'companies');
-            for (const c of companies) {
-              const desc = c.description || c.short_description || c.tagline || '';
-              const funding = c.funding_total || c.total_funding_amount || 0;
-              const compStage = c.stage || c.funding_stage || '';
-
-              // Apply stage filter if set
-              if (stageFilters.length > 0) {
-                const compStageLower = (compStage || '').toLowerCase().replace(/[\s-]/g, '_');
-                const noFunding = !funding || funding === 0;
-                const matchesStage = stageFilters.some(sf => {
-                  if (sf === 'bootstrapped') return noFunding;
-                  return compStageLower.includes(sf);
-                });
-                if (!matchesStage) continue;
-              }
-              const tm = c.tractionMetrics || {};
-              const webGrowth = tm.webTraffic?.ago30d?.percentChange || null;
-              const hcGrowth = tm.headcount?.ago90d?.percentChange || null;
-              const engGrowth = tm.headcountEngineering?.ago90d?.percentChange || null;
-              const highlights = (c.highlights || []).map(h => h.text || h).filter(Boolean).slice(0, 2);
-              const founders = Array.isArray(c.founders)
-                ? c.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ')
-                : '';
-
-              allSignals.push({
-                source: 'harmonic',
-                id: `hm-${c.id || c.entity_id}`,
-                title: c.name || c.company_name || c.display_name || '?',
-                subtitle: compStage || 'Unknown stage',
-                text: desc.slice(0, 300) + (highlights.length ? '\n💡 ' + highlights.join(' | ') : ''),
-                url: c.website?.url || c.website?.domain || c.homepage_url || '',
-                pfp: c.logo_url || '',
-                followers: c.headcount || 0,
-                engagement: funding,
-                likes: 0,
-                timestamp: c.created_at || c.founded_date || null,
-                meta: {
-                  funding, stage: compStage, headcount: c.headcount,
-                  website: c.website?.url || c.homepage_url || '',
-                  founders,
-                  webGrowth, hcGrowth, engGrowth,
-                },
-              });
-              sourceStats.harmonic++;
-            }
-          } else {
+          console.log('[Super] Harmonic search:', kw, anchorTag === 'widen' ? '(widened)' : '');
+          const r = await fetch(searchUrl, { headers: harmonicHeaders });
+          if (!r.ok) {
             const errText = await r.text().catch(() => '');
             console.error('[Super] Harmonic "' + kw + '" failed (' + r.status + '):', errText.slice(0, 200));
+            return 0;
           }
-          await sleep(200);
-        } catch (e) { console.error('[Super] Harmonic search error:', e.message); }
+          const data = await r.json();
+          const companies = data.results || data.data || data.companies || [];
+          console.log('[Super] Harmonic "' + kw + '" returned', companies.length, 'companies');
+          for (const c of companies) {
+            const cid = c.id || c.entity_id;
+            if (!cid) continue;
+            if (seenHmIds.has(cid)) continue;
+            seenHmIds.add(cid);
+            const desc = c.description || c.short_description || c.tagline || '';
+            const funding = c.funding_total || c.total_funding_amount || 0;
+            const compStage = c.stage || c.funding_stage || '';
+            if (stageFilters.length > 0) {
+              const compStageLower = (compStage || '').toLowerCase().replace(/[\s-]/g, '_');
+              const noFunding = !funding || funding === 0;
+              const matchesStage = stageFilters.some(sf => sf === 'bootstrapped' ? noFunding : compStageLower.includes(sf));
+              if (!matchesStage) continue;
+            }
+            const tm = c.tractionMetrics || {};
+            const webGrowth = tm.webTraffic?.ago30d?.percentChange || null;
+            const hcGrowth = tm.headcount?.ago90d?.percentChange || null;
+            const engGrowth = tm.headcountEngineering?.ago90d?.percentChange || null;
+            const highlights = (c.highlights || []).map(h => h.text || h).filter(Boolean).slice(0, 2);
+            const founders = Array.isArray(c.founders) ? c.founders.map(f => f.name || f.full_name || '').filter(Boolean).join(', ') : '';
+            allSignals.push({
+              source: 'harmonic',
+              id: `hm-${cid}`,
+              title: c.name || c.company_name || c.display_name || '?',
+              subtitle: compStage || 'Unknown stage',
+              text: desc.slice(0, 300) + (highlights.length ? '\n💡 ' + highlights.join(' | ') : ''),
+              url: c.website?.url || c.website?.domain || c.homepage_url || '',
+              pfp: c.logo_url || '',
+              followers: c.headcount || 0,
+              engagement: funding,
+              likes: 0,
+              timestamp: c.created_at || c.founded_date || null,
+              meta: { funding, stage: compStage, headcount: c.headcount, website: c.website?.url || c.homepage_url || '', founders, webGrowth, hcGrowth, engGrowth, _autoWiden: anchorTag === 'widen' ? kw : undefined },
+            });
+            sourceStats.harmonic++;
+            added++;
+          }
+        } catch (e) { console.error('[Super] Harmonic kw error:', e.message); }
+        return added;
+      };
+
+      // Pass 1: original keywords
+      for (const kw of hKws) {
+        const n = await runHarmonicKw(kw, 'kw');
+        kwCounts[kw] = n;
+        harmonicAddedThisPass += n;
+        await sleep(200);
       }
-      console.log('[Super] Harmonic:', sourceStats.harmonic, 'signals');
+
+      // Pass 2: auto-widen if pool is thin (< 10 total). One Haiku call generates broader
+      // synonyms for ALL narrow kws at once. Bounded: 1 Haiku call (~$0.001), 5 extra Harmonic queries.
+      const narrowKws = Object.entries(kwCounts).filter(([, n]) => n < 5).map(([k]) => k);
+      if (harmonicAddedThisPass < 10 && narrowKws.length > 0 && anthropicKey) {
+        sendProgress(`Harmonic returned only ${harmonicAddedThisPass} — asking Haiku to widen "${narrowKws.join(', ')}"...`, 'import', { source: 'harmonic-widen-gen', narrow: narrowKws });
+        try {
+          const wprompt = `You are widening narrow Harmonic search queries to find more early-stage startups.
+
+NARROW KEYWORDS THAT RETURNED FEW RESULTS:
+${narrowKws.map(k => `- "${k}"`).join('\n')}
+
+SECTORS: ${(sectors || []).join(', ') || '(none)'}
+ANCHORS: ${(baselines || []).map(b => b.name).join(', ') || '(none)'}
+
+Suggest 5 BROADER synonym/adjacent keywords (TOTAL, not per input) that:
+- Cover the same investment thesis but use different vocabulary
+- Are 1-3 words each, optimized for semantic search
+- Are DIVERSE (different angles: tech category, customer type, adjacent vertical)
+- Stay relevant to early-stage startups
+
+Output STRICT JSON only:
+\`\`\`json
+{"expansions": ["kw1", "kw2", "kw3", "kw4", "kw5"]}
+\`\`\``;
+          const wr = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400, messages: [{ role: 'user', content: wprompt }] }),
+          });
+          if (wr.ok) {
+            const wd = await wr.json();
+            if (typeof recordUsage === 'function') recordUsage('claude-haiku-4-5-20251001', wd.usage);
+            const txt = (wd.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+            const m = txt.match(/```json\s*\n?([\s\S]*?)\n?```/) || [null, txt];
+            try {
+              const parsed = JSON.parse(m[1]);
+              const expansions = (parsed.expansions || []).filter(s => typeof s === 'string' && s.trim() && s.length < 60).map(s => s.trim()).slice(0, 5);
+              if (expansions.length) {
+                sendProgress(`Auto-widening Harmonic with: ${expansions.join(', ')}`, 'import', { source: 'harmonic-widen-run', expansions });
+                let widenedAdded = 0;
+                for (const ekw of expansions) {
+                  widenedAdded += await runHarmonicKw(ekw, 'widen');
+                  await sleep(200);
+                }
+                sendProgress(`Auto-widen added ${widenedAdded} companies (total Harmonic: ${sourceStats.harmonic})`, 'import', { source: 'harmonic-widen-done', added: widenedAdded });
+              } else {
+                sendProgress('Auto-widen returned no usable expansions', 'import', { source: 'harmonic-widen-empty' });
+              }
+            } catch (pe) {
+              console.error('[Super/Widen] JSON parse failed:', pe.message, 'raw:', m[1]?.slice(0, 200));
+              sendProgress('Auto-widen JSON parse failed — keeping original results', 'import', { source: 'harmonic-widen-fail' });
+            }
+          } else {
+            console.error('[Super/Widen] Haiku HTTP', wr.status);
+            sendProgress(`Auto-widen Haiku call failed (${wr.status})`, 'import', { source: 'harmonic-widen-fail' });
+          }
+        } catch (e) {
+          console.error('[Super/Widen] error:', e.message);
+          sendProgress(`Auto-widen error: ${e.message}`, 'import', { source: 'harmonic-widen-fail' });
+        }
+      }
+      console.log('[Super] Harmonic:', sourceStats.harmonic, 'signals (after any widen)');
     }
 
     // Compute which requested sources skipped (missing API keys)
