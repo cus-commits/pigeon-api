@@ -7168,14 +7168,35 @@ app.post('/api/airtable/add', async (req, res) => {
   }
 
   try {
-    // Check if company already exists
-    const checkFormula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
-    const checkUrl = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${checkFormula}&maxRecords=1`;
+    // Check if company already exists — by Company name OR by Harmonic ID.
+    // Name-only check was missing the duplicate-from-race case (two near-simultaneous
+    // /add calls would both pass the name check and both insert). Adding the Harmonic
+    // ID OR-clause catches the same company even if the name had a typo difference.
+    const hid = (harmonicData && harmonicData.id) ? String(harmonicData.id) : null;
+    const safeCo = company.replace(/"/g, '\\"');
+    const checkFormula = encodeURIComponent(
+      hid
+        ? `OR({Company} = "${safeCo}", {Harmonic ID} = "${hid}")`
+        : `{Company} = "${safeCo}"`
+    );
+    const checkUrl = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${checkFormula}&maxRecords=5`;
     const checkRes = await fetch(checkUrl, { headers });
     if (checkRes.ok) {
       const checkData = await checkRes.json();
       if (checkData.records?.length > 0) {
-        const existing = checkData.records[0];
+        // Prefer richest record when name and harmonic-id matched different rows.
+        const recs = checkData.records;
+        if (recs.length > 1) {
+          const score = (r2) => {
+            const f = r2.fields || {};
+            return (Array.isArray(f['IN or OUT']) ? f['IN or OUT'].length * 10 : 0)
+              + (f['Harmonic ID'] ? 5 : 0) + (f['Initial Rating'] ? 3 : 0)
+              + (f['Initial Reachout Notes'] ? 2 : 0) + (f['Total Funding'] ? 1 : 0);
+          };
+          recs.sort((a, b) => score(b) - score(a));
+          console.warn(`[Airtable/add] DUPLICATE: ${recs.length} records for "${company}" — updating richest (${recs[0].id})`);
+        }
+        const existing = recs[0];
         // Update stage + fill in any missing fields
         const updateFields = { 'CRM Stage': stage || existing.fields['CRM Stage'] };
         if (!existing.fields['Company Link'] && enrichedWebsite) updateFields['Company Link'] = fields['Company Link'];
@@ -7306,28 +7327,49 @@ app.post('/api/airtable/update-stage', async (req, res) => {
   const baseId = process.env.AIRTABLE_BASE_ID;
   if (!headers || !baseId) return res.json({ error: 'Airtable not configured' });
 
-  const { company, stage } = req.body;
+  const { company, stage, airtable_id } = req.body;
   if (!company || !stage) return res.status(400).json({ error: 'company and stage required' });
 
   try {
-    console.log(`[Airtable] Stage change: "${company}" → ${stage}`);
-    const formula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
-    const r = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=1`, { headers });
-    if (!r.ok) return res.json({ error: `Airtable error: ${r.status}` });
-    const data = await r.json();
-    let record = data.records?.[0];
-    
-    // Fallback: SEARCH if exact match fails
+    console.log(`[Airtable] Stage change: "${company}" → ${stage}${airtable_id ? ' (id: ' + airtable_id + ')' : ''}`);
+    let record = null;
+
+    // PREFERRED: direct fetch by airtable_id — avoids hitting the wrong duplicate.
+    if (airtable_id) {
+      const directRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${airtable_id}`, { headers });
+      if (directRes.ok) record = await directRes.json();
+      else console.warn(`[Airtable] Stage direct fetch ${airtable_id} failed: ${directRes.status} — falling back to name search`);
+    }
+
+    // FALLBACK: name search. Prefer richest record when duplicates exist.
     if (!record) {
-      console.log(`[Airtable] Stage exact match failed for "${company}", trying SEARCH...`);
-      const sf = encodeURIComponent(`SEARCH("${company.replace(/"/g, '\\"')}", {Company})`);
-      const sr = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${sf}&maxRecords=5`, { headers });
-      if (sr.ok) {
-        const sd = await sr.json();
-        record = (sd.records || []).find(rec => (rec.fields['Company'] || '').trim() === company);
+      const formula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
+      const r = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=10`, { headers });
+      if (!r.ok) return res.json({ error: `Airtable error: ${r.status}` });
+      const data = await r.json();
+      const matches = data.records || [];
+      if (matches.length > 1) {
+        const score = (r2) => {
+          const f = r2.fields || {};
+          return (Array.isArray(f['IN or OUT']) ? f['IN or OUT'].length * 10 : 0)
+            + (f['Harmonic ID'] ? 5 : 0) + (f['Initial Rating'] ? 3 : 0)
+            + (f['Initial Reachout Notes'] ? 2 : 0) + (f['Total Funding'] ? 1 : 0);
+        };
+        matches.sort((a, b) => score(b) - score(a));
+        console.warn(`[Airtable] DUPLICATE: ${matches.length} records for "${company}" — updating richest (${matches[0].id})`);
+      }
+      record = matches[0];
+
+      if (!record) {
+        const sf = encodeURIComponent(`SEARCH("${company.replace(/"/g, '\\"')}", {Company})`);
+        const sr = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${sf}&maxRecords=5`, { headers });
+        if (sr.ok) {
+          const sd = await sr.json();
+          record = (sd.records || []).find(rec => (rec.fields['Company'] || '').trim() === company);
+        }
       }
     }
-    
+
     if (!record) return res.json({ error: 'Company not found in Airtable' });
 
     const recId = record.id;
@@ -7344,6 +7386,85 @@ app.post('/api/airtable/update-stage', async (req, res) => {
       setImmediate(() => { refreshBackburnIndex().catch(() => {}); });
     }
     res.json({ success: true, company, stage });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ───────── DEDUPE Airtable records (Company name collisions) ─────────
+// Finds duplicate rows in Airtable, merges votes/data into the richest, deletes the rest.
+// Optional `dryRun: true` returns the plan without mutating.
+app.post('/api/airtable/dedupe', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const hdrs = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  if (!hdrs || !baseId) return res.json({ error: 'Airtable not configured' });
+  const dryRun = !!req.body?.dryRun;
+
+  try {
+    // Pull every record (paginated)
+    const all = [];
+    let offset = null, pages = 0;
+    do {
+      let url = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?pageSize=100`;
+      if (offset) url += `&offset=${encodeURIComponent(offset)}`;
+      const r = await fetch(url, { headers: hdrs });
+      if (!r.ok) return res.json({ error: `Airtable list error: ${r.status}` });
+      const d = await r.json();
+      all.push(...(d.records || []));
+      offset = d.offset || null;
+      pages++;
+      if (pages > 25) break; // safety
+    } while (offset);
+
+    // Group by lowercase Company name
+    const groups = {};
+    for (const r of all) {
+      const name = ((r.fields || {}).Company || '').trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      (groups[key] ||= []).push(r);
+    }
+    const dupGroups = Object.entries(groups).filter(([, arr]) => arr.length > 1);
+
+    const score = (r2) => {
+      const f = r2.fields || {};
+      return (Array.isArray(f['IN or OUT']) ? f['IN or OUT'].length * 10 : 0)
+        + (f['Harmonic ID'] ? 5 : 0) + (f['Initial Rating'] ? 3 : 0)
+        + (f['Initial Reachout Notes'] ? 2 : 0) + (f['Total Funding'] ? 1 : 0)
+        + (f['Original Notes + Ongoing Negotiation Notes'] ? 1 : 0);
+    };
+
+    const plan = [];
+    let deleted = 0;
+    for (const [key, recs] of dupGroups) {
+      recs.sort((a, b) => score(b) - score(a));
+      const keep = recs[0];
+      const toDelete = recs.slice(1);
+      plan.push({
+        name: keep.fields.Company,
+        keep: keep.id,
+        keepScore: score(keep),
+        delete: toDelete.map(r => ({ id: r.id, score: score(r) })),
+      });
+      if (!dryRun) {
+        for (const r of toDelete) {
+          try {
+            const dr = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${r.id}`, { method: 'DELETE', headers: hdrs });
+            if (dr.ok) deleted++;
+          } catch (e) { console.error('[Dedupe] delete failed:', r.id, e.message); }
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      dryRun,
+      totalRecords: all.length,
+      duplicateGroups: dupGroups.length,
+      deleted: dryRun ? 0 : deleted,
+      plan,
+    });
   } catch (e) {
     res.json({ error: e.message });
   }
@@ -7588,21 +7709,48 @@ app.post('/api/airtable/vote', async (req, res) => {
   const baseId = process.env.AIRTABLE_BASE_ID;
   if (!headers || !baseId) return res.json({ error: 'Airtable not configured' });
 
-  const { voter, vote } = req.body;
+  const { voter, vote, airtable_id } = req.body;
   const company = (req.body.company || '').trim();
   if (!company || !voter || !vote) return res.status(400).json({ error: 'company, voter, and vote required' });
 
   try {
-    // Find the record — use FIND for exact match
-    console.log(`[Airtable] Vote lookup: "${company}" by ${voter} (${vote})`);
-    const formula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
-    const findRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=1`, { headers });
-    if (!findRes.ok) {
-      console.error(`[Airtable] Vote lookup failed: ${findRes.status}`);
-      return res.json({ error: 'Airtable lookup failed' });
+    let record = null;
+
+    // PREFERRED: direct fetch by airtable_id (avoids the duplicate-record bug).
+    // Frontend has airtable_id per row from /api/airtable/companies — pass it through.
+    if (airtable_id) {
+      const directRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${airtable_id}`, { headers });
+      if (directRes.ok) record = await directRes.json();
+      else console.warn(`[Airtable] Vote direct fetch ${airtable_id} failed: ${directRes.status} — falling back to name search`);
     }
-    const findData = await findRes.json();
-    let record = findData.records?.[0];
+
+    // FALLBACK: name search. If multiple records share the name (Airtable allows dupes),
+    // prefer the one with the most data populated so we don't write to an empty stub.
+    if (!record) {
+      console.log(`[Airtable] Vote lookup: "${company}" by ${voter} (${vote}) — no airtable_id, searching by name`);
+      const formula = encodeURIComponent(`{Company} = "${company.replace(/"/g, '\\"')}"`);
+      const findRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?filterByFormula=${formula}&maxRecords=10`, { headers });
+      if (!findRes.ok) {
+        console.error(`[Airtable] Vote lookup failed: ${findRes.status}`);
+        return res.json({ error: 'Airtable lookup failed' });
+      }
+      const findData = await findRes.json();
+      const matches = findData.records || [];
+      if (matches.length > 1) {
+        // Prefer the record with the most populated fields (votes, harmonic_id, rating, notes)
+        const score = (r) => {
+          const f = r.fields || {};
+          return (Array.isArray(f['IN or OUT']) ? f['IN or OUT'].length * 10 : 0)
+            + (f['Harmonic ID'] ? 5 : 0)
+            + (f['Initial Rating'] ? 3 : 0)
+            + (f['Initial Reachout Notes'] ? 2 : 0)
+            + (f['Total Funding'] ? 1 : 0);
+        };
+        matches.sort((a, b) => score(b) - score(a));
+        console.warn(`[Airtable] DUPLICATE: ${matches.length} records for "${company}" — voting on the richest (${matches[0].id})`);
+      }
+      record = matches[0];
+    }
     
     // Fallback: try SEARCH if exact match fails (handles special chars)
     if (!record) {
