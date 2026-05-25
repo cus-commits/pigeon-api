@@ -34,43 +34,22 @@ const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
 // Railway's mounted volume (survives redeploys) so users don't lose work.
 const SUPER_STATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'super_search_state.json');
 let _superSaveTimer = null;
-// Internal: write the current state to disk RIGHT NOW. Used by saveSuperStateNow()
-// (for terminal transitions — done/cancelled/error/interrupted) and by the
-// debounced variant for progress ticks.
-function _writeSuperStateToDisk() {
-  try {
-    const state = global._superSearchStatus || {};
-    // Retention windows: terminal scans (done/cancelled/error) kept 4h so the user
-    // can revisit recent results after a refresh. In-flight scans always kept while
-    // they're still in-flight. Other states pruned at 30 min.
-    const now = Date.now();
-    const TERMINAL_TTL = 4 * 60 * 60 * 1000;  // 4h
-    const DEFAULT_TTL = 30 * 60 * 1000;        // 30m
-    const fresh = {};
-    for (const [k, v] of Object.entries(state)) {
-      const t = v.finishedAt || v.startedAt || 0;
-      const isTerminal = ['done', 'cancelled', 'error', 'interrupted'].includes(v.status);
-      const isScanning = v.status === 'scanning';
-      const ttl = isTerminal ? TERMINAL_TTL : DEFAULT_TTL;
-      if (isScanning || (now - t < ttl)) fresh[k] = v;
-    }
-    fs.writeFileSync(SUPER_STATE_FILE, JSON.stringify(fresh));
-  } catch (e) { console.error('[Super/persist] save error:', e.message); }
-}
-
 function saveSuperStateDebounced() {
   if (_superSaveTimer) return;
   _superSaveTimer = setTimeout(() => {
-    _writeSuperStateToDisk();
+    try {
+      const state = global._superSearchStatus || {};
+      // Only persist scans <30 min old; clean up older
+      const now = Date.now();
+      const fresh = {};
+      for (const [k, v] of Object.entries(state)) {
+        const t = v.finishedAt || v.startedAt || 0;
+        if (now - t < 30 * 60 * 1000) fresh[k] = v;
+      }
+      fs.writeFileSync(SUPER_STATE_FILE, JSON.stringify(fresh));
+    } catch (e) { console.error('[Super/persist] save error:', e.message); }
     _superSaveTimer = null;
   }, 2000); // debounce 2s — protects against write storms during fast progress updates
-}
-
-// Immediate, synchronous write — call on terminal transitions (sendResult, cancel)
-// so a Railway redeploy that hits within the 2s debounce window cannot lose results.
-function saveSuperStateNow() {
-  if (_superSaveTimer) { clearTimeout(_superSaveTimer); _superSaveTimer = null; }
-  _writeSuperStateToDisk();
 }
 function restoreSuperState() {
   try {
@@ -5192,27 +5171,6 @@ app.post('/api/signals/twitter', async (req, res) => {
 // Super Search status tracking
 if (!global._superSearchStatus) global._superSearchStatus = {};
 
-// ───── PER-USER SCAN OWNERSHIP ─────
-// Each Super Search is tagged with the requester's user id (from x-user-id header
-// or body.userId). /status filters per-user when requested; cancel refuses
-// cross-user destruction. Without this, Jake opening /super would auto-attach
-// to Mark's in-flight scan (5 cascading bugs documented in May 25 audit).
-const getUserId = (req) => {
-  const src = (req.headers['x-user-id'] || '') ||
-              (req.body && req.body.userId) ||
-              (req.query && (req.query.userId || req.query.crm_user)) || '';
-  return String(src).trim().toLowerCase();
-};
-// Back-compat: scans written before this deploy have no userId. During the
-// grace window, treat them as "owned by everyone" so users don't lose access.
-const SUPER_OWNER_GRACE_UNTIL = Date.now() + 24 * 60 * 60 * 1000;
-const scanIsOwnedBy = (scan, userId) => {
-  if (!scan) return false;
-  if (!scan.userId) return Date.now() < SUPER_OWNER_GRACE_UNTIL;
-  if (!userId) return false;
-  return scan.userId === userId;
-};
-
 app.get('/api/signals/super/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const status = global._superSearchStatus || {};
@@ -5223,48 +5181,23 @@ app.get('/api/signals/super/status', (req, res) => {
       status[k] = { status: 'idle' };
     }
   }
-  // Filtering: if request supplies userId/x-user-id, return only THAT user's scans
-  // (personal recovery). Otherwise return ALL — used by ActiveScansPanel team view.
-  const filterRequested = !!(req.headers['x-user-id'] || (req.query && (req.query.userId || req.query.crm_user)));
-  if (filterRequested) {
-    const userId = getUserId(req);
-    const filtered = {};
-    for (const [k, v] of Object.entries(status)) {
-      if (scanIsOwnedBy(v, userId)) filtered[k] = v;
-    }
-    return res.json(filtered);
-  }
   res.json(status);
 });
 
 app.post('/api/signals/super/cancel', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { scanId } = req.body || {};
-  const userId = getUserId(req);
-  const force = req.query && (req.query.force === 'true' || req.query.force === '1');
   if (!global._superSearchStatus) global._superSearchStatus = {};
-
   if (scanId && global._superSearchStatus[scanId]) {
-    const scan = global._superSearchStatus[scanId];
-    if (!force && !scanIsOwnedBy(scan, userId)) {
-      console.log(`[Super] REFUSED cancel of ${scanId} — owner=${scan.userId || '(legacy)'} requester=${userId || '(anon)'}`);
-      return res.status(403).json({
-        success: false, error: 'forbidden',
-        message: `Scan is owned by ${scan.userId || 'another user'} — refusing cross-user cancel. Pass ?force=true to override.`,
-      });
-    }
-    scan.cancelled = true;
+    global._superSearchStatus[scanId].cancelled = true;
     saveSuperStateDebounced();
-    console.log(`[Super] Scan ${scanId} cancelled by ${userId || 'anon'}${force ? ' (forced)' : ''}`);
+    console.log(`[Super] Scan ${scanId} marked cancelled by user`);
     return res.json({ success: true, scanId, cancelled: true });
   }
-  // No scanId — only cancel scans the requester owns (unless ?force=true)
+  // No scanId or unknown — cancel ALL running scans (best-effort)
   let count = 0;
-  for (const [, v] of Object.entries(global._superSearchStatus)) {
-    if (v.status !== 'scanning') continue;
-    if (!force && !scanIsOwnedBy(v, userId)) continue;
-    v.cancelled = true;
-    count++;
+  for (const [k, v] of Object.entries(global._superSearchStatus)) {
+    if (v.status === 'scanning') { v.cancelled = true; count++; }
   }
   saveSuperStateDebounced();
   res.json({ success: true, cancelledCount: count });
@@ -5380,119 +5313,27 @@ app.post('/api/signals/super/preflight', async (req, res) => {
     const assessment = assessQueryNarrowness({ sectors, customKeywords, baselines, portfolioCompanies, sources, additionalInfo });
     const tierWantsAIExpansion = ['opus80', 'extreme'].includes(superTier);
     if (tierWantsAIExpansion && !assessment.aiExpansionWillRun) {
-      warnings.push({ severity: 'high', message: 'AI Query Expansion will skip — needs anchors OR (sectors + keywords/additionalInfo >100 chars).', fix: 'Add a baseline anchor, or write more in additionalInfo.' });
+      warnings.push({ severity: 'warn', message: 'AI Query Expansion will skip — needs anchors OR (sectors + keywords/additionalInfo >100 chars).', fix: 'Add a baseline anchor, or write more in additionalInfo.' });
     }
-    if (assessment.verdict === 'too_broad') warnings.push({ severity: 'low', message: `Query is broad (breadth=${assessment.breadth}). Signal-to-noise may suffer.`, fix: 'Consider tightening — drop one sector or trim keywords.' });
-    // narrow-query warning is folded into the signal-count thresholds below
+    if (assessment.verdict === 'too_narrow') warnings.push({ severity: 'warn', message: `Query is narrow (breadth=${assessment.breadth}). Pool may be small — auto-widen will help if Harmonic returns thin.`, fix: 'Add another sector, more keywords, or an additional anchor.' });
+    else if (assessment.verdict === 'too_broad') warnings.push({ severity: 'info', message: `Query is broad (breadth=${assessment.breadth}). Signal-to-noise may suffer.`, fix: 'Consider tightening — drop one sector or trim keywords.' });
 
-    // ── BETTER signal-count formula (per Agent 1 spec) ──
+    // Rough estimates
     const kwList = customKeywords.split(',').map(s => s.trim()).filter(Boolean);
-    const YIELD = { twitter: 25, farcaster: 12, github: 8, producthunt: 3, harmonic: 15 };
-    const TIER_HARMONIC_MULT = { haiku: 1, sonnet: 1, opus20: 1.5, opus80: 3, extreme: 10 };
-    const SECTOR_BREADTH_MULT = 1 + Math.min(sectors.length, 4) * 0.25;
-    const anchorCount = baselines.length + portfolioCompanies.length;
-    const effectiveKw = Math.max(1, Math.min(kwList.length + sectors.length * 2, 16));
+    const yieldsPerSource = { twitter: 30, farcaster: 15, github: 10, producthunt: 3 };
     let estimatedSignals = 0;
+    const effectiveKw = Math.max(1, Math.min(kwList.length + sectors.length * 2, 16));
     for (const s of sourcesLikelyToFire) {
-      const base = (YIELD[s] || 5) * effectiveKw * SECTOR_BREADTH_MULT;
-      if (s === 'harmonic') estimatedSignals += base * (TIER_HARMONIC_MULT[superTier] || 1) + anchorCount * 50;
-      else estimatedSignals += base;
+      if (s === 'harmonic') estimatedSignals += (baselines.length + portfolioCompanies.length) * 50 + effectiveKw * 15;
+      else estimatedSignals += (yieldsPerSource[s] || 5) * effectiveKw;
     }
-    if (tierWantsAIExpansion && assessment.aiExpansionWillRun) {
-      estimatedSignals += superTier === 'extreme' ? (50 * 250) : (20 * 150);
-    }
-    // 25% dedup haircut across sources
-    estimatedSignals = Math.round(estimatedSignals * 0.75);
-
-    // ── SIGNAL-COUNT severity thresholds (the headline metric) ──
-    if (estimatedSignals < 50) {
-      warnings.push({ severity: 'critical', message: `Expected pool: only ~${estimatedSignals} signals. Almost certainly too thin for AI to rank meaningfully.`, fix: 'Add a sector, broaden keywords, or attach an anchor.' });
-    } else if (estimatedSignals < 200) {
-      warnings.push({ severity: 'high', message: `Expected pool: ~${estimatedSignals} signals. Small — results may be sparse.`, fix: 'Add another keyword or sector to widen.' });
-    } else if (estimatedSignals < 500) {
-      warnings.push({ severity: 'medium', message: `Expected pool: ~${estimatedSignals} signals — modest. AI will have a decent set to rank.`, fix: 'Optional: add one more sector or keyword for richer results.' });
-    } else if (estimatedSignals < 1000) {
-      warnings.push({ severity: 'low', message: `Expected pool: ~${estimatedSignals} signals — healthy.`, fix: null });
-    }
+    if (tierWantsAIExpansion && assessment.aiExpansionWillRun) estimatedSignals += superTier === 'extreme' ? 8000 : 2000;
 
     const opusTopN = { opus20: 20, opus80: 80, extreme: 300 }[superTier] || 0;
     const screenCost = Math.min(estimatedSignals, 500) * (superTier === 'haiku' ? 0.0005 : 0.002);
     const opusCost = opusTopN * 0.015;
     const queryGenCost = tierWantsAIExpansion ? 0.05 : 0;
     const estimatedCostUsd = +(queryGenCost + screenCost + opusCost).toFixed(2);
-
-    // ── EDGE-CASE CHECKS (Agent 3 spec) ──
-    // Tier-vs-breadth mismatches
-    if (['opus80', 'extreme'].includes(superTier) && assessment.breadth <= 2) {
-      warnings.push({ severity: 'high', message: `Tier "${superTier}" on a very narrow query (breadth=${assessment.breadth}) wastes $15-18 on Opus scoring of low-relevance noise.`, fix: 'Drop to opus20, or add anchors/sectors first.' });
-    }
-    if (superTier === 'haiku' && assessment.breadth >= 18) {
-      warnings.push({ severity: 'medium', message: `Haiku tier on a broad query (breadth=${assessment.breadth}) under-screens — true positives may be missed.`, fix: 'Promote to sonnet, or tighten the query first.' });
-    }
-    // additionalInfo bloat
-    if (additionalInfo.length > 4000) {
-      const extraTokens = Math.round(additionalInfo.length / 4);
-      const batches = ['opus80', 'extreme'].includes(superTier) ? 50 : 20;
-      const bloatCost = +((extraTokens * batches * 3) / 1e6).toFixed(2);
-      warnings.push({ severity: 'medium', message: `additionalInfo is ${additionalInfo.length} chars (~${extraTokens} tokens × ~${batches} batches) → ~$${bloatCost} extra in token bloat.`, fix: 'Trim to <2000 chars — keep only the key thesis facts.' });
-    }
-    // Funding-filter exclusion on capital-heavy sectors
-    const fundingFilter = (req.body.fundingFilter || 'auto');
-    const heavyRaiseSectors = ['defense', 'aerospace', 'biotech', 'climate', 'energy', 'hardware', 'robotics', 'semiconductors', 'space'];
-    if (fundingFilter === 'under_2m' && sectors.some(s => heavyRaiseSectors.some(h => String(s).toLowerCase().includes(h)))) {
-      warnings.push({ severity: 'medium', message: 'under_2m funding filter on capital-heavy sectors (defense/aerospace/biotech/etc) will exclude most real targets — typical raises are $3-15M.', fix: 'Switch to under_10m or all.' });
-    }
-    // Time range too short
-    const timeRange = (req.body.timeRange || 'week');
-    if (timeRange === 'day' && (sources.includes('twitter') || sources.includes('farcaster'))) {
-      warnings.push({ severity: 'medium', message: '24h window on social sources usually yields <5 signals — most account activity is older.', fix: 'Use week or month.' });
-    }
-    // Engagement filters too restrictive
-    const minFollowers = Number(req.body.minFollowers || 0);
-    const minEngagement = Number(req.body.minEngagement || 0);
-    if (minFollowers > 10000 || minEngagement > 500) {
-      warnings.push({ severity: 'medium', message: `Engagement thresholds (followers ≥ ${minFollowers}, engagement ≥ ${minEngagement}) will eliminate ~95% of early-stage accounts.`, fix: 'Drop to 0 for early-stage discovery.' });
-    }
-    // Stuck in-flight scan from prior session
-    try {
-      const stuck = Object.entries(global._superSearchStatus || {}).filter(([, v]) =>
-        v.status === 'scanning' && v.startedAt && (Date.now() - v.startedAt) < 30 * 60_000 && !v.cancelled
-      );
-      if (stuck.length > 0) {
-        const ids = stuck.map(([k]) => k).slice(0, 3).join(', ');
-        warnings.push({ severity: 'high', message: `${stuck.length} scan(s) still in flight from prior session: ${ids}. Starting a new one competes for budget/rate-limits.`, fix: `Cancel them first: POST /api/signals/super/cancel { scanId: "${stuck[0][0]}" }` });
-      }
-    } catch (e) {}
-    // GitHub source with non-code keywords
-    const codeShaped = /\b(sdk|api|cli|framework|library|repo|github|open[- ]?source|protocol|server|client|compiler|kernel)\b/i;
-    if (sources.includes('github') && kwList.length > 0 && !codeShaped.test(customKeywords)) {
-      warnings.push({ severity: 'low', message: "GitHub source returns repos — your keywords don't look code-shaped. Expect ~0 hits from GitHub.", fix: 'Drop GitHub, or add code-shaped keywords (sdk, framework, protocol, ...).' });
-    }
-    // Crypto-sector vs non-crypto keyword drift
-    const cryptoSectorPattern = /\b(defi|web3|crypto|chain|nft|dao|stable|token|wallet|bridge)\b/i;
-    const cryptoVocab = /\b(defi|web3|crypto|chain|token|nft|dao|l1|l2|rollup|solana|eth|bitcoin|wallet)\b/i;
-    const hasCryptoSector = sectors.some(s => cryptoSectorPattern.test(String(s)));
-    const kwHasCrypto = cryptoVocab.test(customKeywords + ' ' + additionalInfo);
-    if (hasCryptoSector && kwList.length > 0 && !kwHasCrypto) {
-      warnings.push({ severity: 'low', message: "Crypto-heavy sectors + non-crypto keywords — sector keyword expansion will drift toward crypto vocab that doesn't match yours.", fix: 'Remove crypto sectors, or add crypto vocab to keywords.' });
-    }
-
-    // ── AUTO-WIDEN consent detection ──
-    // Same condition the scan itself uses: narrow + Harmonic-selected + Anthropic available
-    const harmonicSelected = sources.includes('harmonic');
-    const anthropicAvail = (req.headers['x-anthropic-key'] || '').trim().startsWith('sk-') || !!process.env.ANTHROPIC_API_KEY;
-    const widenLikely = harmonicSelected && anthropicAvail && (
-      (kwList.length <= 2 && anchorCount === 0) ||
-      assessment.verdict === 'too_narrow' ||
-      estimatedSignals < 300
-    );
-    let autoWidenSuggested = false, autoWidenEstCost = 0, autoWidenExplanation = '';
-    if (widenLikely) {
-      autoWidenSuggested = true;
-      autoWidenEstCost = 0.001;
-      const narrowList = kwList.length ? kwList.join(', ') : (sectors[0] || 'your query');
-      autoWidenExplanation = `Your narrow query ("${narrowList}") is likely to return <10 Harmonic companies. Haiku can expand to 5 broader synonyms — adds ~$0.001 and ~10s.`;
-    }
 
     // Optional Haiku keyword expansion (frontend opts in via suggestKeywords:true)
     let suggestedKeywords = null;
@@ -5521,28 +5362,18 @@ app.post('/api/signals/super/preflight', async (req, res) => {
       }
     }
 
-    // Sort warnings by severity (critical → high → medium → low → info) so the
-    // frontend renders the worst thing first without re-sorting.
-    const SEV_RANK = { critical: 0, high: 1, error: 1, medium: 2, warn: 2, low: 3, info: 4 };
-    warnings.sort((a, b) => (SEV_RANK[a.severity] ?? 99) - (SEV_RANK[b.severity] ?? 99));
-
     const elapsed = Date.now() - t0;
-    console.log(`[Preflight] ${elapsed}ms — warnings:${warnings.length} estSignals:${estimatedSignals} cost:$${estimatedCostUsd} widen:${autoWidenSuggested}`);
+    console.log(`[Preflight] ${elapsed}ms — warnings:${warnings.length} estSignals:${estimatedSignals} cost:$${estimatedCostUsd}`);
     res.json({
-      ok: !warnings.some(w => w.severity === 'critical' || w.severity === 'error'),
+      ok: !warnings.some(w => w.severity === 'error'),
       warnings,
       expected: {
         estimatedSignals,
         sourcesLikelyToFire,
         sourcesLikelyEmpty,
-        firingSources: sourcesLikelyToFire,        // alias for new frontend
-        emptySources: sourcesLikelyEmpty.map(e => `${e.source} (${e.reason})`),
         queryAssessment: assessment.verdict,
         suggestedKeywords,
         estimatedCostUsd,
-        autoWidenSuggested,
-        autoWidenEstCost,
-        autoWidenExplanation,
       },
       _meta: { elapsedMs: elapsed, anchorChecks, breadth: assessment.breadth, tier: superTier },
     });
@@ -5584,26 +5415,11 @@ app.post('/api/signals/super', async (req, res) => {
     if (!global._superSearchStatus) global._superSearchStatus = {};
     const prev = global._superSearchStatus[scanId] || {};
     global._superSearchStatus[scanId] = { ...prev, status: data.cancelled ? 'cancelled' : 'done', finishedAt: Date.now(), results: data };
-    // TERMINAL transition — write to disk synchronously. The 2s debounce was
-    // losing scans whose completion happened to land inside a Railway redeploy
-    // window (the user's 25-May scan was destroyed exactly this way).
-    saveSuperStateNow();
+    saveSuperStateDebounced();
   };
   const startTime = Date.now();
   if (!global._superSearchStatus) global._superSearchStatus = {};
-  // Persist tier so recovery on page reload can restore ETA + cost display correctly.
-  // Without this, frontend's superTier resets to its useState default ('opus20') and the
-  // ETA calculation uses the wrong tier ceiling → "0 min remaining" forever for any
-  // scan whose elapsed > 5 min. Read directly from req.body since destructure hasn't run yet.
-  const _initialTier = (req.body && typeof req.body.superTier === 'string') ? req.body.superTier : 'sonnet';
-  const _ownerId = getUserId(req);  // '' if anonymous
-  // ScanId collision protection — refuse if a different user already owns this scanId.
-  const _existing = global._superSearchStatus[scanId];
-  if (_existing && _existing.userId && _ownerId && _existing.userId !== _ownerId) {
-    return res.status(409).json({ error: `scanId collision with user ${_existing.userId} — retry with a new scanId` });
-  }
-  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false, tier: _initialTier, userId: _ownerId };
-  console.log(`[Super] Scan ${scanId} started by ${_ownerId || 'anon'} tier=${_initialTier}`);
+  global._superSearchStatus[scanId] = { status: 'scanning', progress: 'Initializing...', stage: 'import', startedAt: startTime, cancelled: false };
   saveSuperStateDebounced();
   // Send scanId to frontend immediately so Cancel can target this scan
   res.write(`data: ${JSON.stringify({ scanId })}\n\n`);
@@ -5637,7 +5453,6 @@ app.post('/api/signals/super', async (req, res) => {
       portfolioImportance = 50,   // 0-100
       additionalInfo = '',        // freeform extra context
       fundingFilter = 'auto',     // 'under_2m' | 'under_10m' | 'under_25m' | 'all' | 'auto'
-      optedIntoWiden = null,      // null = legacy auto-on, true = explicit on, false = opt-out
     } = req.body;
     // Defensive coercion — destructure defaults only apply for `undefined`, not for `null` or
     // wrong-shaped values (object/string). Stale localStorage saved-searches or partial
@@ -6445,15 +6260,10 @@ ${'```'}`;
         await sleep(200);
       }
 
-      // Pass 2: auto-widen if pool is thin (< 10 total) AND user opted in (or legacy null).
-      // optedIntoWiden: false = explicit user opt-out (frontend toggle), true = explicit on,
-      // null = legacy behavior (on by default) for back-compat with old frontends.
+      // Pass 2: auto-widen if pool is thin (< 10 total). One Haiku call generates broader
+      // synonyms for ALL narrow kws at once. Bounded: 1 Haiku call (~$0.001), 5 extra Harmonic queries.
       const narrowKws = Object.entries(kwCounts).filter(([, n]) => n < 5).map(([k]) => k);
-      const widenAllowed = optedIntoWiden !== false;
-      if (!widenAllowed && harmonicAddedThisPass < 10) {
-        sendProgress(`Harmonic returned only ${harmonicAddedThisPass} — auto-widen disabled by user, keeping thin pool.`, 'import', { source: 'harmonic-widen-skipped-by-user' });
-      }
-      if (widenAllowed && harmonicAddedThisPass < 10 && narrowKws.length > 0 && anthropicKey) {
+      if (harmonicAddedThisPass < 10 && narrowKws.length > 0 && anthropicKey) {
         sendProgress(`Harmonic returned only ${harmonicAddedThisPass} — asking Haiku to widen "${narrowKws.join(', ')}"...`, 'import', { source: 'harmonic-widen-gen', narrow: narrowKws });
         try {
           const wprompt = `You are widening narrow Harmonic search queries to find more early-stage startups.
@@ -9339,13 +9149,10 @@ const SCANS_STATE_FILE = path.join(SCAN_VOLUME, 'deep_scans_state.json');
 function loadScansState() {
   try {
     const data = JSON.parse(fs.readFileSync(SCANS_STATE_FILE, 'utf8'));
-    const bootTime = Date.now();
     for (const id of Object.keys(data)) {
       if (data[id].status === 'scanning') {
         data[id].status = 'interrupted';
         data[id].progress = `Interrupted (server restarted) — was at: ${data[id].progress || 'unknown phase'}`;
-        // Effective death time = boot time (the actual kill happened seconds before)
-        if (!data[id].interruptedAt) data[id].interruptedAt = bootTime;
       }
     }
     return data;
@@ -9355,7 +9162,7 @@ function loadScansState() {
       const old = JSON.parse(fs.readFileSync(path.join(SCAN_VOLUME, 'recurring_scan_state.json'), 'utf8'));
       if (old && old.status && old.status !== 'idle') {
         const id = (old.startedAt || Date.now()).toString(36);
-        if (old.status === 'scanning') { old.status = 'interrupted'; old.progress = `Interrupted — was at: ${old.progress || 'unknown'}`; old.interruptedAt = Date.now(); }
+        if (old.status === 'scanning') { old.status = 'interrupted'; old.progress = `Interrupted — was at: ${old.progress || 'unknown'}`; }
         old.id = id; old.user = old.user || 'Mark';
         return { [id]: old };
       }
@@ -9368,39 +9175,11 @@ function saveScansState() {
   try {
     const toSave = {};
     for (const [id, s] of Object.entries(global._deepScans || {})) {
-      toSave[id] = {
-        id: s.id, status: s.status, progress: s.progress, stats: { ...(s.stats || {}) },
-        startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark', options: s.options,
-        lastUpdatedAt: s.lastUpdatedAt || s.startedAt,
-        interruptedAt: s.interruptedAt || null,
-        finishedAt: s.finishedAt || null,
-      };
+      toSave[id] = { id: s.id, status: s.status, progress: s.progress, stats: { ...(s.stats || {}) }, startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark', options: s.options };
     }
     fs.writeFileSync(SCANS_STATE_FILE, JSON.stringify(toSave));
   } catch (e) {}
 }
-
-// Graceful shutdown: mark any running scans as interrupted with the exact moment
-// of shutdown, so the next boot doesn't have to guess (and the UI shows accurate
-// "ran for X" math instead of using boot time).
-function markRunningScansInterruptedOnShutdown(signal) {
-  try {
-    const now = Date.now();
-    let n = 0;
-    for (const s of Object.values(global._deepScans || {})) {
-      if (s.status === 'scanning') {
-        s.status = 'interrupted';
-        s.progress = `Interrupted (server ${signal}) — was at: ${s.progress || 'unknown phase'}`;
-        s.interruptedAt = now;
-        n++;
-      }
-    }
-    if (n > 0) saveScansState();
-    console.log(`[Scans] Graceful ${signal}: marked ${n} scanning → interrupted`);
-  } catch (e) { console.error('[Scans] shutdown handler error:', e.message); }
-}
-process.on('SIGTERM', () => { markRunningScansInterruptedOnShutdown('SIGTERM'); });
-process.on('SIGINT', () => { markRunningScansInterruptedOnShutdown('SIGINT'); process.exit(0); });
 
 if (!global._deepScans) {
   global._deepScans = loadScansState();
@@ -9414,11 +9193,11 @@ function cleanupOldScans() {
 }
 
 const SCAN_TIERS = {
-  scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   ddPush: 3,  etaMin: 3,  etaMax: 6,  preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 25,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet scoring → Sonnet deep (budget-capped) → top to DD' },
-  standard: { name: 'Standard',      cost: '$12', budget: 12,  ddPush: 8,  etaMin: 8,  etaMax: 15, preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 80,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
-  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 15, etaMin: 18, etaMax: 32, preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 150, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
-  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 25, etaMin: 30, etaMax: 50, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 300, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
-  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 40, etaMin: 45, etaMax: 75, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 500, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep (budget-capped) → top to DD' },
+  scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   ddPush: 3,  preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 25,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet scoring → Sonnet deep (budget-capped) → top to DD' },
+  standard: { name: 'Standard',      cost: '$12', budget: 12,  ddPush: 8,  preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 80,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
+  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 15, preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 150, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
+  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 25, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 300, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
+  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 40, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 500, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep (budget-capped) → top to DD' },
 };
 
 const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
@@ -9435,9 +9214,6 @@ app.get('/api/recurring-scan/status', (req, res) => {
   const scans = Object.values(global._deepScans).map(s => ({
     id: s.id, status: s.status, progress: s.progress, stats: s.stats || {},
     startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark',
-    lastUpdatedAt: s.lastUpdatedAt || s.startedAt || null,
-    interruptedAt: s.interruptedAt || null,
-    finishedAt: s.finishedAt || null,
   }));
   res.json({ scans });
 });
@@ -9627,7 +9403,7 @@ app.post('/api/recurring-scan', async (req, res) => {
   };
   global._deepScans[scanId] = scan;
 
-  const keepalive = setInterval(() => { safeWrite(': keepalive\n\n'); try { scan.lastUpdatedAt = Date.now(); saveScansState(); } catch(e){} }, 5000);
+  const keepalive = setInterval(() => { safeWrite(': keepalive\n\n'); try { saveScansState(); } catch(e){} }, 5000);
   safeWrite(`data: ${JSON.stringify({ scanId })}\n\n`);
 
   const persistState = () => { try { saveScansState(); } catch (e) {} };
@@ -10433,7 +10209,6 @@ ${batchText}`;
     scan.status = 'done';
     scan.progress = `Complete — ${deepResults.length} deep-scored, ${scan.stats.topResults} rated 7+, ${ddPushed} pushed to DD`;
     scan.results = finalResults;
-    scan.finishedAt = Date.now();
     persistState();
     cleanupOldScans();
 
@@ -10448,16 +10223,13 @@ ${batchText}`;
     if (e.message === 'Cancelled') {
       scan.status = 'cancelled';
       scan.progress = 'Cancelled by user';
-      scan.finishedAt = Date.now();
       safeWrite(`data: ${JSON.stringify({ error: 'Scan cancelled' })}\n\n`);
     } else {
       console.error('[RecurringScan] Fatal error:', e.message);
       scan.status = 'error';
       scan.progress = `Error: ${e.message}`;
-      scan.finishedAt = Date.now();
       safeWrite(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     }
-    try { saveScansState(); } catch (e) {}
   } finally {
     clearInterval(keepalive);
     res.end();
