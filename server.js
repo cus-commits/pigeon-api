@@ -7833,12 +7833,17 @@ app.post('/api/airtable/vote', async (req, res) => {
     const voterMap = { 'Joe': 'Joe C', 'Mark': 'Mark', 'Carlo': 'Carlo', 'Jake': 'Jake', 'Liam': 'Liam' };
     const airtableVoter = voterMap[voter] || voter;
 
-    // Get existing votes, update
+    // Get existing votes, update — third option MAYBE (amber) for "needs more info"
     const existingVotes = record.fields['IN or OUT'] || [];
+    const voteUp = String(vote || '').toUpperCase();
     const inKey = `${airtableVoter}: IN`;
     const outKey = `${airtableVoter}: OUT`;
-    const newVotes = existingVotes.filter(v => v !== inKey && v !== outKey);
-    newVotes.push(vote === 'IN' ? inKey : outKey);
+    const maybeKey = `${airtableVoter}: MAYBE`;
+    // Strip ANY prior vote from this user so we don't stack IN+MAYBE+OUT
+    const newVotes = existingVotes.filter(v => v !== inKey && v !== outKey && v !== maybeKey);
+    const tokenForVote = voteUp === 'IN' ? inKey : voteUp === 'OUT' ? outKey : voteUp === 'MAYBE' ? maybeKey : null;
+    if (!tokenForVote) return res.status(400).json({ error: `vote must be IN, OUT, or MAYBE — got "${vote}"` });
+    newVotes.push(tokenForVote);
 
     const patchRes = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${record.id}`, {
       method: 'PATCH', headers,
