@@ -34,22 +34,43 @@ const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
 // Railway's mounted volume (survives redeploys) so users don't lose work.
 const SUPER_STATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'super_search_state.json');
 let _superSaveTimer = null;
+// Internal: write the current state to disk RIGHT NOW. Used by saveSuperStateNow()
+// (for terminal transitions — done/cancelled/error/interrupted) and by the
+// debounced variant for progress ticks.
+function _writeSuperStateToDisk() {
+  try {
+    const state = global._superSearchStatus || {};
+    // Retention windows: terminal scans (done/cancelled/error) kept 4h so the user
+    // can revisit recent results after a refresh. In-flight scans always kept while
+    // they're still in-flight. Other states pruned at 30 min.
+    const now = Date.now();
+    const TERMINAL_TTL = 4 * 60 * 60 * 1000;  // 4h
+    const DEFAULT_TTL = 30 * 60 * 1000;        // 30m
+    const fresh = {};
+    for (const [k, v] of Object.entries(state)) {
+      const t = v.finishedAt || v.startedAt || 0;
+      const isTerminal = ['done', 'cancelled', 'error', 'interrupted'].includes(v.status);
+      const isScanning = v.status === 'scanning';
+      const ttl = isTerminal ? TERMINAL_TTL : DEFAULT_TTL;
+      if (isScanning || (now - t < ttl)) fresh[k] = v;
+    }
+    fs.writeFileSync(SUPER_STATE_FILE, JSON.stringify(fresh));
+  } catch (e) { console.error('[Super/persist] save error:', e.message); }
+}
+
 function saveSuperStateDebounced() {
   if (_superSaveTimer) return;
   _superSaveTimer = setTimeout(() => {
-    try {
-      const state = global._superSearchStatus || {};
-      // Only persist scans <30 min old; clean up older
-      const now = Date.now();
-      const fresh = {};
-      for (const [k, v] of Object.entries(state)) {
-        const t = v.finishedAt || v.startedAt || 0;
-        if (now - t < 30 * 60 * 1000) fresh[k] = v;
-      }
-      fs.writeFileSync(SUPER_STATE_FILE, JSON.stringify(fresh));
-    } catch (e) { console.error('[Super/persist] save error:', e.message); }
+    _writeSuperStateToDisk();
     _superSaveTimer = null;
   }, 2000); // debounce 2s — protects against write storms during fast progress updates
+}
+
+// Immediate, synchronous write — call on terminal transitions (sendResult, cancel)
+// so a Railway redeploy that hits within the 2s debounce window cannot lose results.
+function saveSuperStateNow() {
+  if (_superSaveTimer) { clearTimeout(_superSaveTimer); _superSaveTimer = null; }
+  _writeSuperStateToDisk();
 }
 function restoreSuperState() {
   try {
@@ -5517,7 +5538,10 @@ app.post('/api/signals/super', async (req, res) => {
     if (!global._superSearchStatus) global._superSearchStatus = {};
     const prev = global._superSearchStatus[scanId] || {};
     global._superSearchStatus[scanId] = { ...prev, status: data.cancelled ? 'cancelled' : 'done', finishedAt: Date.now(), results: data };
-    saveSuperStateDebounced();
+    // TERMINAL transition — write to disk synchronously. The 2s debounce was
+    // losing scans whose completion happened to land inside a Railway redeploy
+    // window (the user's 25-May scan was destroyed exactly this way).
+    saveSuperStateNow();
   };
   const startTime = Date.now();
   if (!global._superSearchStatus) global._superSearchStatus = {};
