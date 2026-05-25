@@ -7463,17 +7463,21 @@ app.post('/api/airtable/dedupe', async (req, res) => {
       const keeperVotesBefore = (keepFields['IN or OUT'] || []).length;
       if (allVotes.size > keeperVotesBefore) mergeUpdates['IN or OUT'] = [...allVotes];
 
-      // KEEP the highest-stage if any duplicate has progressed further than the keeper.
-      // Stage order: BORO-SM > BORO > BO > Warm > Backburn > '' (we don't promote OUT of Backburn).
-      const STAGE_RANK = { 'BORO-SM': 5, 'BORO': 4, 'BO': 3, 'Warm': 2, 'Backburn': 1 };
+      // Promote keeper's stage to the highest ACTIVE stage among dupes.
+      // Only promote within the known good-deal pipeline. Backburn / unknown stages
+      // ('Issues Contacting', 'Not Imported To CRM', etc.) are NOT targets — only
+      // keep them if the keeper is already there. And never promote OUT of Backburn.
+      const STAGE_RANK = { 'BORO-SM': 5, 'BORO': 4, 'BO': 3, 'Warm': 2 };
       const keepStage = keepFields['CRM Stage'] || '';
       let bestStage = keepStage;
       let bestRank = STAGE_RANK[keepStage] || 0;
+      const keeperIsBackburn = keepStage === 'Backburn';
       for (const r of toDelete) {
         const s = (r.fields || {})['CRM Stage'] || '';
         const rank = STAGE_RANK[s] || 0;
-        // Don't auto-promote OUT of Backburn — that's a deliberate user action
-        if (rank > bestRank && keepStage !== 'Backburn') { bestStage = s; bestRank = rank; }
+        // Only promote to a stage that exists in the rank table (skips Backburn/unknown).
+        // Never auto-promote OUT of Backburn.
+        if (rank > 0 && rank > bestRank && !keeperIsBackburn) { bestStage = s; bestRank = rank; }
       }
       if (bestStage !== keepStage) mergeUpdates['CRM Stage'] = bestStage;
 
