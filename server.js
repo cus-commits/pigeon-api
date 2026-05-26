@@ -7431,19 +7431,21 @@ app.get('/api/harmonic/debug-company', async (req, res) => {
   try {
     const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
     const td = await tr.json();
-    // Return the RAW typeahead so we can see all fields
     const rawTypeahead = (td.results || []).slice(0, 5);
-    // Try to fetch the first company entity by URN
-    let full = null;
-    const first = (td.results || []).find(r => /company:/.test(r.entity_urn || ''));
+    // Match on .text (Harmonic typeahead uses text, not name)
+    const exact = (td.results || []).find(r => r.type === 'COMPANY' && (r.text || '').toLowerCase().trim() === name.toLowerCase().trim());
+    const first = exact || (td.results || []).find(r => r.type === 'COMPANY');
+    let full = null, fetchStatus = null, fetchedFrom = null;
     if (first) {
       const tid = (first.entity_urn || '').split(':').pop();
       if (tid) {
         const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
+        fetchStatus = cr.status;
+        fetchedFrom = tid;
         if (cr.ok) full = await cr.json();
       }
     }
-    res.json({ rawTypeahead, full });
+    res.json({ rawTypeahead, exactMatch: !!exact, fetchedFrom, fetchStatus, full });
   } catch (e) { res.json({ error: e.message }); }
 });
 
@@ -7553,23 +7555,23 @@ app.post('/api/airtable/add', async (req, res) => {
 
       // Fallback to typeahead
       if (!harmonicData) {
-        const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(company)}&size=3`, { headers: { apikey: harmonicKey } });
+        const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(company)}&size=5`, { headers: { apikey: harmonicKey } });
         if (tr.ok) {
           const td = await tr.json();
-          const results = td.results || [];
+          // Harmonic typeahead returns .text + .type (not .name + .id)
+          const companies = (td.results || []).filter(r => r.type === 'COMPANY');
           const compLower2 = company.toLowerCase().trim();
-          const exact = results.find(r => (r.name || '').toLowerCase().trim() === compLower2);
+          const exact = companies.find(r => (r.text || '').toLowerCase().trim() === compLower2);
           let target = exact;
-          if (!target && results[0]) {
-            // Fuzzy: only use results[0] if name has significant word overlap
+          if (!target && companies[0]) {
             const cw = compLower2.split(/\s+/);
-            const rw = (results[0].name || '').toLowerCase().split(/\s+/);
+            const rw = (companies[0].text || '').toLowerCase().split(/\s+/);
             const ov = cw.filter(w => rw.some(r2 => r2.includes(w) || w.includes(r2))).length;
-            if (ov / Math.max(cw.length, 1) >= 0.4) target = results[0];
-            else console.log(`[Add/Enrich] Rejected typeahead "${results[0].name}" for "${company}" — low overlap`);
+            if (ov / Math.max(cw.length, 1) >= 0.4) target = companies[0];
+            else console.log(`[Add/Enrich] Rejected typeahead "${companies[0].text}" for "${company}" — low overlap`);
           }
           if (target) {
-            const tid = target.id || (target.entity_urn || '').split(':').pop();
+            const tid = (target.entity_urn || '').split(':').pop();
             if (tid) {
               const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
               if (cr.ok) harmonicData = await cr.json();
@@ -7828,14 +7830,15 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
           if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; matchKind = 'harmonic_id'; }
         }
         if (!real && name) {
-          const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=3`, { headers: { apikey: harmonicKey } });
+          const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
           if (tr.ok) {
             const td = await tr.json();
-            const exact = (td.results || []).find(r => (r.name || '').toLowerCase().trim() === name.toLowerCase().trim());
-            const target = exact || (mode !== 'mismatch' ? (td.results || [])[0] : null); // mismatch mode requires EXACT name match
+            // Harmonic typeahead uses .text + .type (not .name)
+            const exact = (td.results || []).find(r => r.type === 'COMPANY' && (r.text || '').toLowerCase().trim() === name.toLowerCase().trim());
+            const target = exact || (mode !== 'mismatch' ? (td.results || []).find(r => r.type === 'COMPANY') : null);
             if (target) {
               matchKind = exact ? 'name_exact' : 'name_fuzzy';
-              const tid = target.id || (target.entity_urn || '').split(':').pop();
+              const tid = (target.entity_urn || '').split(':').pop();
               if (tid) {
                 const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
                 if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; }
