@@ -7465,6 +7465,30 @@ app.get('/api/airtable/reachout-notes', async (req, res) => {
   }
 });
 
+// Detect URLs that are clearly NOT a company website — social posts, tweet/cast/repo
+// permalinks, news article paths, etc. These get passed into /add by signal cards
+// because the card's "source URL" field gets reused as `website`. Harmonic's domain
+// is always preferred over one of these.
+function looksLikeSourceUrl(url) {
+  if (!url) return false;
+  const u = String(url).toLowerCase();
+  // Known source-only hosts (post permalinks, not company sites)
+  if (/^https?:\/\/(www\.)?(x|twitter)\.com\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?warpcast\.com\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?farcaster\.xyz\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?producthunt\.com\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?reddit\.com\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?linkedin\.com\/posts\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?medium\.com\//.test(u)) return true;
+  if (/^https?:\/\/(www\.)?substack\.com\//.test(u)) return true;
+  // GitHub repo URLs (path beyond the org/) — a company's own github org is fine,
+  // but `github.com/foo/bar` (repo) is not a company site.
+  if (/^https?:\/\/(www\.)?github\.com\/[^/]+\/[^/?#]+/.test(u)) return true;
+  // Permalink-shaped paths on any domain
+  if (/\/(status|posts|p|cast|notes|comments)\/[^/]+/.test(u)) return true;
+  return false;
+}
+
 // Add a company to Airtable CRM (with auto-enrichment from Harmonic)
 app.post('/api/airtable/add', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -7534,7 +7558,15 @@ app.post('/api/airtable/add', async (req, res) => {
         const f = c.funding || {};
         console.log(`[Airtable+Harmonic] Found: ${c.name} (ID: ${c.id})`);
 
-        if (!enrichedWebsite) enrichedWebsite = c.website?.url || c.website?.domain || '';
+        // Harmonic's website is authoritative — overwrite any passed-in value
+        // (signal.url from Twitter/GitHub/PH/Farcaster is a SOURCE post URL, not the company domain).
+        const harmonicWebsite = c.website?.url || c.website?.domain || '';
+        if (harmonicWebsite && (!enrichedWebsite || looksLikeSourceUrl(enrichedWebsite))) {
+          if (enrichedWebsite && enrichedWebsite !== harmonicWebsite) {
+            console.log(`[Airtable+Harmonic] Replacing source-URL "${enrichedWebsite}" with Harmonic domain "${harmonicWebsite}"`);
+          }
+          enrichedWebsite = harmonicWebsite;
+        }
         if (!enrichedTwitter) enrichedTwitter = c.socials?.twitter?.url || '';
         if (!enrichedCB) enrichedCB = c.socials?.crunchbase?.url || '';
         if (!enrichedFunding) {
@@ -7626,7 +7658,16 @@ app.post('/api/airtable/add', async (req, res) => {
         const existing = recs[0];
         // Update stage + fill in any missing fields
         const updateFields = { 'CRM Stage': stage || existing.fields['CRM Stage'] };
-        if (!existing.fields['Company Link'] && enrichedWebsite) updateFields['Company Link'] = fields['Company Link'];
+        // Overwrite Company Link when (a) existing is empty, or (b) existing is a known source-URL
+        // shape (twitter/x/warpcast/etc.) — Harmonic's domain is always more trustworthy than a
+        // tweet permalink that landed in the field via a signal-card add.
+        const existingLink = existing.fields['Company Link'] || '';
+        if (enrichedWebsite && fields['Company Link'] && (!existingLink || looksLikeSourceUrl(existingLink))) {
+          if (existingLink && existingLink !== fields['Company Link']) {
+            console.log(`[Airtable] Healing "${company}" Company Link: "${existingLink}" → "${fields['Company Link']}"`);
+          }
+          updateFields['Company Link'] = fields['Company Link'];
+        }
         if (!existing.fields['Twitter Link'] && enrichedTwitter) updateFields['Twitter Link'] = fields['Twitter Link'];
         if (!existing.fields['CB Link'] && enrichedCB) updateFields['CB Link'] = fields['CB Link'];
         if (!existing.fields['Total Funding'] && enrichedFunding) updateFields['Total Funding'] = fields['Total Funding'];
@@ -7701,6 +7742,78 @@ app.post('/api/airtable/add', async (req, res) => {
     res.json({ success: true, action: 'created', stage: stage || 'BO', airtable_id: newId, fieldsPopulated: Object.keys(fields) });
   } catch (e) {
     console.error('[Airtable] Error:', e.message);
+    res.json({ error: e.message });
+  }
+});
+
+// Heal: find every CRM record whose Company Link is a source-shaped URL (tweet,
+// cast, repo, blog post) and replace it with the real domain from Harmonic.
+// Call with ?apply=true to actually patch; otherwise returns a dry-run diff.
+app.post('/api/airtable/heal-websites', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const headers = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  const harmonicKey = process.env.HARMONIC_API_KEY;
+  if (!headers || !baseId) return res.json({ error: 'Airtable not configured' });
+  if (!harmonicKey) return res.json({ error: 'Harmonic key not configured' });
+  const apply = String(req.query.apply || req.body?.apply || '') === 'true';
+
+  try {
+    const proposals = [];
+    let offset = null;
+    let scanned = 0;
+    do {
+      const url = new URL(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}`);
+      url.searchParams.set('pageSize', '100');
+      url.searchParams.set('fields[]', 'Company');
+      url.searchParams.append('fields[]', 'Company Link');
+      url.searchParams.append('fields[]', 'Harmonic ID');
+      if (offset) url.searchParams.set('offset', offset);
+      const r = await fetch(url, { headers });
+      if (!r.ok) return res.json({ error: `Airtable list error ${r.status}` });
+      const data = await r.json();
+      for (const rec of data.records || []) {
+        scanned++;
+        const link = rec.fields['Company Link'] || '';
+        if (!looksLikeSourceUrl(link)) continue;
+        const name = rec.fields['Company'] || '';
+        const hid = rec.fields['Harmonic ID'] || '';
+        // Resolve real domain via Harmonic
+        let real = '';
+        if (hid) {
+          const cr = await fetch(`${HARMONIC_BASE}/companies/${hid}`, { headers: { apikey: harmonicKey } });
+          if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; }
+        }
+        if (!real && name) {
+          const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=3`, { headers: { apikey: harmonicKey } });
+          if (tr.ok) {
+            const td = await tr.json();
+            const exact = (td.results || []).find(r => (r.name || '').toLowerCase().trim() === name.toLowerCase().trim());
+            const target = exact || (td.results || [])[0];
+            if (target) {
+              const tid = target.id || (target.entity_urn || '').split(':').pop();
+              if (tid) {
+                const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
+                if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; }
+              }
+            }
+          }
+        }
+        if (!real || real === link) continue;
+        const realUrl = real.startsWith('http') ? real : `https://${real}`;
+        proposals.push({ id: rec.id, company: name, from: link, to: realUrl });
+        if (apply) {
+          const patch = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${rec.id}`, {
+            method: 'PATCH', headers, body: JSON.stringify({ fields: { 'Company Link': realUrl } }),
+          });
+          if (!patch.ok) console.error(`[Heal] PATCH failed for ${name}: ${patch.status}`);
+        }
+      }
+      offset = data.offset || null;
+    } while (offset);
+    res.json({ scanned, proposals, applied: apply, count: proposals.length });
+  } catch (e) {
+    console.error('[Heal] error:', e.message);
     res.json({ error: e.message });
   }
 });
