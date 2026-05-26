@@ -7496,6 +7496,37 @@ app.get('/api/airtable/reachout-notes', async (req, res) => {
 // permalinks, news article paths, etc. These get passed into /add by signal cards
 // because the card's "source URL" field gets reused as `website`. Harmonic's domain
 // is always preferred over one of these.
+// Pick the best company website from a Harmonic company record. The primary
+// `website.url` is often wrong/broken (e.g. Boomitra → bomitrayoga.com, broken),
+// but the real domain is usually in website_domain_aliases or the exec emails.
+// We score candidates: primary (if not broken) wins, otherwise an alias or email
+// domain whose root matches the company name wins.
+function pickHarmonicWebsite(c) {
+  if (!c) return '';
+  const nameKey = (c.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const primary = c.website?.url || c.website?.domain || '';
+  const broken = c.website?.is_broken === true;
+  const aliases = Array.isArray(c.website_domain_aliases) ? c.website_domain_aliases.filter(Boolean) : [];
+  const emails = [c.contact?.primary_email, ...(c.contact?.exec_emails || [])].filter(Boolean);
+  const emailDomains = [...new Set(emails.map(e => (e.split('@')[1] || '').toLowerCase()).filter(Boolean))];
+
+  const candidates = [];
+  if (primary) candidates.push({ url: primary, score: broken ? 10 : 100, src: broken ? 'primary_broken' : 'primary' });
+  const rootOf = (s) => String(s).toLowerCase().replace(/^https?:\/\//,'').replace(/^www\./,'').split('/')[0].split('.')[0].replace(/[^a-z0-9]/g,'');
+  for (const a of aliases) {
+    const root = rootOf(a);
+    const nameMatch = !!(root && nameKey && (root.includes(nameKey) || nameKey.includes(root)));
+    candidates.push({ url: a.startsWith('http') ? a : `https://${a}`, score: nameMatch ? 90 : 40, src: nameMatch ? 'alias_name_match' : 'alias' });
+  }
+  for (const ed of emailDomains) {
+    const root = rootOf(ed);
+    const nameMatch = !!(root && nameKey && (root.includes(nameKey) || nameKey.includes(root)));
+    candidates.push({ url: `https://${ed}`, score: nameMatch ? 95 : 35, src: nameMatch ? 'email_name_match' : 'email' });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.url || '';
+}
+
 function looksLikeSourceUrl(url) {
   if (!url) return false;
   const u = String(url).toLowerCase();
@@ -7587,7 +7618,8 @@ app.post('/api/airtable/add', async (req, res) => {
 
         // Harmonic's website is authoritative — overwrite any passed-in value
         // (signal.url from Twitter/GitHub/PH/Farcaster is a SOURCE post URL, not the company domain).
-        const harmonicWebsite = c.website?.url || c.website?.domain || '';
+        // pickHarmonicWebsite() heals broken primary URLs by consulting aliases + email domain.
+        const harmonicWebsite = pickHarmonicWebsite(c);
         if (harmonicWebsite && (!enrichedWebsite || looksLikeSourceUrl(enrichedWebsite))) {
           if (enrichedWebsite && enrichedWebsite !== harmonicWebsite) {
             console.log(`[Airtable+Harmonic] Replacing source-URL "${enrichedWebsite}" with Harmonic domain "${harmonicWebsite}"`);
@@ -7827,7 +7859,7 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
         let matchKind = '';
         if (hid) {
           const cr = await fetch(`${HARMONIC_BASE}/companies/${hid}`, { headers: { apikey: harmonicKey } });
-          if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; matchKind = 'harmonic_id'; }
+          if (cr.ok) { const cd = await cr.json(); real = pickHarmonicWebsite(cd); matchKind = 'harmonic_id'; }
         }
         if (!real && name) {
           const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
@@ -7841,7 +7873,7 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
               const tid = (target.entity_urn || '').split(':').pop();
               if (tid) {
                 const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
-                if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; }
+                if (cr.ok) { const cd = await cr.json(); real = pickHarmonicWebsite(cd); }
               }
             }
           }
