@@ -7422,6 +7422,27 @@ app.get('/api/airtable/companies', async (req, res) => {
 });
 
 // DEBUG: See raw Airtable fields for first record
+app.get('/api/harmonic/debug-company', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const harmonicKey = process.env.HARMONIC_API_KEY;
+  if (!harmonicKey) return res.json({ error: 'no key' });
+  const name = req.query.name;
+  if (!name) return res.json({ error: 'name required' });
+  try {
+    const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
+    const td = await tr.json();
+    const results = (td.results || []).slice(0, 5).map(r => ({ id: r.id, name: r.name, entity_urn: r.entity_urn }));
+    const exact = (td.results || []).find(r => (r.name || '').toLowerCase().trim() === name.toLowerCase().trim());
+    let full = null;
+    if (exact) {
+      const tid = exact.id || (exact.entity_urn || '').split(':').pop();
+      const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
+      if (cr.ok) full = await cr.json();
+    }
+    res.json({ typeahead: results, exact: exact ? { id: exact.id, name: exact.name } : null, full });
+  } catch (e) { res.json({ error: e.message }); }
+});
+
 app.get('/api/airtable/debug-fields', async (req, res) => {
   const headers = airtableHeaders();
   const baseId = process.env.AIRTABLE_BASE_ID;
