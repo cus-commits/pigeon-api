@@ -7880,7 +7880,7 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
         }
         if (!real) { if (verbose) diag.push({ company: name, skip: 'harmonic_no_website', hid, matchKind }); continue; }
         const realUrl = real.startsWith('http') ? real : `https://${real}`;
-        if (apex(realUrl) === apex(link)) { if (verbose) diag.push({ company: name, skip: 'already_correct', link, realUrl }); continue; }
+        if (apex(realUrl) === apex(link)) { if (verbose) diag.push({ company: name, skip: 'already_correct', link, realUrl, matchKind, hid: hid || null }); continue; }
         // In mismatch mode, only flag plain-domain replacements when Harmonic match was high-confidence
         if (mode === 'mismatch' && !isSourceShape) {
           if (matchKind !== 'harmonic_id' && matchKind !== 'name_exact') { if (verbose) diag.push({ company: name, skip: 'low_confidence_match', matchKind, real }); continue; }
