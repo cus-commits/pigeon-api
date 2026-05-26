@@ -7759,9 +7759,13 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
   const apply = String(req.query.apply || req.body?.apply || '') === 'true';
   // mode=strict (default): only flag source-shaped URLs (tweets, casts, etc.)
   // mode=mismatch: ALSO flag plain domains that disagree with Harmonic's exact-name match
-  // mode=stages: limit to specific CRM stages (comma-separated, default = all)
+  // stages: limit to specific CRM stages (comma-separated, default = all)
+  // name: limit to a single company name (case-insensitive, verbose diagnostics)
   const mode = String(req.query.mode || req.body?.mode || 'strict');
   const stagesFilter = (req.query.stages || req.body?.stages || '').split(',').map(s => s.trim()).filter(Boolean);
+  const nameFilter = String(req.query.name || req.body?.name || '').toLowerCase().trim();
+  const verbose = !!nameFilter || String(req.query.verbose || '') === 'true';
+  const diag = [];
 
   const apex = (u) => String(u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].split(':')[0];
 
@@ -7786,9 +7790,10 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
         const name = rec.fields['Company'] || '';
         const stage = rec.fields['CRM Stage'] || '';
         if (stagesFilter.length && !stagesFilter.includes(stage)) continue;
+        if (nameFilter && name.toLowerCase().trim() !== nameFilter) continue;
         const isSourceShape = looksLikeSourceUrl(link);
         // In strict mode skip anything that doesn't look like a source URL
-        if (mode === 'strict' && !isSourceShape) continue;
+        if (mode === 'strict' && !isSourceShape) { if (verbose) diag.push({ company: name, skip: 'not_source_shape', link }); continue; }
         // In mismatch mode also process plain domains (we'll compare to Harmonic later)
         const hid = rec.fields['Harmonic ID'] || '';
         let real = '';
@@ -7813,12 +7818,12 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
             }
           }
         }
-        if (!real) continue;
+        if (!real) { if (verbose) diag.push({ company: name, skip: 'harmonic_no_website', hid, matchKind }); continue; }
         const realUrl = real.startsWith('http') ? real : `https://${real}`;
-        if (apex(realUrl) === apex(link)) continue; // already correct
+        if (apex(realUrl) === apex(link)) { if (verbose) diag.push({ company: name, skip: 'already_correct', link, realUrl }); continue; }
         // In mismatch mode, only flag plain-domain replacements when Harmonic match was high-confidence
         if (mode === 'mismatch' && !isSourceShape) {
-          if (matchKind !== 'harmonic_id' && matchKind !== 'name_exact') continue;
+          if (matchKind !== 'harmonic_id' && matchKind !== 'name_exact') { if (verbose) diag.push({ company: name, skip: 'low_confidence_match', matchKind, real }); continue; }
         }
         proposals.push({ id: rec.id, company: name, stage, from: link, to: realUrl, match: matchKind, source_shape: isSourceShape });
         if (apply) {
@@ -7830,7 +7835,7 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
       }
       offset = data.offset || null;
     } while (offset);
-    res.json({ scanned, mode, stages: stagesFilter, proposals, applied: apply, count: proposals.length });
+    res.json({ scanned, mode, stages: stagesFilter, proposals, applied: apply, count: proposals.length, ...(verbose ? { diagnostics: diag } : {}) });
   } catch (e) {
     console.error('[Heal] error:', e.message);
     res.json({ error: e.message });
