@@ -7431,15 +7431,19 @@ app.get('/api/harmonic/debug-company', async (req, res) => {
   try {
     const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=5`, { headers: { apikey: harmonicKey } });
     const td = await tr.json();
-    const results = (td.results || []).slice(0, 5).map(r => ({ id: r.id, name: r.name, entity_urn: r.entity_urn }));
-    const exact = (td.results || []).find(r => (r.name || '').toLowerCase().trim() === name.toLowerCase().trim());
+    // Return the RAW typeahead so we can see all fields
+    const rawTypeahead = (td.results || []).slice(0, 5);
+    // Try to fetch the first company entity by URN
     let full = null;
-    if (exact) {
-      const tid = exact.id || (exact.entity_urn || '').split(':').pop();
-      const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
-      if (cr.ok) full = await cr.json();
+    const first = (td.results || []).find(r => /company:/.test(r.entity_urn || ''));
+    if (first) {
+      const tid = (first.entity_urn || '').split(':').pop();
+      if (tid) {
+        const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
+        if (cr.ok) full = await cr.json();
+      }
     }
-    res.json({ typeahead: results, exact: exact ? { id: exact.id, name: exact.name } : null, full });
+    res.json({ rawTypeahead, full });
   } catch (e) { res.json({ error: e.message }); }
 });
 
