@@ -7757,6 +7757,13 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
   if (!headers || !baseId) return res.json({ error: 'Airtable not configured' });
   if (!harmonicKey) return res.json({ error: 'Harmonic key not configured' });
   const apply = String(req.query.apply || req.body?.apply || '') === 'true';
+  // mode=strict (default): only flag source-shaped URLs (tweets, casts, etc.)
+  // mode=mismatch: ALSO flag plain domains that disagree with Harmonic's exact-name match
+  // mode=stages: limit to specific CRM stages (comma-separated, default = all)
+  const mode = String(req.query.mode || req.body?.mode || 'strict');
+  const stagesFilter = (req.query.stages || req.body?.stages || '').split(',').map(s => s.trim()).filter(Boolean);
+
+  const apex = (u) => String(u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].split(':')[0];
 
   try {
     const proposals = [];
@@ -7768,6 +7775,7 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
       url.searchParams.set('fields[]', 'Company');
       url.searchParams.append('fields[]', 'Company Link');
       url.searchParams.append('fields[]', 'Harmonic ID');
+      url.searchParams.append('fields[]', 'CRM Stage');
       if (offset) url.searchParams.set('offset', offset);
       const r = await fetch(url, { headers });
       if (!r.ok) return res.json({ error: `Airtable list error ${r.status}` });
@@ -7775,22 +7783,28 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
       for (const rec of data.records || []) {
         scanned++;
         const link = rec.fields['Company Link'] || '';
-        if (!looksLikeSourceUrl(link)) continue;
         const name = rec.fields['Company'] || '';
+        const stage = rec.fields['CRM Stage'] || '';
+        if (stagesFilter.length && !stagesFilter.includes(stage)) continue;
+        const isSourceShape = looksLikeSourceUrl(link);
+        // In strict mode skip anything that doesn't look like a source URL
+        if (mode === 'strict' && !isSourceShape) continue;
+        // In mismatch mode also process plain domains (we'll compare to Harmonic later)
         const hid = rec.fields['Harmonic ID'] || '';
-        // Resolve real domain via Harmonic
         let real = '';
+        let matchKind = '';
         if (hid) {
           const cr = await fetch(`${HARMONIC_BASE}/companies/${hid}`, { headers: { apikey: harmonicKey } });
-          if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; }
+          if (cr.ok) { const cd = await cr.json(); real = cd.website?.url || cd.website?.domain || ''; matchKind = 'harmonic_id'; }
         }
         if (!real && name) {
           const tr = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=3`, { headers: { apikey: harmonicKey } });
           if (tr.ok) {
             const td = await tr.json();
             const exact = (td.results || []).find(r => (r.name || '').toLowerCase().trim() === name.toLowerCase().trim());
-            const target = exact || (td.results || [])[0];
+            const target = exact || (mode !== 'mismatch' ? (td.results || [])[0] : null); // mismatch mode requires EXACT name match
             if (target) {
+              matchKind = exact ? 'name_exact' : 'name_fuzzy';
               const tid = target.id || (target.entity_urn || '').split(':').pop();
               if (tid) {
                 const cr = await fetch(`${HARMONIC_BASE}/companies/${tid}`, { headers: { apikey: harmonicKey } });
@@ -7799,9 +7813,14 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
             }
           }
         }
-        if (!real || real === link) continue;
+        if (!real) continue;
         const realUrl = real.startsWith('http') ? real : `https://${real}`;
-        proposals.push({ id: rec.id, company: name, from: link, to: realUrl });
+        if (apex(realUrl) === apex(link)) continue; // already correct
+        // In mismatch mode, only flag plain-domain replacements when Harmonic match was high-confidence
+        if (mode === 'mismatch' && !isSourceShape) {
+          if (matchKind !== 'harmonic_id' && matchKind !== 'name_exact') continue;
+        }
+        proposals.push({ id: rec.id, company: name, stage, from: link, to: realUrl, match: matchKind, source_shape: isSourceShape });
         if (apply) {
           const patch = await fetch(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}/${rec.id}`, {
             method: 'PATCH', headers, body: JSON.stringify({ fields: { 'Company Link': realUrl } }),
@@ -7811,7 +7830,7 @@ app.post('/api/airtable/heal-websites', async (req, res) => {
       }
       offset = data.offset || null;
     } while (offset);
-    res.json({ scanned, proposals, applied: apply, count: proposals.length });
+    res.json({ scanned, mode, stages: stagesFilter, proposals, applied: apply, count: proposals.length });
   } catch (e) {
     console.error('[Heal] error:', e.message);
     res.json({ error: e.message });
