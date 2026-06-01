@@ -1750,17 +1750,23 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
   if (!name) return res.json({ error: 'name required', companies: [] });
 
   try {
-    // Step 1: Find company by name
-    console.log(`[FindSimilar] Looking up "${name}"...`);
-    const lookupRes = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(name)}&size=1`, { headers: { apikey: harmonicKey } });
+    // Step 1: Find company by name.
+    // Strip parentheticals (e.g. "Bear (YC F25)" → "Bear") so the typeahead
+    // can actually match. Then filter results to COMPANY type and prefer an
+    // exact-text match over PERSON results that share the same query string.
+    const cleanName = name.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    console.log(`[FindSimilar] Looking up "${name}" (cleaned: "${cleanName}")...`);
+    const lookupRes = await fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(cleanName)}&size=10`, { headers: { apikey: harmonicKey } });
     if (!lookupRes.ok) return res.json({ error: `Typeahead failed: ${lookupRes.status}`, companies: [] });
     const lookupData = await lookupRes.json();
-    const results = lookupData.results || [];
-    if (results.length === 0) return res.json({ error: `"${name}" not found in Harmonic`, companies: [] });
-
-    const target = results[0];
-    const targetId = target.id || (target.entity_urn || '').split(':').pop();
-    console.log(`[FindSimilar] Found "${target.name}" (ID: ${targetId})`);
+    // Harmonic typeahead fields: { entity_urn, type, text } — NOT { id, name }.
+    const companyHits = (lookupData.results || []).filter(r => r.type === 'COMPANY');
+    if (companyHits.length === 0) return res.json({ error: `"${name}" not found in Harmonic`, companies: [] });
+    const cleanLower = cleanName.toLowerCase();
+    const exact = companyHits.find(r => (r.text || '').toLowerCase().trim() === cleanLower);
+    const target = exact || companyHits[0];
+    const targetId = (target.entity_urn || '').split(':').pop();
+    console.log(`[FindSimilar] Found "${target.text}" (ID: ${targetId}) ${exact ? '[exact]' : '[fuzzy]'}`);
 
     // Step 2: Get similar companies
     let rawResults = [];
@@ -1794,7 +1800,7 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
       let companies = filterBackburn(rawResults.map(c => gqlToCard(c)));
       companies = filterUserHidden(companies, hideIdx);
       console.log(`[FindSimilar] Already enriched: ${companies.length}`);
-      return res.json({ companies, targetName: target.name });
+      return res.json({ companies, targetName: target.text });
     }
 
     // Extract IDs and enrich
@@ -1815,8 +1821,8 @@ app.get('/api/harmonic/find-similar-by-name', async (req, res) => {
     const enriched = await gqlEnrichCompanies(idsAfterBurn, harmonicKey);
     let companies = filterBackburn(enriched.map(c => gqlToCard(c)));
     companies = filterUserHidden(companies, hideIdx);
-    console.log(`[FindSimilar] Enriched ${companies.length} similar to "${target.name}"`);
-    res.json({ companies, targetName: target.name });
+    console.log(`[FindSimilar] Enriched ${companies.length} similar to "${target.text}"`);
+    res.json({ companies, targetName: target.text });
   } catch (e) {
     console.error('[FindSimilar] Error:', e.message);
     res.json({ error: e.message, companies: [] });
