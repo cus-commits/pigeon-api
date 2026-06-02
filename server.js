@@ -7379,31 +7379,44 @@ app.get('/api/airtable/companies', async (req, res) => {
   const maxRecords = parseInt(req.query.limit) || 100;
 
   try {
-    let url = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?maxRecords=${maxRecords}`;
+    // Airtable's default page size is 100. For maxRecords > 100 we must
+    // paginate via the `offset` cursor. Single-stage queries kept the original
+    // single-fetch behavior; multi-stage / large requests now paginate.
+    const baseUrl = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}`;
+    const params = new URLSearchParams();
+    params.set('pageSize', '100');
     if (stages.length === 1) {
-      const formula = encodeURIComponent(`{CRM Stage} = "${stages[0]}"`);
-      url += `&filterByFormula=${formula}`;
+      params.set('filterByFormula', `{CRM Stage} = "${stages[0]}"`);
     } else if (stages.length > 1) {
       const clauses = stages.map(s => `{CRM Stage} = "${s.replace(/"/g, '\\"')}"`).join(', ');
-      url += `&filterByFormula=${encodeURIComponent(`OR(${clauses})`)}`;
+      params.set('filterByFormula', `OR(${clauses})`);
     }
-    // Don't rely on Airtable sort — sort server-side after mapping dates
 
-    console.log(`[Airtable] Fetching companies${stages.length ? ` (stages: ${stages.join(',')})` : ''}`);
-    const r = await fetch(url, { headers });
-    if (!r.ok) {
-      const err = await r.text().catch(() => '');
-      console.error(`[Airtable] Error: ${r.status} ${err.slice(0, 200)}`);
-      return res.json({ error: `Airtable error: ${r.status}`, companies: [] });
+    console.log(`[Airtable] Fetching companies${stages.length ? ` (stages: ${stages.join(',')}, max: ${maxRecords})` : ''}`);
+    const allRecords = [];
+    let offset = null;
+    do {
+      if (offset) params.set('offset', offset); else params.delete('offset');
+      const r = await fetch(`${baseUrl}?${params.toString()}`, { headers });
+      if (!r.ok) {
+        const err = await r.text().catch(() => '');
+        console.error(`[Airtable] Error: ${r.status} ${err.slice(0, 200)}`);
+        return res.json({ error: `Airtable error: ${r.status}`, companies: [] });
+      }
+      const data = await r.json();
+      for (const rec of data.records || []) {
+        allRecords.push(rec);
+        if (allRecords.length >= maxRecords) break;
+      }
+      if (allRecords.length >= maxRecords) break;
+      offset = data.offset || null;
+    } while (offset);
+
+    if (allRecords.length > 0) {
+      const fieldNames = Object.keys(allRecords[0].fields);
+      console.log(`[Airtable] Got ${allRecords.length} records. First fields: ${fieldNames.slice(0, 8).join(', ')}`);
     }
-    const data = await r.json();
-    // Log first record's field names for debugging
-    if (data.records?.length > 0) {
-      const fieldNames = Object.keys(data.records[0].fields);
-      console.log(`[Airtable] First record fields: ${fieldNames.join(', ')}`);
-      console.log(`[Airtable] Last Modified Time: "${data.records[0].fields['Last Modified Time']}" | createdTime: "${data.records[0].createdTime}"`);
-    }
-    const companies = (data.records || []).map(rec => ({
+    const companies = allRecords.map(rec => ({
       airtable_id: rec.id,
       created_time: rec.fields['Last Time CRM Stage Modified'] || rec.fields['Created'] || rec.createdTime || null,
       company: (rec.fields['Company'] || '').trim(),
