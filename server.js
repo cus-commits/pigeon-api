@@ -7374,18 +7374,22 @@ app.get('/api/airtable/companies', async (req, res) => {
   const baseId = process.env.AIRTABLE_BASE_ID;
   if (!headers || !baseId) return res.json({ error: 'Airtable not configured', companies: [] });
 
-  const stage = req.query.stage || ''; // BO, BORO, BORO-SM, Warm, Backburn
+  const stageParam = req.query.stage || ''; // single or comma-separated: BO,BORO,BORO-SM,Warm,Backburn
+  const stages = stageParam.split(',').map(s => s.trim()).filter(Boolean);
   const maxRecords = parseInt(req.query.limit) || 100;
 
   try {
     let url = `${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}?maxRecords=${maxRecords}`;
-    if (stage) {
-      const formula = encodeURIComponent(`{CRM Stage} = "${stage}"`);
+    if (stages.length === 1) {
+      const formula = encodeURIComponent(`{CRM Stage} = "${stages[0]}"`);
       url += `&filterByFormula=${formula}`;
+    } else if (stages.length > 1) {
+      const clauses = stages.map(s => `{CRM Stage} = "${s.replace(/"/g, '\\"')}"`).join(', ');
+      url += `&filterByFormula=${encodeURIComponent(`OR(${clauses})`)}`;
     }
     // Don't rely on Airtable sort — sort server-side after mapping dates
 
-    console.log(`[Airtable] Fetching companies${stage ? ` (stage: ${stage})` : ''}`);
+    console.log(`[Airtable] Fetching companies${stages.length ? ` (stages: ${stages.join(',')})` : ''}`);
     const r = await fetch(url, { headers });
     if (!r.ok) {
       const err = await r.text().catch(() => '');
@@ -7426,6 +7430,65 @@ app.get('/api/airtable/companies', async (req, res) => {
     res.json({ error: e.message, companies: [] });
   }
 });
+
+// Lightweight CRM stage index for cross-workflow badging on every company card.
+// Returns 3 lookup maps so the frontend can resolve a company → its CRM stage
+// by harmonic id, normalized name, or apex domain. Cached server-side (5min TTL).
+const _crmIndexCache = { data: null, fetchedAt: 0 };
+const CRM_INDEX_TTL = 5 * 60 * 1000;
+
+async function rebuildCrmIndex() {
+  const headers = airtableHeaders();
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  if (!headers || !baseId) return null;
+  const idx = { byName: {}, byDomain: {}, byHarmonicId: {}, counts: {}, generatedAt: Date.now() };
+  let offset = null, scanned = 0;
+  try {
+    do {
+      const url = new URL(`${AIRTABLE_API}/${baseId}/${AIRTABLE_TABLE}`);
+      url.searchParams.set('pageSize', '100');
+      ['Company', 'CRM Stage', 'Company Link', 'Harmonic ID'].forEach(f => url.searchParams.append('fields[]', f));
+      if (offset) url.searchParams.set('offset', offset);
+      const r = await fetch(url, { headers });
+      if (!r.ok) { console.error(`[CRM-Index] Airtable error ${r.status}`); return null; }
+      const data = await r.json();
+      for (const rec of data.records || []) {
+        scanned++;
+        const stage = (rec.fields['CRM Stage'] || '').trim();
+        if (!stage || stage === 'Not Imported To CRM') continue;
+        idx.counts[stage] = (idx.counts[stage] || 0) + 1;
+        const name = (rec.fields['Company'] || '').trim();
+        const link = rec.fields['Company Link'] || '';
+        const hid = String(rec.fields['Harmonic ID'] || '').trim();
+        const normName = normalizeBackburnName(name);
+        if (normName) idx.byName[normName] = stage;
+        const apex = extractApexDomain(link);
+        if (apex) idx.byDomain[apex] = stage;
+        if (hid) idx.byHarmonicId[hid] = stage;
+      }
+      offset = data.offset || null;
+    } while (offset);
+    console.log(`[CRM-Index] rebuilt: scanned=${scanned}, names=${Object.keys(idx.byName).length}, domains=${Object.keys(idx.byDomain).length}, ids=${Object.keys(idx.byHarmonicId).length}`);
+    return idx;
+  } catch (e) { console.error('[CRM-Index] error:', e.message); return null; }
+}
+
+app.get('/api/airtable/crm-index', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const now = Date.now();
+  const age = now - _crmIndexCache.fetchedAt;
+  const force = req.query.refresh === 'true';
+  if (!force && _crmIndexCache.data && age < CRM_INDEX_TTL) {
+    return res.json({ ..._crmIndexCache.data, cached: true, cacheAgeMs: age });
+  }
+  const idx = await rebuildCrmIndex();
+  if (!idx) return res.json({ error: 'CRM index unavailable', byName: {}, byDomain: {}, byHarmonicId: {}, counts: {} });
+  _crmIndexCache.data = idx; _crmIndexCache.fetchedAt = now;
+  res.json({ ...idx, cached: false });
+});
+
+// Bust the CRM index cache after any /add or stage-change so next read is fresh.
+function bustCrmIndexCache() { _crmIndexCache.data = null; _crmIndexCache.fetchedAt = 0; }
 
 // DEBUG: See raw Airtable fields for first record
 app.get('/api/harmonic/debug-company', async (req, res) => {
@@ -7762,6 +7825,7 @@ app.post('/api/airtable/add', async (req, res) => {
           return res.json({ error: `Airtable error: ${patchRes.status}`, details: patchErr.slice(0, 300) });
         }
         console.log(`[Airtable] Updated "${company}" → ${stage}, filled ${Object.keys(updateFields).length} fields`);
+        bustCrmIndexCache();
         return res.json({ success: true, action: 'updated', stage: stage || existing.fields['CRM Stage'], airtable_id: existing.id, fieldsUpdated: Object.keys(updateFields) });
       }
     }
@@ -7797,6 +7861,7 @@ app.post('/api/airtable/add', async (req, res) => {
         const data = await r.json();
         const newId = data.records?.[0]?.id;
         console.log(`[Airtable] Created "${company}" with minimal fields → ${newId}`);
+        bustCrmIndexCache();
         return res.json({ success: true, action: 'created', stage: stage || 'BO', airtable_id: newId, fieldsPopulated: Object.keys(safeFields), note: 'Some fields skipped due to type mismatch' });
       }
       return res.json({ error: `Airtable error: ${r.status}`, details: err.slice(0, 300) });
@@ -7804,6 +7869,7 @@ app.post('/api/airtable/add', async (req, res) => {
     const data = await r.json();
     const newId = data.records?.[0]?.id;
     console.log(`[Airtable] Created "${company}" → ${newId} with fields: ${Object.keys(fields).join(', ')}`);
+    bustCrmIndexCache();
     res.json({ success: true, action: 'created', stage: stage || 'BO', airtable_id: newId, fieldsPopulated: Object.keys(fields) });
   } catch (e) {
     console.error('[Airtable] Error:', e.message);
@@ -8015,6 +8081,7 @@ app.post('/api/airtable/update-stage', async (req, res) => {
       addToBackburnIndex({ name: company, website: record.fields?.['Company Link'] || '', harmonic_id: record.fields?.['Harmonic ID'] || null });
       setImmediate(() => { refreshBackburnIndex().catch(() => {}); });
     }
+    bustCrmIndexCache();
     res.json({ success: true, company, stage });
   } catch (e) {
     res.json({ error: e.message });
