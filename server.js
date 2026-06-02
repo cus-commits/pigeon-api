@@ -1655,8 +1655,12 @@ app.get('/api/harmonic/typeahead', async (req, res) => {
         });
       }
     }
-    console.log(`[Typeahead] Enriched ${enriched.length}: ${enriched.map(e => e.name).join(', ')}`);
-    res.json({ results: enriched });
+    // Per project rule: Backburn companies must NEVER appear in any search result.
+    // The typeahead used to leak Backburn into the global search dropdown.
+    const filtered = filterBackburn(enriched);
+    if (filtered.length !== enriched.length) console.log(`[Typeahead] Filtered ${enriched.length - filtered.length} backburn`);
+    console.log(`[Typeahead] Enriched ${filtered.length}: ${filtered.map(e => e.name).join(', ')}`);
+    res.json({ results: filtered });
   } catch (e) {
     console.error('[Typeahead] Error:', e.message);
     res.json({ results: [], error: e.message });
