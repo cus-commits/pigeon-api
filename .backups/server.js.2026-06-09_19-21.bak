@@ -9706,9 +9706,6 @@ const SCAN_TIERS = {
   deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 15, etaMin: 18, etaMax: 32, preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 150, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
   sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 25, etaMin: 30, etaMax: 50, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 300, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
   maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 40, etaMin: 45, etaMax: 75, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 500, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep (budget-capped) → top to DD' },
-  // Weekly per-partner search tier — invoked by cron every Monday 09:00 UTC and by /api/partner-searches/:id/run.
-  // Shape mirrors Standard so it integrates with the existing recurring-scan pipeline; ddPush=5 (top 5 per partner to DD).
-  weeklyPartner: { name: 'Weekly Partner', cost: '$15', budget: 15, ddPush: 5, etaMin: 8, etaMax: 18, preModel: 'claude-sonnet-4-20250514', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6', deepMax: 30, preBatch: 120, screenBatch: 60, deepBatch: 15, desc: 'Weekly per-partner search → top 5 to DD' },
 };
 
 const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
@@ -9724,10 +9721,6 @@ app.get('/api/recurring-scan/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const scans = Object.values(global._deepScans).map(s => ({
     id: s.id, status: s.status, progress: s.progress, stats: s.stats || {},
-    // Corpus-size signals surfaced at top level for easy UI access.
-    corpusSize: s.stats?.corpusSize ?? null,
-    corpusWarning: s.stats?.corpusWarning ?? false,
-    corpusIdeal: s.stats?.corpusIdeal ?? false,
     startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark',
     lastUpdatedAt: s.lastUpdatedAt || s.startedAt || null,
     interruptedAt: s.interruptedAt || null,
@@ -9862,7 +9855,7 @@ app.post('/api/recurring-scan', async (req, res) => {
 
   const safeWrite = (msg) => { try { if (clientConnected) res.write(msg); } catch (e) {} };
 
-  const anthropicKey = req.headers['x-anthropic-key'] || req.body?.anthropicKey || process.env.ANTHROPIC_API_KEY;
+  const anthropicKey = req.headers['x-anthropic-key'] || req.body?.anthropicKey;
   const harmonicKey = process.env.HARMONIC_API_KEY;
   const tierKey = req.headers['x-scan-tier'] || req.body?.tier || 'standard';
 
@@ -10343,13 +10336,6 @@ ${batchText}`;
     });
 
     scan.stats.filtered = filtered.length;
-    // Corpus-size signals (informational only; never aborts a scan):
-    // <2500 = warning (corpus too narrow), >=10000 = ideal coverage.
-    scan.stats.corpusSize = filtered.length;
-    scan.stats.corpusWarning = filtered.length < 2500;
-    scan.stats.corpusIdeal = filtered.length >= 10000;
-    if (scan.stats.corpusWarning) safeWrite(`: ⚠️ Corpus warning: only ${filtered.length} candidates (<2500); results may be narrow\n\n`);
-    else if (scan.stats.corpusIdeal) safeWrite(`: ✅ Corpus ideal: ${filtered.length} candidates (≥10000)\n\n`);
     safeWrite(`: 🔽 Filtered to ${filtered.length} (removed ${enrichedCards.length - filtered.length} VCs/late-stage/stealth)\n\n`);
 
     // Sort by traction signals — web traffic first
@@ -10713,10 +10699,6 @@ ${batchText}`;
       results: flattenedResults,
       screenAnalysis,
       stats: scan.stats,
-      // Corpus-size signals — informational; <2500 = narrow, >=10000 = ideal.
-      corpusSize: scan.stats.corpusSize ?? null,
-      corpusWarning: scan.stats.corpusWarning ?? false,
-      corpusIdeal: scan.stats.corpusIdeal ?? false,
       budgetUsed: budgetUsed.toFixed(2),
       timestamp: new Date().toISOString(),
       duration: Math.round((Date.now() - scan.startedAt) / 1000),
@@ -10768,296 +10750,6 @@ ${batchText}`;
     res.end();
   }
 });
-
-// ==========================================
-// WEEKLY PER-PARTNER SEARCH
-// 7 partners, each with stored prompt + filters. Cron runs Monday 09:00 UTC.
-// Each enabled partner's search calls the recurring-scan pipeline (tier=weeklyPartner),
-// pushing top 5 to the DD vetting pipeline.
-// ==========================================
-
-const PARTNER_SEARCHES_FILE = path.join(SCAN_VOLUME, 'partner_searches.json');
-
-// Whitelist — only these 7 ids are valid. Order matches Daxos partner list.
-const PARTNER_SEED = [
-  { id: 'mark',   name: 'Mark',   emoji: '🦅' },
-  { id: 'jake',   name: 'Jake',   emoji: '🐺' },
-  { id: 'joe',    name: 'Joe',    emoji: '🦁' },
-  { id: 'carlo',  name: 'Carlo',  emoji: '🐻' },
-  { id: 'liam',   name: 'Liam',   emoji: '🦊' },
-  { id: 'serena', name: 'Serena', emoji: '🦋' },
-  { id: 'nick',   name: 'Nick',   emoji: '🦈' },
-];
-const PARTNER_IDS = new Set(PARTNER_SEED.map(p => p.id));
-
-function defaultPartnerConfig(seed) {
-  return {
-    id: seed.id,
-    name: seed.name,
-    emoji: seed.emoji,
-    isEnabled: true,
-    searchPrompt: '',
-    context: '',
-    filters: {
-      sectors: [], stages: [], geos: [], models: [],
-      signals: [], maxRaised: '', maxValuation: '',
-      foundedAfter: '', minTeam: '', maxTeam: '',
-      keywords: '', excludeKeywords: '',
-    },
-    lastRunAt: null,
-    lastRunScanId: null,
-    lastRunResultCount: 0,
-    lastCorpusSize: 0,
-  };
-}
-
-function loadPartnerSearches() {
-  let state;
-  try {
-    state = JSON.parse(fs.readFileSync(PARTNER_SEARCHES_FILE, 'utf8'));
-  } catch {
-    state = { partners: {} };
-  }
-  if (!state || typeof state !== 'object') state = { partners: {} };
-  if (!state.partners || typeof state.partners !== 'object') state.partners = {};
-  // Heal: ensure every seed partner exists with all default fields.
-  let mutated = false;
-  for (const seed of PARTNER_SEED) {
-    if (!state.partners[seed.id]) {
-      state.partners[seed.id] = defaultPartnerConfig(seed);
-      mutated = true;
-    } else {
-      const p = state.partners[seed.id];
-      const dflt = defaultPartnerConfig(seed);
-      // Fill in any missing top-level field.
-      for (const k of Object.keys(dflt)) {
-        if (p[k] === undefined) { p[k] = dflt[k]; mutated = true; }
-      }
-      // Fill in any missing filter key.
-      if (!p.filters || typeof p.filters !== 'object') { p.filters = dflt.filters; mutated = true; }
-      else {
-        for (const k of Object.keys(dflt.filters)) {
-          if (p.filters[k] === undefined) { p.filters[k] = dflt.filters[k]; mutated = true; }
-        }
-      }
-      // Keep canonical name/emoji from seed (never let UI overwrite).
-      if (p.name !== seed.name) { p.name = seed.name; mutated = true; }
-      if (p.emoji !== seed.emoji) { p.emoji = seed.emoji; mutated = true; }
-    }
-  }
-  if (mutated) savePartnerSearches(state);
-  return state;
-}
-
-function savePartnerSearches(state) {
-  try { fs.writeFileSync(PARTNER_SEARCHES_FILE, JSON.stringify(state, null, 2)); }
-  catch (e) { console.error('[PartnerSearches] save error:', e.message); }
-}
-
-// Seed on first boot.
-loadPartnerSearches();
-
-app.get('/api/partner-searches', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(loadPartnerSearches());
-});
-
-app.get('/api/partner-searches/:id', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const id = (req.params.id || '').toLowerCase();
-  if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
-  const state = loadPartnerSearches();
-  res.json(state.partners[id]);
-});
-
-app.put('/api/partner-searches/:id', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const id = (req.params.id || '').toLowerCase();
-  if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
-  const state = loadPartnerSearches();
-  const current = state.partners[id];
-  const body = (req.body && typeof req.body === 'object') ? req.body : {};
-  // Allowed editable fields — merge, never overwrite blindly.
-  const editable = ['isEnabled', 'searchPrompt', 'context'];
-  for (const k of editable) {
-    if (body[k] !== undefined) current[k] = body[k];
-  }
-  // Filters merge — only known keys.
-  if (body.filters && typeof body.filters === 'object') {
-    for (const k of Object.keys(current.filters)) {
-      if (body.filters[k] !== undefined) current.filters[k] = body.filters[k];
-    }
-  }
-  // Never let client overwrite id/name/emoji/lastRun* — preserved automatically by ignoring them above.
-  state.partners[id] = current;
-  savePartnerSearches(state);
-  res.json(current);
-});
-
-// Loopback invocation: POST to the public /api/recurring-scan endpoint over 127.0.0.1.
-// Cheaper than refactoring the 900-line handler — the existing route already does
-// everything we need (Sonnet screen → Opus deep → vetting push, filterBackburn, etc).
-// We only need the scanId, which the SSE stream emits in its first data: line.
-async function triggerRecurringScanLoopback(body) {
-  const port = process.env.PORT || 3001;
-  const url = `http://127.0.0.1:${port}/api/recurring-scan`;
-  // node-fetch v3 is ESM-only; use dynamic import.
-  const { default: fetch } = await import('node-fetch');
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-scan-tier': 'weeklyPartner' },
-    body: JSON.stringify(body),
-  });
-  // The endpoint is SSE; the very first `data:` line is the scanId. Read incrementally.
-  const reader = resp.body;
-  let scanId = null;
-  let buf = '';
-  await new Promise((resolve) => {
-    const onData = (chunk) => {
-      buf += chunk.toString('utf8');
-      const m = buf.match(/data:\s*(\{[^\n]*"scanId"[^\n]*\})/);
-      if (m) {
-        try { const parsed = JSON.parse(m[1]); if (parsed.scanId) { scanId = parsed.scanId; resolve(); } } catch {}
-      }
-      // Also resolve if we hit an error event.
-      if (/data:\s*\{[^\n]*"error"/.test(buf)) resolve();
-    };
-    const onEnd = () => resolve();
-    reader.on('data', onData);
-    reader.on('end', onEnd);
-    reader.on('error', onEnd);
-    // Safety timeout so we don't hang forever.
-    setTimeout(() => resolve(), 8000);
-  });
-  return scanId;
-}
-
-app.post('/api/partner-searches/:id/run', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const id = (req.params.id || '').toLowerCase();
-  if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
-  const state = loadPartnerSearches();
-  const partner = state.partners[id];
-  if (!partner.searchPrompt?.trim()) return res.status(400).json({ error: 'partner has no searchPrompt configured' });
-
-  try {
-    const anthropicKey = req.headers['x-anthropic-key'] || process.env.ANTHROPIC_API_KEY;
-    if (!anthropicKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY missing' });
-
-    const filters = partner.filters || {};
-    const body = {
-      tier: 'weeklyPartner',
-      anthropicKey,
-      user: partner.name,
-      source: `weekly-partner:${partner.id}`,
-      notes: [partner.searchPrompt, partner.context].filter(s => s && s.trim()).join('\n\n').trim(),
-      keywords: filters.keywords || partner.searchPrompt || '',
-      excludeKeywords: filters.excludeKeywords || '',
-      sectors: filters.sectors || [],
-      stages: filters.stages || [],
-      geos: filters.geos || [],
-      models: filters.models || [],
-      signals: filters.signals || [],
-      maxRaised: filters.maxRaised || '',
-      maxValuation: filters.maxValuation || '',
-      foundedAfter: filters.foundedAfter || '',
-      minTeam: filters.minTeam || '',
-      maxTeam: filters.maxTeam || '',
-    };
-    const scanId = await triggerRecurringScanLoopback(body);
-    if (!scanId) return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
-
-    // Optimistically stamp lastRunAt + scanId. lastRunResultCount and lastCorpusSize will be
-    // filled in by the scan-completion sweeper below.
-    partner.lastRunAt = Date.now();
-    partner.lastRunScanId = scanId;
-    state.partners[id] = partner;
-    savePartnerSearches(state);
-    res.json({ scanId, partnerId: id });
-  } catch (e) {
-    console.error(`[PartnerSearches] /run ${id} error:`, e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Sweeper — periodically updates lastRunResultCount/lastCorpusSize for partners whose
-// last scan has just finished. Cheap; runs every 60s.
-setInterval(() => {
-  try {
-    const state = loadPartnerSearches();
-    let mutated = false;
-    for (const partner of Object.values(state.partners)) {
-      if (!partner.lastRunScanId) continue;
-      const scan = global._deepScans?.[partner.lastRunScanId];
-      if (!scan) continue;
-      if (scan.status !== 'done') continue;
-      const stats = scan.stats || {};
-      const newCount = stats.topResults ?? stats.ddPushed ?? 0;
-      const newCorpus = stats.corpusSize ?? 0;
-      if (partner.lastRunResultCount !== newCount || partner.lastCorpusSize !== newCorpus) {
-        partner.lastRunResultCount = newCount;
-        partner.lastCorpusSize = newCorpus;
-        mutated = true;
-      }
-    }
-    if (mutated) savePartnerSearches(state);
-  } catch (e) {}
-}, 60_000);
-
-// Weekly cron — every Monday 09:00 UTC.
-try {
-  const cronLib = require('node-cron');
-  cronLib.schedule('0 9 * * 1', async () => {
-    console.log('[WeeklyCron] Starting weekly per-partner search run');
-    const state = loadPartnerSearches();
-    for (const partner of Object.values(state.partners)) {
-      if (!partner.isEnabled) { console.log(`[WeeklyCron] skip ${partner.id} (disabled)`); continue; }
-      if (!partner.searchPrompt?.trim()) { console.log(`[WeeklyCron] skip ${partner.id} (no prompt)`); continue; }
-      try {
-        const filters = partner.filters || {};
-        const body = {
-          tier: 'weeklyPartner',
-          anthropicKey: process.env.ANTHROPIC_API_KEY,
-          user: partner.name,
-          source: `weekly-cron:${partner.id}`,
-          notes: [partner.searchPrompt, partner.context].filter(s => s && s.trim()).join('\n\n').trim(),
-          keywords: filters.keywords || partner.searchPrompt || '',
-          excludeKeywords: filters.excludeKeywords || '',
-          sectors: filters.sectors || [],
-          stages: filters.stages || [],
-          geos: filters.geos || [],
-          models: filters.models || [],
-          signals: filters.signals || [],
-          maxRaised: filters.maxRaised || '',
-          maxValuation: filters.maxValuation || '',
-          foundedAfter: filters.foundedAfter || '',
-          minTeam: filters.minTeam || '',
-          maxTeam: filters.maxTeam || '',
-        };
-        const scanId = await triggerRecurringScanLoopback(body);
-        if (scanId) {
-          partner.lastRunAt = Date.now();
-          partner.lastRunScanId = scanId;
-          // Re-load + save inside the loop to survive crashes mid-batch.
-          const s2 = loadPartnerSearches();
-          s2.partners[partner.id] = partner;
-          savePartnerSearches(s2);
-          console.log(`[WeeklyCron] ${partner.id} → scanId ${scanId}`);
-        } else {
-          console.error(`[WeeklyCron] ${partner.id}: no scanId returned`);
-        }
-      } catch (e) {
-        console.error(`[WeeklyCron] ${partner.id} failed:`, e.message);
-      }
-      // 30s gap between partners so we don't fan 7 concurrent Sonnet/Opus scans.
-      await new Promise(r => setTimeout(r, 30_000));
-    }
-    console.log('[WeeklyCron] Weekly run complete');
-  }, { timezone: 'UTC' });
-  console.log('[WeeklyCron] Scheduled: Mondays 09:00 UTC');
-} catch (e) {
-  console.error('[WeeklyCron] node-cron not available:', e.message);
-}
 
 // ==========================================
 // REACHOUTS — Multi-platform DM tracker
