@@ -11072,7 +11072,8 @@ app.get('/api/partner-searches/:id/preview-weights', (req, res) => {
   if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
   const state = loadPartnerSearches();
   const partner = state.partners[id];
-  const weekOffset = Math.max(0, Math.min(52, parseInt(req.query.week, 10) || 1));
+  const parsedWeek = parseInt(req.query.week, 10);
+  const weekOffset = Math.max(0, Math.min(52, Number.isFinite(parsedWeek) ? parsedWeek : 1));
   const targetDate = new Date(Date.now() + weekOffset * 7 * 24 * 60 * 60 * 1000);
   const weekTag = isoWeekTag(targetDate);
   const applied = rollWeightsForWeek(partner, weekTag);
