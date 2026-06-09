@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -9707,8 +9708,9 @@ const SCAN_TIERS = {
   sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 25, etaMin: 30, etaMax: 50, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 300, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
   maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 40, etaMin: 45, etaMax: 75, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 500, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep (budget-capped) → top to DD' },
   // Weekly per-partner search tier — invoked by cron every Monday 09:00 UTC and by /api/partner-searches/:id/run.
-  // Shape mirrors Standard so it integrates with the existing recurring-scan pipeline; ddPush=5 (top 5 per partner to DD).
-  weeklyPartner: { name: 'Weekly Partner', cost: '$15', budget: 15, ddPush: 5, etaMin: 8, etaMax: 18, preModel: 'claude-sonnet-4-20250514', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6', deepMax: 30, preBatch: 120, screenBatch: 60, deepBatch: 15, desc: 'Weekly per-partner search → top 5 to DD' },
+  // Mark's brief: deepest pipeline available, $18 ceiling per partner so 6 × $18 = $108/week < $120/week cap.
+  // Wall-clock ~35-75 min is fine. Shape mirrors Maximum so it integrates with the existing recurring-scan pipeline.
+  weeklyPartner: { name: 'Weekly Partner (Deep)', cost: '$18', budget: 18, ddPush: 5, etaMin: 35, etaMax: 75, preModel: 'claude-sonnet-4-20250514', preMax: 18000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6', deepMax: 60, preBatch: 120, screenBatch: 60, deepBatch: 15, desc: 'Weekly per-partner search (deep, slow, ≤$18) → top 5 to DD' },
 };
 
 const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
@@ -9722,17 +9724,28 @@ app.get('/api/recurring-scan/tiers', (req, res) => {
 
 app.get('/api/recurring-scan/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const scans = Object.values(global._deepScans).map(s => ({
-    id: s.id, status: s.status, progress: s.progress, stats: s.stats || {},
-    // Corpus-size signals surfaced at top level for easy UI access.
-    corpusSize: s.stats?.corpusSize ?? null,
-    corpusWarning: s.stats?.corpusWarning ?? false,
-    corpusIdeal: s.stats?.corpusIdeal ?? false,
-    startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark',
-    lastUpdatedAt: s.lastUpdatedAt || s.startedAt || null,
-    interruptedAt: s.interruptedAt || null,
-    finishedAt: s.finishedAt || null,
-  }));
+  const scans = Object.values(global._deepScans).map(s => {
+    const stats = s.stats || {};
+    // Best-effort "current/total" pulled out of `progress` for the UI strip.
+    const m = String(s.progress || '').match(/batch\s+(\d+)\/(\d+)/i);
+    const phase = progressToPhase(s.progress);
+    return {
+      id: s.id, status: s.status, progress: s.progress, stats,
+      // Corpus-size signals surfaced at top level for easy UI access.
+      corpusSize: stats.corpusSize ?? null,
+      corpusWarning: stats.corpusWarning ?? false,
+      corpusIdeal: stats.corpusIdeal ?? false,
+      startedAt: s.startedAt, tier: s.tier, user: s.user || 'Mark',
+      lastUpdatedAt: s.lastUpdatedAt || s.startedAt || null,
+      interruptedAt: s.interruptedAt || null,
+      finishedAt: s.finishedAt || null,
+      // New: structured phase + counts for progress-strip rendering.
+      phase,
+      phaseLabel: phase.replace(/-/g, ' '),
+      phaseCurrent: m ? parseInt(m[1], 10) : null,
+      phaseTotal: m ? parseInt(m[2], 10) : null,
+    };
+  });
   res.json({ scans });
 });
 
@@ -10778,17 +10791,93 @@ ${batchText}`;
 
 const PARTNER_SEARCHES_FILE = path.join(SCAN_VOLUME, 'partner_searches.json');
 
-// Whitelist — only these 7 ids are valid. Order matches Daxos partner list.
+// Whitelist — only these 6 ids are valid. Order matches Daxos partner list.
+// Serena removed 2026-06-09; loadPartnerSearches() prunes her from existing on-disk JSON.
 const PARTNER_SEED = [
   { id: 'mark',   name: 'Mark',   emoji: '🦅' },
   { id: 'jake',   name: 'Jake',   emoji: '🐺' },
   { id: 'joe',    name: 'Joe',    emoji: '🦁' },
   { id: 'carlo',  name: 'Carlo',  emoji: '🐻' },
   { id: 'liam',   name: 'Liam',   emoji: '🦊' },
-  { id: 'serena', name: 'Serena', emoji: '🦋' },
   { id: 'nick',   name: 'Nick',   emoji: '🦈' },
 ];
 const PARTNER_IDS = new Set(PARTNER_SEED.map(p => p.id));
+
+// ───────── Context-emphasis rotation helpers ─────────
+// Stable short hash for prompt/context fingerprinting.
+function shortHash(s) {
+  return crypto.createHash('sha256').update(String(s || '')).digest('hex').slice(0, 12);
+}
+// Stable id for a context chunk: hash of trimmed text. 8 hex chars is plenty for ~20 chunks.
+function chunkIdFor(text) {
+  return 'c' + crypto.createHash('sha256').update(String(text || '').trim()).digest('hex').slice(0, 8);
+}
+// Parse a raw context blob into chunks (one per non-empty line).
+function parseContextToChunks(raw) {
+  const text = String(raw || '');
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  return lines.map(line => ({ id: chunkIdFor(line), text: line, weight: 50, lockedByUser: false }));
+}
+// ISO week number for a given Date (used as the PRNG seed component so weights
+// stay stable for any given (partner, week) pair).
+function isoWeekNumber(d) {
+  const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dayNum = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  return Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+}
+function isoWeekTag(d = new Date()) {
+  return `${d.getUTCFullYear()}-W${isoWeekNumber(d)}`;
+}
+// Deterministic PRNG (mulberry32) seeded from a 32-bit hash of (partnerId + ':' + isoWeek).
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t = (t + 0x6D2B79F5) >>> 0;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function seedFor(partnerId, weekTag) {
+  const h = crypto.createHash('sha256').update(`${partnerId}:${weekTag}`).digest();
+  return (h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3];
+}
+// Roll weights for unlocked chunks in [20, 95]. Deterministic per (partnerId, weekTag).
+function rollWeightsForWeek(partner, weekTag) {
+  const rand = mulberry32(seedFor(partner.id, weekTag));
+  const applied = {};
+  for (const ch of (partner.contextChunks || [])) {
+    if (ch.lockedByUser) {
+      applied[ch.id] = ch.weight;
+    } else {
+      const w = 20 + Math.floor(rand() * (95 - 20 + 1)); // [20, 95]
+      applied[ch.id] = w;
+    }
+  }
+  return applied;
+}
+// Build the EMPHASIS GUIDANCE block to append to the partner's notes for one run.
+function buildEmphasisBlock(partner, appliedWeights) {
+  const chunks = partner.contextChunks || [];
+  if (!chunks.length) return '';
+  const high = [], med = [], low = [];
+  for (const ch of chunks) {
+    const w = (appliedWeights && appliedWeights[ch.id] !== undefined) ? appliedWeights[ch.id] : ch.weight;
+    const line = `(${w}%) ${ch.text}`;
+    if (w >= 70) high.push(line);
+    else if (w >= 40) med.push(line);
+    else low.push(line);
+  }
+  const sections = [];
+  sections.push('EMPHASIS GUIDANCE (this run\'s weighting):');
+  sections.push(`- HIGH (≥70%): ${high.length ? high.join(' | ') : '(none)'}`);
+  sections.push(`- MED  (40-69%): ${med.length ? med.join(' | ') : '(none)'}`);
+  sections.push(`- LOW  (<40%): ${low.length ? low.join(' | ') : '(none)'}`);
+  sections.push('Weight your scoring proportionally — companies satisfying HIGH-priority signals should rank significantly higher than those satisfying only LOW-priority signals.');
+  return sections.join('\n');
+}
 
 function defaultPartnerConfig(seed) {
   return {
@@ -10808,6 +10897,13 @@ function defaultPartnerConfig(seed) {
     lastRunScanId: null,
     lastRunResultCount: 0,
     lastCorpusSize: 0,
+    // ── Context-emphasis rotation (added 2026-06-09) ──
+    contextChunks: [],
+    autoVaryWeekly: true,
+    lastPromptHash: null,
+    lastContextHash: null,
+    lastWeightRollAt: null,
+    weeklyAppliedWeights: {},
   };
 }
 
@@ -10820,8 +10916,11 @@ function loadPartnerSearches() {
   }
   if (!state || typeof state !== 'object') state = { partners: {} };
   if (!state.partners || typeof state.partners !== 'object') state.partners = {};
-  // Heal: ensure every seed partner exists with all default fields.
+  // Migration: Serena removed 2026-06-09. Drop her if present; leave any other
+  // unknown ids alone (graceful — don't crash on unexpected shape).
   let mutated = false;
+  if (state.partners.serena) { delete state.partners.serena; mutated = true; }
+  // Heal: ensure every seed partner exists with all default fields.
   for (const seed of PARTNER_SEED) {
     if (!state.partners[seed.id]) {
       state.partners[seed.id] = defaultPartnerConfig(seed);
@@ -10840,6 +10939,12 @@ function loadPartnerSearches() {
           if (p.filters[k] === undefined) { p.filters[k] = dflt.filters[k]; mutated = true; }
         }
       }
+      // Migration: build contextChunks from existing context blob on first load.
+      if (!Array.isArray(p.contextChunks)) { p.contextChunks = []; mutated = true; }
+      if (p.contextChunks.length === 0 && p.context && p.context.trim()) {
+        p.contextChunks = parseContextToChunks(p.context);
+        mutated = true;
+      }
       // Keep canonical name/emoji from seed (never let UI overwrite).
       if (p.name !== seed.name) { p.name = seed.name; mutated = true; }
       if (p.emoji !== seed.emoji) { p.emoji = seed.emoji; mutated = true; }
@@ -10847,6 +10952,34 @@ function loadPartnerSearches() {
   }
   if (mutated) savePartnerSearches(state);
   return state;
+}
+
+// ───────── Next-Monday-09:00-UTC computation for ETA surface ─────────
+function nextMondayNineUTC(from = new Date()) {
+  const d = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate(), 9, 0, 0));
+  const day = d.getUTCDay(); // 0=Sun, 1=Mon...
+  let addDays;
+  if (day === 1 && from.getTime() < d.getTime()) {
+    addDays = 0; // Today is Monday and 09:00 UTC hasn't passed yet
+  } else {
+    addDays = (8 - day) % 7;
+    if (addDays === 0) addDays = 7;
+  }
+  d.setUTCDate(d.getUTCDate() + addDays);
+  return d.toISOString();
+}
+// Decode `scan.progress` string into a coarse phase label. Best-effort — the
+// recurring-scan handler writes free-form progress strings, so we sniff them.
+function progressToPhase(progressStr) {
+  const s = String(progressStr || '').toLowerCase();
+  if (!s) return 'starting';
+  if (s.includes('complete') || s.includes('cancelled') || s.startsWith('error')) return 'finalize';
+  if (s.includes('fetching') || s.includes('saved searches') || s.includes('harmonic')) return 'harmonic-fetch';
+  if (s.includes('pre-screen') || s.includes('pre screen')) return 'sonnet-prescreen';
+  if (s.includes('enriching')) return 'enrich';
+  if (s.includes('sonnet scoring') || s.includes('scoring batch')) return 'sonnet-screen';
+  if (s.includes('opus') || s.includes('deep analysis')) return 'opus-deep';
+  return 'running';
 }
 
 function savePartnerSearches(state) {
@@ -10857,9 +10990,23 @@ function savePartnerSearches(state) {
 // Seed on first boot.
 loadPartnerSearches();
 
+// Decorate a partner record with ETA + nextRunAt for UI surface.
+function decoratePartner(p) {
+  const tier = SCAN_TIERS.weeklyPartner;
+  return {
+    ...p,
+    nextRunAt: nextMondayNineUTC(),
+    etaMinMinutes: tier.etaMin,
+    etaMaxMinutes: tier.etaMax,
+  };
+}
+
 app.get('/api/partner-searches', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(loadPartnerSearches());
+  const state = loadPartnerSearches();
+  const decorated = {};
+  for (const [id, p] of Object.entries(state.partners)) decorated[id] = decoratePartner(p);
+  res.json({ partners: decorated });
 });
 
 app.get('/api/partner-searches/:id', (req, res) => {
@@ -10867,7 +11014,7 @@ app.get('/api/partner-searches/:id', (req, res) => {
   const id = (req.params.id || '').toLowerCase();
   if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
   const state = loadPartnerSearches();
-  res.json(state.partners[id]);
+  res.json(decoratePartner(state.partners[id]));
 });
 
 app.put('/api/partner-searches/:id', (req, res) => {
@@ -10878,7 +11025,7 @@ app.put('/api/partner-searches/:id', (req, res) => {
   const current = state.partners[id];
   const body = (req.body && typeof req.body === 'object') ? req.body : {};
   // Allowed editable fields — merge, never overwrite blindly.
-  const editable = ['isEnabled', 'searchPrompt', 'context'];
+  const editable = ['isEnabled', 'searchPrompt', 'context', 'autoVaryWeekly'];
   for (const k of editable) {
     if (body[k] !== undefined) current[k] = body[k];
   }
@@ -10888,10 +11035,81 @@ app.put('/api/partner-searches/:id', (req, res) => {
       if (body.filters[k] !== undefined) current.filters[k] = body.filters[k];
     }
   }
+  // Reconcile contextChunks from the (possibly updated) context blob.
+  // Preserve weight + lockedByUser for any text that survives the edit.
+  if (body.context !== undefined || body.contextChunks === undefined) {
+    const incoming = parseContextToChunks(current.context);
+    const prevById = new Map((current.contextChunks || []).map(c => [c.id, c]));
+    current.contextChunks = incoming.map(c => {
+      const prev = prevById.get(c.id);
+      return prev ? { ...c, weight: prev.weight, lockedByUser: !!prev.lockedByUser } : c;
+    });
+  } else if (Array.isArray(body.contextChunks)) {
+    // Client-driven chunks (advanced UI). Normalize.
+    current.contextChunks = body.contextChunks
+      .filter(c => c && typeof c.text === 'string' && c.text.trim())
+      .map(c => ({
+        id: c.id && /^c[0-9a-f]{6,}$/.test(c.id) ? c.id : chunkIdFor(c.text),
+        text: c.text.trim(),
+        weight: Math.max(0, Math.min(100, Number.isFinite(+c.weight) ? +c.weight : 50)),
+        lockedByUser: !!c.lockedByUser,
+      }));
+  }
+  // Recompute fingerprints so the next run knows whether to re-roll.
+  current.lastPromptHash = shortHash(current.searchPrompt || '');
+  current.lastContextHash = shortHash((current.contextChunks || []).map(c => c.text).join('\n'));
   // Never let client overwrite id/name/emoji/lastRun* — preserved automatically by ignoring them above.
   state.partners[id] = current;
   savePartnerSearches(state);
-  res.json(current);
+  res.json(decoratePartner(current));
+});
+
+// Preview the weights that WOULD be applied for a given ISO-week offset.
+// ?week=<N> where N=0 is current week, 1 is next week (default).
+app.get('/api/partner-searches/:id/preview-weights', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const id = (req.params.id || '').toLowerCase();
+  if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
+  const state = loadPartnerSearches();
+  const partner = state.partners[id];
+  const weekOffset = Math.max(0, Math.min(52, parseInt(req.query.week, 10) || 1));
+  const targetDate = new Date(Date.now() + weekOffset * 7 * 24 * 60 * 60 * 1000);
+  const weekTag = isoWeekTag(targetDate);
+  const applied = rollWeightsForWeek(partner, weekTag);
+  res.json({
+    partnerId: id,
+    weekTag,
+    weekOffset,
+    autoVaryWeekly: !!partner.autoVaryWeekly,
+    chunks: (partner.contextChunks || []).map(c => ({
+      id: c.id,
+      text: c.text,
+      currentWeight: c.weight,
+      previewWeight: applied[c.id],
+      lockedByUser: !!c.lockedByUser,
+    })),
+  });
+});
+
+// Lock/unlock a chunk (and optionally pin a weight).
+app.post('/api/partner-searches/:id/lock-chunk', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const id = (req.params.id || '').toLowerCase();
+  if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
+  const state = loadPartnerSearches();
+  const partner = state.partners[id];
+  const body = (req.body && typeof req.body === 'object') ? req.body : {};
+  const chunkId = String(body.chunkId || '');
+  if (!chunkId) return res.status(400).json({ error: 'chunkId required' });
+  const chunk = (partner.contextChunks || []).find(c => c.id === chunkId);
+  if (!chunk) return res.status(404).json({ error: 'chunk not found' });
+  if (body.locked !== undefined) chunk.lockedByUser = !!body.locked;
+  if (body.weight !== undefined && Number.isFinite(+body.weight)) {
+    chunk.weight = Math.max(0, Math.min(100, +body.weight));
+  }
+  state.partners[id] = partner;
+  savePartnerSearches(state);
+  res.json({ partnerId: id, chunk });
 });
 
 // Loopback invocation: POST to the public /api/recurring-scan endpoint over 127.0.0.1.
@@ -10932,6 +11150,55 @@ async function triggerRecurringScanLoopback(body) {
   return scanId;
 }
 
+// Build the recurring-scan body for one partner. Mutates `partner` in place to
+// stamp weeklyAppliedWeights + lastWeightRollAt when a fresh weight roll happens.
+// Returns { body, applied } so callers can persist the partner.
+function buildPartnerScanBody(partner, { anthropicKey, sourcePrefix }) {
+  const filters = partner.filters || {};
+  // Decide whether to roll fresh weights for this run.
+  const promptHash = shortHash(partner.searchPrompt || '');
+  const contextHash = shortHash((partner.contextChunks || []).map(c => c.text).join('\n'));
+  const unchanged = partner.lastPromptHash === promptHash && partner.lastContextHash === contextHash;
+  let applied;
+  if (partner.autoVaryWeekly && unchanged && (partner.contextChunks || []).length > 0) {
+    const weekTag = isoWeekTag();
+    applied = rollWeightsForWeek(partner, weekTag);
+    partner.weeklyAppliedWeights = applied;
+    partner.lastWeightRollAt = new Date().toISOString();
+  } else {
+    // Use whatever weights are currently set on the chunks.
+    applied = {};
+    for (const ch of (partner.contextChunks || [])) applied[ch.id] = ch.weight;
+    partner.weeklyAppliedWeights = applied;
+  }
+  // Keep fingerprints fresh (used by next run's "unchanged" check).
+  partner.lastPromptHash = promptHash;
+  partner.lastContextHash = contextHash;
+
+  const emphasis = buildEmphasisBlock(partner, applied);
+  const notesPieces = [partner.searchPrompt, partner.context, emphasis].filter(s => s && s.trim());
+  const body = {
+    tier: 'weeklyPartner',
+    anthropicKey,
+    user: partner.name,
+    source: `${sourcePrefix}:${partner.id}`,
+    notes: notesPieces.join('\n\n').trim(),
+    keywords: filters.keywords || partner.searchPrompt || '',
+    excludeKeywords: filters.excludeKeywords || '',
+    sectors: filters.sectors || [],
+    stages: filters.stages || [],
+    geos: filters.geos || [],
+    models: filters.models || [],
+    signals: filters.signals || [],
+    maxRaised: filters.maxRaised || '',
+    maxValuation: filters.maxValuation || '',
+    foundedAfter: filters.foundedAfter || '',
+    minTeam: filters.minTeam || '',
+    maxTeam: filters.maxTeam || '',
+  };
+  return { body, applied };
+}
+
 app.post('/api/partner-searches/:id/run', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const id = (req.params.id || '').toLowerCase();
@@ -10944,36 +11211,26 @@ app.post('/api/partner-searches/:id/run', async (req, res) => {
     const anthropicKey = req.headers['x-anthropic-key'] || process.env.ANTHROPIC_API_KEY;
     if (!anthropicKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY missing' });
 
-    const filters = partner.filters || {};
-    const body = {
-      tier: 'weeklyPartner',
-      anthropicKey,
-      user: partner.name,
-      source: `weekly-partner:${partner.id}`,
-      notes: [partner.searchPrompt, partner.context].filter(s => s && s.trim()).join('\n\n').trim(),
-      keywords: filters.keywords || partner.searchPrompt || '',
-      excludeKeywords: filters.excludeKeywords || '',
-      sectors: filters.sectors || [],
-      stages: filters.stages || [],
-      geos: filters.geos || [],
-      models: filters.models || [],
-      signals: filters.signals || [],
-      maxRaised: filters.maxRaised || '',
-      maxValuation: filters.maxValuation || '',
-      foundedAfter: filters.foundedAfter || '',
-      minTeam: filters.minTeam || '',
-      maxTeam: filters.maxTeam || '',
-    };
+    const { body, applied } = buildPartnerScanBody(partner, { anthropicKey, sourcePrefix: 'weekly-partner' });
+    const startedAt = Date.now();
     const scanId = await triggerRecurringScanLoopback(body);
     if (!scanId) return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
 
     // Optimistically stamp lastRunAt + scanId. lastRunResultCount and lastCorpusSize will be
     // filled in by the scan-completion sweeper below.
-    partner.lastRunAt = Date.now();
+    partner.lastRunAt = startedAt;
     partner.lastRunScanId = scanId;
     state.partners[id] = partner;
     savePartnerSearches(state);
-    res.json({ scanId, partnerId: id });
+    const tier = SCAN_TIERS.weeklyPartner;
+    res.json({
+      scanId,
+      partnerId: id,
+      startedAt: new Date(startedAt).toISOString(),
+      etaMinMinutes: tier.etaMin,
+      etaMaxMinutes: tier.etaMax,
+      appliedWeights: applied,
+    });
   } catch (e) {
     console.error(`[PartnerSearches] /run ${id} error:`, e.message);
     res.status(500).json({ error: e.message });
@@ -11014,31 +11271,17 @@ try {
       if (!partner.isEnabled) { console.log(`[WeeklyCron] skip ${partner.id} (disabled)`); continue; }
       if (!partner.searchPrompt?.trim()) { console.log(`[WeeklyCron] skip ${partner.id} (no prompt)`); continue; }
       try {
-        const filters = partner.filters || {};
-        const body = {
-          tier: 'weeklyPartner',
+        const { body } = buildPartnerScanBody(partner, {
           anthropicKey: process.env.ANTHROPIC_API_KEY,
-          user: partner.name,
-          source: `weekly-cron:${partner.id}`,
-          notes: [partner.searchPrompt, partner.context].filter(s => s && s.trim()).join('\n\n').trim(),
-          keywords: filters.keywords || partner.searchPrompt || '',
-          excludeKeywords: filters.excludeKeywords || '',
-          sectors: filters.sectors || [],
-          stages: filters.stages || [],
-          geos: filters.geos || [],
-          models: filters.models || [],
-          signals: filters.signals || [],
-          maxRaised: filters.maxRaised || '',
-          maxValuation: filters.maxValuation || '',
-          foundedAfter: filters.foundedAfter || '',
-          minTeam: filters.minTeam || '',
-          maxTeam: filters.maxTeam || '',
-        };
+          sourcePrefix: 'weekly-cron',
+        });
         const scanId = await triggerRecurringScanLoopback(body);
         if (scanId) {
           partner.lastRunAt = Date.now();
           partner.lastRunScanId = scanId;
-          // Re-load + save inside the loop to survive crashes mid-batch.
+          // Re-load + save inside the loop to survive crashes mid-batch. We
+          // overwrite this partner only — leave every other partner's
+          // weeklyAppliedWeights / hashes alone in case another tick mutated them.
           const s2 = loadPartnerSearches();
           s2.partners[partner.id] = partner;
           savePartnerSearches(s2);
@@ -11049,7 +11292,7 @@ try {
       } catch (e) {
         console.error(`[WeeklyCron] ${partner.id} failed:`, e.message);
       }
-      // 30s gap between partners so we don't fan 7 concurrent Sonnet/Opus scans.
+      // 30s gap between partners so we don't fan 6 concurrent Sonnet/Opus scans.
       await new Promise(r => setTimeout(r, 30_000));
     }
     console.log('[WeeklyCron] Weekly run complete');
