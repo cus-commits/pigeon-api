@@ -10897,6 +10897,10 @@ function defaultPartnerConfig(seed) {
     lastRunScanId: null,
     lastRunResultCount: 0,
     lastCorpusSize: 0,
+    // ── Per-partner rolling 7d cooldown (added 2026-06-09) ──
+    // ISO string. Initialized to next Monday 09:00 UTC on cold-start; bumped to
+    // now+7d on every manual or cron-triggered run.
+    nextRunAt: null,
     // ── Context-emphasis rotation (added 2026-06-09) ──
     contextChunks: [],
     autoVaryWeekly: true,
@@ -10924,6 +10928,8 @@ function loadPartnerSearches() {
   for (const seed of PARTNER_SEED) {
     if (!state.partners[seed.id]) {
       state.partners[seed.id] = defaultPartnerConfig(seed);
+      // New partners: clean weekly anchor on cold-start.
+      state.partners[seed.id].nextRunAt = nextMondayNineUTC();
       mutated = true;
     } else {
       const p = state.partners[seed.id];
@@ -10932,6 +10938,8 @@ function loadPartnerSearches() {
       for (const k of Object.keys(dflt)) {
         if (p[k] === undefined) { p[k] = dflt[k]; mutated = true; }
       }
+      // Migration: existing partners without a persisted nextRunAt get next Monday.
+      if (!p.nextRunAt) { p.nextRunAt = nextMondayNineUTC(); mutated = true; }
       // Fill in any missing filter key.
       if (!p.filters || typeof p.filters !== 'object') { p.filters = dflt.filters; mutated = true; }
       else {
@@ -10993,9 +11001,15 @@ loadPartnerSearches();
 // Decorate a partner record with ETA + nextRunAt for UI surface.
 function decoratePartner(p) {
   const tier = SCAN_TIERS.weeklyPartner;
+  const nextRunAt = p.nextRunAt || nextMondayNineUTC();
+  const nextRunMs = Date.parse(nextRunAt);
+  const secondsUntilNextRun = Number.isFinite(nextRunMs)
+    ? Math.max(0, Math.floor((nextRunMs - Date.now()) / 1000))
+    : null;
   return {
     ...p,
-    nextRunAt: nextMondayNineUTC(),
+    nextRunAt,
+    secondsUntilNextRun,
     etaMinMinutes: tier.etaMin,
     etaMaxMinutes: tier.etaMax,
   };
@@ -11214,6 +11228,13 @@ app.post('/api/partner-searches/:id/run', async (req, res) => {
 
     const { body, applied } = buildPartnerScanBody(partner, { anthropicKey, sourcePrefix: 'weekly-partner' });
     const startedAt = Date.now();
+    // Bump cooldown BEFORE loopback fires so an overlapping cron tick can't
+    // re-fire the same partner if this run is slow to start.
+    const nextRunAt = new Date(startedAt + 7 * 24 * 60 * 60 * 1000).toISOString();
+    partner.nextRunAt = nextRunAt;
+    state.partners[id] = partner;
+    savePartnerSearches(state);
+
     const scanId = await triggerRecurringScanLoopback(body);
     if (!scanId) return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
 
@@ -11228,6 +11249,8 @@ app.post('/api/partner-searches/:id/run', async (req, res) => {
       scanId,
       partnerId: id,
       startedAt: new Date(startedAt).toISOString(),
+      nextRunAt,
+      secondsUntilNextRun: Math.max(0, Math.floor((Date.parse(nextRunAt) - Date.now()) / 1000)),
       etaMinMinutes: tier.etaMin,
       etaMaxMinutes: tier.etaMax,
       appliedWeights: applied,
@@ -11262,16 +11285,36 @@ setInterval(() => {
   } catch (e) {}
 }, 60_000);
 
-// Weekly cron — every Monday 09:00 UTC.
+// Hourly cron — fires every hour at :00 UTC. Each partner runs on its own
+// rolling 7-day cycle: `nextRunAt` is bumped to now+7d whenever the partner
+// fires (manual or cron). The hourly tick only fires partners whose
+// `nextRunAt` is in the past.
 try {
   const cronLib = require('node-cron');
-  cronLib.schedule('0 9 * * 1', async () => {
-    console.log('[WeeklyCron] Starting weekly per-partner search run');
+  cronLib.schedule('0 * * * *', async () => {
+    const nowIso = new Date().toISOString();
+    console.log(`[WeeklyCron] Hourly check at ${nowIso}`);
     const state = loadPartnerSearches();
+    const now = Date.now();
+    const due = [];
     for (const partner of Object.values(state.partners)) {
-      if (!partner.isEnabled) { console.log(`[WeeklyCron] skip ${partner.id} (disabled)`); continue; }
-      if (!partner.searchPrompt?.trim()) { console.log(`[WeeklyCron] skip ${partner.id} (no prompt)`); continue; }
+      if (!partner.isEnabled) continue;
+      if (!partner.searchPrompt?.trim()) continue;
+      const nextMs = Date.parse(partner.nextRunAt || '');
+      if (!Number.isFinite(nextMs) || nextMs <= now) due.push(partner);
+    }
+    if (!due.length) { console.log('[WeeklyCron] No partners due this tick'); return; }
+    console.log(`[WeeklyCron] ${due.length} partner(s) due: ${due.map(p => p.id).join(', ')}`);
+    for (const partner of due) {
       try {
+        // Bump cooldown BEFORE loopback fires so the next hourly tick (or an
+        // overlapping run) can't re-fire the same partner.
+        partner.nextRunAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        {
+          const s0 = loadPartnerSearches();
+          s0.partners[partner.id] = partner;
+          savePartnerSearches(s0);
+        }
         const { body } = buildPartnerScanBody(partner, {
           anthropicKey: process.env.ANTHROPIC_API_KEY,
           sourcePrefix: 'weekly-cron',
@@ -11286,19 +11329,19 @@ try {
           const s2 = loadPartnerSearches();
           s2.partners[partner.id] = partner;
           savePartnerSearches(s2);
-          console.log(`[WeeklyCron] ${partner.id} → scanId ${scanId}`);
+          console.log(`[WeeklyCron] ${partner.id} → scanId ${scanId} (next run ${partner.nextRunAt})`);
         } else {
           console.error(`[WeeklyCron] ${partner.id}: no scanId returned`);
         }
       } catch (e) {
         console.error(`[WeeklyCron] ${partner.id} failed:`, e.message);
       }
-      // 30s gap between partners so we don't fan 6 concurrent Sonnet/Opus scans.
+      // 30s gap between partners so we don't fan multiple concurrent Sonnet/Opus scans.
       await new Promise(r => setTimeout(r, 30_000));
     }
-    console.log('[WeeklyCron] Weekly run complete');
+    console.log('[WeeklyCron] Hourly tick complete');
   }, { timezone: 'UTC' });
-  console.log('[WeeklyCron] Scheduled: Mondays 09:00 UTC');
+  console.log('[WeeklyCron] Scheduled: hourly at :00 UTC (per-partner 7d cooldown)');
 } catch (e) {
   console.error('[WeeklyCron] node-cron not available:', e.message);
 }
