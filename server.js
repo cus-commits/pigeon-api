@@ -10762,8 +10762,9 @@ ${batchText}`;
     } catch (e) {}
 
     // Weekly partner scans also get a dedicated per-partner history entry
-    // (surfaced by the History panel on /weekly).
-    if (weeklySourceMatch) {
+    // (surfaced by the History panel on /weekly). PARTNER_IDS check keeps
+    // arbitrary client-supplied source ids out of the history file.
+    if (weeklySourceMatch && PARTNER_IDS.has(weeklySourceMatch[2])) {
       try {
         const ddNames = new Set(ddCompanies.map(c => (c.name || '').toLowerCase()));
         appendPartnerHistory(weeklySourceMatch[2], {
@@ -10821,7 +10822,7 @@ ${batchText}`;
       safeWrite(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     }
     // Record failed/cancelled weekly runs too so the History panel tells the truth.
-    if (weeklySourceMatch) {
+    if (weeklySourceMatch && PARTNER_IDS.has(weeklySourceMatch[2])) {
       try {
         appendPartnerHistory(weeklySourceMatch[2], {
           scanId,
@@ -11366,23 +11367,50 @@ app.post('/api/partner-searches/:id/run', async (req, res) => {
     state.partners[id] = partner;
     savePartnerSearches(state);
 
-    const scanId = await triggerRecurringScanLoopback(body);
+    let scanId = null;
+    try {
+      scanId = await triggerRecurringScanLoopback(body);
+    } catch (e2) {
+      console.error(`[PartnerSearches] /run ${id} loopback error:`, e2.message);
+    }
     if (!scanId) {
-      // Scan never started — put the cooldown back so the failed attempt
-      // doesn't eat the partner's next 7 days.
-      try {
-        const sR = loadPartnerSearches();
-        if (sR.partners[id]) { sR.partners[id].nextRunAt = prevNextRunAt; savePartnerSearches(sR); }
-      } catch {}
-      return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
+      // The 8s scanId window can expire while the scan IS live (event-loop
+      // stall). Adopt such an orphan instead of restoring the cooldown —
+      // restoring would let the next cron tick double-fire this partner.
+      const tenMinAgo = Date.now() - 10 * 60 * 1000;
+      const orphan = Object.values(global._deepScans || {}).find(s =>
+        s.status === 'scanning' && s.tier?.key === 'weeklyPartner' &&
+        s.user === partner.name && (s.startedAt || 0) > tenMinAgo);
+      if (orphan) {
+        console.log(`[PartnerSearches] /run ${id}: adopting orphan scan ${orphan.id}`);
+        scanId = orphan.id;
+      } else {
+        // Scan genuinely never started — put the cooldown back so the failed
+        // attempt doesn't eat the partner's next 7 days.
+        try {
+          const sR = loadPartnerSearches();
+          if (sR.partners[id]) { sR.partners[id].nextRunAt = prevNextRunAt; savePartnerSearches(sR); }
+        } catch {}
+        return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
+      }
     }
 
-    // Optimistically stamp lastRunAt + scanId. lastRunResultCount and lastCorpusSize will be
-    // filled in by the scan-completion sweeper below.
-    partner.lastRunAt = startedAt;
-    partner.lastRunScanId = scanId;
-    state.partners[id] = partner;
-    savePartnerSearches(state);
+    // Stamp run fields surgically onto a fresh load — never rewrite the whole
+    // request-start snapshot (a concurrent PUT during the loopback window would
+    // be reverted). lastRunResultCount/lastCorpusSize backfilled by the sweeper.
+    {
+      const s2 = loadPartnerSearches();
+      const p2 = s2.partners[id];
+      if (p2) {
+        p2.lastRunAt = startedAt;
+        p2.lastRunScanId = scanId;
+        p2.weeklyAppliedWeights = partner.weeklyAppliedWeights;
+        p2.lastWeightRollAt = partner.lastWeightRollAt;
+        p2.lastPromptHash = partner.lastPromptHash;
+        p2.lastContextHash = partner.lastContextHash;
+        savePartnerSearches(s2);
+      }
+    }
     const tier = SCAN_TIERS.weeklyPartner;
     res.json({
       scanId,
@@ -11526,6 +11554,12 @@ try {
               if (s4.partners[dueId]) {
                 s4.partners[dueId].lastRunAt = orphan.startedAt || Date.now();
                 s4.partners[dueId].lastRunScanId = orphan.id;
+                // The adopted scan ran with the weights/hashes buildPartnerScanBody
+                // rolled — persist them so next run's "unchanged" check is honest.
+                s4.partners[dueId].weeklyAppliedWeights = partner.weeklyAppliedWeights;
+                s4.partners[dueId].lastWeightRollAt = partner.lastWeightRollAt;
+                s4.partners[dueId].lastPromptHash = partner.lastPromptHash;
+                s4.partners[dueId].lastContextHash = partner.lastContextHash;
                 savePartnerSearches(s4);
               }
             } catch (e) {}
