@@ -3157,21 +3157,20 @@ ${batchText}`;
     const SCORE_BATCH = 15;
     const scoredCompanies = [];
 
-    for (let i = 0; i < Math.ceil(toScore.length / SCORE_BATCH); i++) {
-      const batch = toScore.slice(i * SCORE_BATCH, (i + 1) * SCORE_BATCH);
-      const batchText = batch.map((c, idx) => {
-        const parts = [`### ${i * SCORE_BATCH + idx + 1}. ${c.name}`];
-        if (c.description) parts.push(`Description: ${(c.description || '').slice(0, 200)}`);
-        if (c.website) parts.push(`Website: ${c.website}`);
-        if (c.funding_stage) parts.push(`Stage: ${c.funding_stage}`);
-        if (c.funding_total) parts.push(`Funding: $${(c.funding_total/1e6).toFixed(1)}M`);
-        if (c.headcount) parts.push(`Team size: ${c.headcount}`);
-        if (c.location) parts.push(`Location: ${c.location}`);
-        if (c.founders?.length) parts.push(`Founders: ${c.founders.map(f => typeof f === 'string' ? f : f.name).filter(Boolean).join(', ')}`);
-        return parts.join('\n');
-      }).join('\n\n');
+    // Batch-text + prompt builders — shared by the scoring batches and the Fable-5 top-10 re-rate.
+    const buildScoreBatchText = (batch, startIdx) => batch.map((c, idx) => {
+      const parts = [`### ${startIdx + idx + 1}. ${c.name}`];
+      if (c.description) parts.push(`Description: ${(c.description || '').slice(0, 200)}`);
+      if (c.website) parts.push(`Website: ${c.website}`);
+      if (c.funding_stage) parts.push(`Stage: ${c.funding_stage}`);
+      if (c.funding_total) parts.push(`Funding: $${(c.funding_total/1e6).toFixed(1)}M`);
+      if (c.headcount) parts.push(`Team size: ${c.headcount}`);
+      if (c.location) parts.push(`Location: ${c.location}`);
+      if (c.founders?.length) parts.push(`Founders: ${c.founders.map(f => typeof f === 'string' ? f : f.name).filter(Boolean).join(', ')}`);
+      return parts.join('\n');
+    }).join('\n\n');
 
-      const scorePrompt = `You are evaluating companies for how similar and relevant they are to: ${baselineDesc}.
+    const buildScorePrompt = (batchText) => `You are evaluating companies for how similar and relevant they are to: ${baselineDesc}.
 
 ${userContext ? `USER CRITERIA:\n${userContext}\n\n` : ''}For each company, provide:
 1. A relevance score from 1-10 (10 = extremely similar/relevant to the baselines)
@@ -3187,6 +3186,12 @@ Score based on: business model similarity, market overlap, technology alignment,
 
 COMPANIES TO SCORE:
 ${batchText}`;
+
+    for (let i = 0; i < Math.ceil(toScore.length / SCORE_BATCH); i++) {
+      const batch = toScore.slice(i * SCORE_BATCH, (i + 1) * SCORE_BATCH);
+      const batchText = buildScoreBatchText(batch, i * SCORE_BATCH);
+
+      const scorePrompt = buildScorePrompt(batchText);
 
       try {
         const sRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -3235,6 +3240,44 @@ ${batchText}`;
 
     // Sort by score
     scoredCompanies.sort((a, b) => (b._score || 0) - (a._score || 0));
+
+    // ── Fable-5 re-rate of top 10 (Opus tiers only: deep/max) ──
+    // Fable's score/analysis replace the Opus ones for the top 10, then results
+    // re-sort. Fail-soft: any error keeps the Opus scores.
+    if (scoreModel.includes('opus')) {
+      try {
+        const fableTop = scoredCompanies.filter(c => (c._score || 0) > 0).slice(0, 10);
+        if (fableTop.length > 0) {
+          sendProgress(`Fable-5 re-rating top ${fableTop.length} picks...`, 'score', 92);
+          const fablePrompt = buildScorePrompt(buildScoreBatchText(fableTop, 0));
+          const fRes = await callAnthropicJson(anthropicKey, FABLE_MODEL, fablePrompt, 4000);
+
+          if (fRes) {
+            let fableRefined = 0;
+            const blocks = fRes.text.split('---').filter(b => b.trim());
+            for (const block of blocks) {
+              const nameMatch = block.match(/COMPANY:\s*(.+)/i);
+              const scoreMatch = block.match(/SCORE:\s*(\d+(?:\.\d+)?)/i);
+              const analysisMatch = block.match(/ANALYSIS:\s*(.+)/is);
+              if (!nameMatch || !scoreMatch) continue;
+              const scoredName = nameMatch[1].trim().toLowerCase();
+              const match = fableTop.find(c => (c.name || '').toLowerCase().trim() === scoredName || (c.name || '').toLowerCase().includes(scoredName) || scoredName.includes((c.name || '').toLowerCase()));
+              if (!match) continue;
+              match._preFableScore = match._score;
+              match._score = parseFloat(scoreMatch[1]);
+              if (analysisMatch) match._analysis = analysisMatch[1].trim().split('\n')[0].trim();
+              match._ratedBy = 'fable-5';
+              fableRefined++;
+            }
+            scoredCompanies.sort((a, b) => (b._score || 0) - (a._score || 0));
+            console.log(`[DeepSearch] Fable-5 re-rated ${fableRefined}/${fableTop.length} top picks`);
+            sendProgress(`Fable-5 re-rated ${fableRefined} top picks`, 'score', 94);
+          }
+        }
+      } catch (e) {
+        console.warn('[DeepSearch] Fable re-rate failed — keeping Opus scores:', e.message);
+      }
+    }
 
     // STEP 4: Generate summary
     sendProgress('Generating search summary...', 'done', 95);
@@ -4050,13 +4093,8 @@ ${batchText}`;
     console.log('[AutoScan] No companies passed Sonnet filter and no enriched cards — skipping deep scoring');
   }
 
-  for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-    const batchStart = batchIdx * analysisBatchSize;
-    const batchCards = opusCandidates.slice(batchStart, batchStart + analysisBatchSize);
-    const batchDataText = buildCompanyText(batchCards, batchStart);
-    const batchLabel = totalBatches > 1 ? ` (Batch ${batchIdx + 1}/${totalBatches})` : '';
-
-    const batchPrompt = isSavedSearchMode
+  // Analysis prompt builder + score parser — shared by the deep-scoring batches and the Fable-5 top-10 re-rate.
+  const buildAnalysisPrompt = (batchCards, batchDataText, batchLabel) => isSavedSearchMode
       ? `You are a senior deal analyst at Daxos Capital ($100K-$250K checks, Pre-Seed/Seed focus).${batchLabel}
 
 This team member's investment profile:
@@ -4105,6 +4143,47 @@ STEALTH COMPANIES: Apply -90% score penalty to any "Stealth Company (Person Name
 COMPANY DATA:
 ${batchDataText}`;
 
+  // Clean name helper — strip numbering, emojis, parens, whitespace
+  const cleanName = (raw) => raw.replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').replace(/^\d+[\.\)]\s*/, '').trim().toLowerCase();
+
+  // Parse "Score: X/10" style output into `map` (same 4 strategies for every analysis pass)
+  const parseAnalysisScores = (batchAnalysis, map) => {
+    // Strategy 1: "**Name** — Score: N/10"
+    for (const m of batchAnalysis.matchAll(/\*\*(.{1,80}?)\*\*\s*[—\-–]\s*Score:\s*(\d+)\s*\/\s*10/gi)) {
+      const name = cleanName(m[1]);
+      if (name.length >= 2 && name.length < 50) map[name] = Math.max(map[name] || 0, parseInt(m[2]) || 0);
+    }
+    // Strategy 2: "Final Score: N/10" preceded by company header
+    for (const m of batchAnalysis.matchAll(/Final Score:\s*(\d+)\s*\/\s*10/gi)) {
+      const before = batchAnalysis.slice(Math.max(0, m.index - 2000), m.index);
+      const nameMatch = [...before.matchAll(/###?\s*\d+\.?\s*\*?\*?(.+?)\*?\*?\s*[—\-–]/gi)].pop();
+      if (nameMatch) {
+        const name = cleanName(nameMatch[1].replace(/\*\*/g, ''));
+        if (name.length >= 2 && name.length < 50) map[name] = Math.max(map[name] || 0, parseInt(m[1]) || 0);
+      }
+    }
+    // Strategy 3: Table format "| N | Name | Score/10 |"
+    for (const m of batchAnalysis.matchAll(/\|\s*\d+\s*\|\s*([^|]+?)\s*\|\s*(\d+)\s*\/\s*10\s*\|/gi)) {
+      const name = cleanName(m[1].replace(/\*\*/g, '').replace(/\[.*?\]/g, ''));
+      if (name.length >= 2) map[name] = Math.max(map[name] || 0, parseInt(m[2]) || 0);
+    }
+    // Strategy 4: "**Name** — N/10" (final picks)
+    for (const m of batchAnalysis.matchAll(/\*\*(.{1,60}?)\*\*\s*[—\-–]\s*(\d+)\s*\/\s*10/gi)) {
+      const name = cleanName(m[1]);
+      if (name.length >= 2 && name.length < 50 && !map[name]) {
+        map[name] = parseInt(m[2]) || 0;
+      }
+    }
+  };
+
+  for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+    const batchStart = batchIdx * analysisBatchSize;
+    const batchCards = opusCandidates.slice(batchStart, batchStart + analysisBatchSize);
+    const batchDataText = buildCompanyText(batchCards, batchStart);
+    const batchLabel = totalBatches > 1 ? ` (Batch ${batchIdx + 1}/${totalBatches})` : '';
+
+    const batchPrompt = buildAnalysisPrompt(batchCards, batchDataText, batchLabel);
+
     try {
       const modelLabel = tierCfg.useOpus ? 'Opus' : 'Sonnet';
       console.log(`[AutoScan] ${modelLabel} batch ${batchIdx + 1}/${totalBatches}: scoring ${batchCards.length} companies...`);
@@ -4132,36 +4211,8 @@ ${batchDataText}`;
       const batchAnalysis = claudeData.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
       allBatchAnalyses.push(totalBatches > 1 ? `## === OPUS BATCH ${batchIdx + 1}/${totalBatches} (${batchCards.length} companies) ===\n\n${batchAnalysis}` : batchAnalysis);
 
-      // Parse scores from this batch
-      // Clean name helper — strip numbering, emojis, parens, whitespace
-      const cleanName = (raw) => raw.replace(/🌐/g, '').replace(/\n/g, ' ').replace(/\(.*?\)/g, '').replace(/^\d+[\.\)]\s*/, '').trim().toLowerCase();
-
-      // Strategy 1: "**Name** — Score: N/10"
-      for (const m of batchAnalysis.matchAll(/\*\*(.{1,80}?)\*\*\s*[—\-–]\s*Score:\s*(\d+)\s*\/\s*10/gi)) {
-        const name = cleanName(m[1]);
-        if (name.length >= 2 && name.length < 50) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
-      }
-      // Strategy 2: "Final Score: N/10" preceded by company header
-      for (const m of batchAnalysis.matchAll(/Final Score:\s*(\d+)\s*\/\s*10/gi)) {
-        const before = batchAnalysis.slice(Math.max(0, m.index - 2000), m.index);
-        const nameMatch = [...before.matchAll(/###?\s*\d+\.?\s*\*?\*?(.+?)\*?\*?\s*[—\-–]/gi)].pop();
-        if (nameMatch) {
-          const name = cleanName(nameMatch[1].replace(/\*\*/g, ''));
-          if (name.length >= 2 && name.length < 50) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[1]) || 0);
-        }
-      }
-      // Strategy 3: Table format "| N | Name | Score/10 |"
-      for (const m of batchAnalysis.matchAll(/\|\s*\d+\s*\|\s*([^|]+?)\s*\|\s*(\d+)\s*\/\s*10\s*\|/gi)) {
-        const name = cleanName(m[1].replace(/\*\*/g, '').replace(/\[.*?\]/g, ''));
-        if (name.length >= 2) scoreMap[name] = Math.max(scoreMap[name] || 0, parseInt(m[2]) || 0);
-      }
-      // Strategy 4: "**Name** — N/10" (final picks)
-      for (const m of batchAnalysis.matchAll(/\*\*(.{1,60}?)\*\*\s*[—\-–]\s*(\d+)\s*\/\s*10/gi)) {
-        const name = cleanName(m[1]);
-        if (name.length >= 2 && name.length < 50 && !scoreMap[name]) {
-          scoreMap[name] = parseInt(m[2]) || 0;
-        }
-      }
+      // Parse scores from this batch (shared 4-strategy parser)
+      parseAnalysisScores(batchAnalysis, scoreMap);
       // PASS detection
       for (const m of batchAnalysis.matchAll(/\*?\*?([^*—\n]+?)\*?\*?\s*—\s*PASS/gi)) {
         passSet.add(m[1].trim().replace(/🌐/g, '').toLowerCase());
@@ -4228,15 +4279,67 @@ ${batchDataText}`;
     });
 
     // Sort: scored companies first (high to low), then PASS companies, then rest
-    companyCards.sort((a, b) => {
+    const scoreFirstSort = (a, b) => {
       if (a._score !== b._score) return b._score - a._score;
       const aPass = passSet.has((a.name||'').toLowerCase()) ? 1 : 0;
       const bPass = passSet.has((b.name||'').toLowerCase()) ? 1 : 0;
       if (aPass !== bPass) return bPass - aPass;
       return (b.funding_total || 0) - (a.funding_total || 0);
-    });
+    };
+    companyCards.sort(scoreFirstSort);
 
     console.log(`[AutoScan] Final sort: ${Object.keys(scoreMap).length} scored, ${passSet.size} passed`);
+
+    // ── Fable-5 re-rate of top 10 (Opus tiers only: full/balanced) ──
+    // Fable's score replaces the Opus one for the top 10, scoreMap is kept in
+    // sync so the DD push below uses the fable scores, then results re-sort.
+    // Fail-soft: any error keeps the Opus scores.
+    if (tierCfg.useOpus && Object.keys(scoreMap).length > 0) {
+      try {
+        const fableTop = companyCards.filter(c => (c._score || 0) > 0).slice(0, 10);
+        if (fableTop.length > 0) {
+          console.log(`[AutoScan] Fable-5 re-rating top ${fableTop.length} picks...`);
+          safeWrite(`: 🧠 Fable-5 re-rating top ${fableTop.length} picks...\n\n`);
+          updateProgress(`Fable-5 re-rating top ${fableTop.length}`, "deepscore");
+
+          const fableText = buildCompanyText(fableTop, 0);
+          const fablePrompt = buildAnalysisPrompt(fableTop, fableText, ' (FINAL RE-RATE: top picks)');
+          const fRes = await callAnthropicJson(anthropicKey, FABLE_MODEL, fablePrompt, 4000);
+
+          if (fRes) {
+            const fableScores = {};
+            parseAnalysisScores(fRes.text, fableScores);
+            let fableRefined = 0;
+            for (const c of fableTop) {
+              const n = (c.name || '').toLowerCase().trim();
+              const noParen = n.replace(/\s*\(.*?\)\s*/g, '').trim();
+              let newScore = fableScores[n] || fableScores[noParen] || 0;
+              if (!newScore && noParen.length >= 5) {
+                for (const [k, v] of Object.entries(fableScores)) {
+                  if (k.length >= 5 && (k.startsWith(noParen) || noParen.startsWith(k))) { newScore = v; break; }
+                }
+              }
+              if (!newScore) continue;
+              // Keep hard stealth cap regardless of what Fable gave
+              if (c._isStealth || (c.name || '').toLowerCase().startsWith('stealth company')) newScore = Math.min(newScore, 3);
+              c._preFableScore = c._score;
+              c._score = newScore;
+              c._ratedBy = 'fable-5';
+              scoreMap[n] = newScore; // keep scoreMap in sync — DD push below re-derives via matchScore
+              fableRefined++;
+              safeWrite(`: 🧠 ${c.name} — Fable ${newScore}/10 (Opus had ${c._preFableScore}/10)\n\n`);
+            }
+            companyCards.sort(scoreFirstSort);
+            console.log(`[AutoScan] Fable-5 re-rated ${fableRefined}/${fableTop.length} top picks`);
+            safeWrite(`: 🧠 Fable-5 re-rated ${fableRefined} top picks\n\n`);
+          } else {
+            safeWrite(`: ⚠️ Fable-5 re-rate unavailable — keeping Opus scores\n\n`);
+          }
+        }
+      } catch (e) {
+        console.warn('[AutoScan] Fable re-rate failed — keeping Opus scores:', e.message);
+      }
+    }
 
     // Auto-push top picks to shared vetting pipeline
     // For savedSearch mode: batch1 (top 8 → DD), batch2 (overflow → stored)
@@ -5685,17 +5788,19 @@ app.post('/api/signals/super', async (req, res) => {
     const opusFillToN = ['opus80', 'extreme'].includes(superTier);
 
     // ── Real token-based cost tracking ──
-    // Anthropic pricing (per 1M tokens): Haiku 4.5 $1/$5 · Sonnet 4 $3/$15 · Opus 4.6 $15/$75
+    // Anthropic pricing (per 1M tokens): Haiku 4.5 $1/$5 · Sonnet 4 $3/$15 · Opus 4.6 $5/$25 · Fable 5 $10/$50
     const PRICING = {
       'claude-haiku-4-5-20251001':  { in: 1,  out: 5  },
       'claude-sonnet-4-20250514':   { in: 3,  out: 15 },
-      'claude-opus-4-6':            { in: 15, out: 75 },
+      'claude-opus-4-6':            { in: 5,  out: 25 },
+      'claude-fable-5':             { in: 10, out: 50 },
     };
-    const usage = { sonnetIn: 0, sonnetOut: 0, opusIn: 0, opusOut: 0, haikuIn: 0, haikuOut: 0 };
+    const usage = { sonnetIn: 0, sonnetOut: 0, opusIn: 0, opusOut: 0, haikuIn: 0, haikuOut: 0, fableIn: 0, fableOut: 0 };
     const recordUsage = (model, u) => {
       if (!u) return;
       const inT = u.input_tokens || 0, outT = u.output_tokens || 0;
-      if (model.includes('haiku'))      { usage.haikuIn += inT; usage.haikuOut += outT; }
+      if (model.includes('fable'))      { usage.fableIn += inT; usage.fableOut += outT; }
+      else if (model.includes('haiku')) { usage.haikuIn += inT; usage.haikuOut += outT; }
       else if (model.includes('opus'))  { usage.opusIn  += inT; usage.opusOut  += outT; }
       else                              { usage.sonnetIn += inT; usage.sonnetOut += outT; }
     };
@@ -5703,7 +5808,8 @@ app.post('/api/signals/super', async (req, res) => {
       const sonnet = (usage.sonnetIn * PRICING['claude-sonnet-4-20250514'].in + usage.sonnetOut * PRICING['claude-sonnet-4-20250514'].out) / 1e6;
       const opus   = (usage.opusIn   * PRICING['claude-opus-4-6'].in           + usage.opusOut   * PRICING['claude-opus-4-6'].out)           / 1e6;
       const haiku  = (usage.haikuIn  * PRICING['claude-haiku-4-5-20251001'].in + usage.haikuOut  * PRICING['claude-haiku-4-5-20251001'].out) / 1e6;
-      return { total: sonnet + opus + haiku, sonnet, opus, haiku, usage };
+      const fable  = (usage.fableIn  * PRICING['claude-fable-5'].in            + usage.fableOut  * PRICING['claude-fable-5'].out)            / 1e6;
+      return { total: sonnet + opus + haiku + fable, sonnet, opus, haiku, fable, usage };
     };
 
     // Track which sources actually ran (vs requested but skipped due to missing env keys)
@@ -6764,6 +6870,49 @@ ${signalText}`;
 
       // OPTIONAL: Opus deep scoring on top signals
       let opusAnalysis = '';
+
+      // Profile/prompt builders — shared by the Opus scoring paths and the Fable-5 top-10 re-rate.
+      const buildMeritProfiles = (batch) => batch.map(s => {
+        const m = s.meta || {};
+        const founders = m.founders || '';
+        const fundingStr = m.funding ? '$' + (m.funding/1e6).toFixed(1) + 'M' : 'undisclosed';
+        return `${s.title}
+Funding: ${fundingStr} | Stage: ${m.stage || s.subtitle || '?'} | Headcount: ${m.headcount || '?'}
+Founders: ${founders || 'unknown'}
+Web: ${s.url || m.website || '—'}
+Description: ${(s.text || '').slice(0, 500)}`;
+      });
+      const buildLegacyOpusPrompt = (signals) => `You are a senior deal partner at Daxos Capital evaluating Pre-Seed/Seed investments ($100K-$250K checks).
+${anchorContext ? `\nSEARCH SCOPE — User asked for companies similar to these baselines. These define WHAT we searched for, NOT how to score:\n${anchorContext}\n⚠ CRITICAL: These signals are ALREADY filtered to be similar to the baselines. Similarity is a given — do NOT give similarity bonus points. Rate each company on its OWN investment merit.\nA company that is "very similar to a baseline rated 6.5" is NOT automatically a 9. Score on absolute investment quality, not relative similarity.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (apply to scoring — what to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 12000)}\n` : ''}
+SCORE 1-10 on INVESTMENT MERIT — the question is "would this be a good investment?" not "how similar is this to the baseline?"
+
+We are looking for companies that are:
+• LIKELY TO BE SUCCESSFUL — strong founders, real traction, clear path to scale
+• GREAT PEDIGREE — repeat founder, prior exit, top-tier alumni, deep domain expertise
+• GOOD IDEA — solving a real problem, sound business model
+• NOVEL — differentiated angle, defensible moat, contrarian timing
+• UNDERVALUED — overlooked at this stage, mispriced relative to traction
+
+SCORING ANCHOR (be calibrated, not inflated):
+- 9-10: Top 1-2% — exceptional founder + novel idea + real traction + right stage. Rare.
+- 7-8: Top 10% — has 3 of {pedigree, idea, traction, undervalued}. Worth an intro call.
+- 5-6: Average — competent execution but missing the standout factor. Generic similar-to-baseline lands here by default.
+- 3-4: Weak — wrong stage, no traction, generic idea, or wrong fit
+- 1-2: Pass — noise, mature company, fundamental issues
+
+DEFAULT: most companies should land 4-6. Reserve 7+ for genuinely exceptional. A 9 means "I'd write the check now." Being similar to a baseline does NOT earn a 9 — it earns the right to be evaluated.
+
+STEALTH COMPANIES: -3 score penalty unless founder has $10M+ prior exit + thesis fit.
+Over-funded ($10M+): max score 6 unless extraordinary.
+
+Respond with a JSON block, then 1-sentence reasoning per company. Reasoning must explain MERIT (founder, traction, idea, valuation), NOT similarity:
+${'`'.repeat(3)}json
+{"CompanyName": {"score": 6, "reason": "Solo founder ex-Stripe, $200K ARR at seed, defensible UX angle but crowded category."}, ...}
+${'`'.repeat(3)}
+
+SIGNALS TO SCORE:
+${signals.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) — ${s.text?.slice(0, 200)}`).join('\n')}`;
+
       if (useOpus && anthropicKey) {
         // ── MERIT-MODE 5-DIM SCORING (when anchors are present) ──
         if (meritMode) {
@@ -6832,16 +6981,7 @@ ${signalText}`;
               return sendResult({ error: 'Cancelled by user', cancelled: true, signals: rated, totalSignals, sourceStats, anchorRatings, meritMode, partial: true });
             }
             const batch = meritPool.slice(bi * MERIT_BATCH_SIZE, (bi + 1) * MERIT_BATCH_SIZE);
-            const profiles = batch.map(s => {
-              const m = s.meta || {};
-              const founders = m.founders || '';
-              const fundingStr = m.funding ? '$' + (m.funding/1e6).toFixed(1) + 'M' : 'undisclosed';
-              return `${s.title}
-Funding: ${fundingStr} | Stage: ${m.stage || s.subtitle || '?'} | Headcount: ${m.headcount || '?'}
-Founders: ${founders || 'unknown'}
-Web: ${s.url || m.website || '—'}
-Description: ${(s.text || '').slice(0, 500)}`;
-            });
+            const profiles = buildMeritProfiles(batch);
 
             const prompt = buildMeritPrompt({
               companies: profiles,
@@ -6937,36 +7077,7 @@ Description: ${(s.text || '').slice(0, 500)}`;
         console.log(`[Super] Opus pool: ${topForOpus.length} signals (tier=${superTier}, fillToN=${opusFillToN}, opusTopN=${opusTopN})`);
         if (topForOpus.length > 0) {
           sendProgress(`Deep scoring ${topForOpus.length} signals with Opus...`, 'deepscore', { total: topForOpus.length });
-          const opusPrompt = `You are a senior deal partner at Daxos Capital evaluating Pre-Seed/Seed investments ($100K-$250K checks).
-${anchorContext ? `\nSEARCH SCOPE — User asked for companies similar to these baselines. These define WHAT we searched for, NOT how to score:\n${anchorContext}\n⚠ CRITICAL: These signals are ALREADY filtered to be similar to the baselines. Similarity is a given — do NOT give similarity bonus points. Rate each company on its OWN investment merit.\nA company that is "very similar to a baseline rated 6.5" is NOT automatically a 9. Score on absolute investment quality, not relative similarity.\n` : ''}${additionalInfo ? `\nADDITIONAL CONTEXT FROM USER (apply to scoring — what to prioritize, avoid, or look for):\n${additionalInfo.slice(0, 12000)}\n` : ''}
-SCORE 1-10 on INVESTMENT MERIT — the question is "would this be a good investment?" not "how similar is this to the baseline?"
-
-We are looking for companies that are:
-• LIKELY TO BE SUCCESSFUL — strong founders, real traction, clear path to scale
-• GREAT PEDIGREE — repeat founder, prior exit, top-tier alumni, deep domain expertise
-• GOOD IDEA — solving a real problem, sound business model
-• NOVEL — differentiated angle, defensible moat, contrarian timing
-• UNDERVALUED — overlooked at this stage, mispriced relative to traction
-
-SCORING ANCHOR (be calibrated, not inflated):
-- 9-10: Top 1-2% — exceptional founder + novel idea + real traction + right stage. Rare.
-- 7-8: Top 10% — has 3 of {pedigree, idea, traction, undervalued}. Worth an intro call.
-- 5-6: Average — competent execution but missing the standout factor. Generic similar-to-baseline lands here by default.
-- 3-4: Weak — wrong stage, no traction, generic idea, or wrong fit
-- 1-2: Pass — noise, mature company, fundamental issues
-
-DEFAULT: most companies should land 4-6. Reserve 7+ for genuinely exceptional. A 9 means "I'd write the check now." Being similar to a baseline does NOT earn a 9 — it earns the right to be evaluated.
-
-STEALTH COMPANIES: -3 score penalty unless founder has $10M+ prior exit + thesis fit.
-Over-funded ($10M+): max score 6 unless extraordinary.
-
-Respond with a JSON block, then 1-sentence reasoning per company. Reasoning must explain MERIT (founder, traction, idea, valuation), NOT similarity:
-${'`'.repeat(3)}json
-{"CompanyName": {"score": 6, "reason": "Solo founder ex-Stripe, $200K ARR at seed, defensible UX angle but crowded category."}, ...}
-${'`'.repeat(3)}
-
-SIGNALS TO SCORE:
-${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) — ${s.text?.slice(0, 200)}`).join('\n')}`;
+          const opusPrompt = buildLegacyOpusPrompt(topForOpus);
 
           try {
             const opusRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -6999,7 +7110,7 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
       }
 
       // Re-sort: Opus scores first (if available), then HIGH/MEDIUM/LOW
-      rated.sort((a, b) => {
+      const opusFirstSort = (a, b) => {
         if (a._opusScore && b._opusScore) return b._opusScore - a._opusScore;
         if (a._opusScore && !b._opusScore) return -1;
         if (!a._opusScore && b._opusScore) return 1;
@@ -7007,7 +7118,99 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
         const sigDiff = (order[a.signal] || 2) - (order[b.signal] || 2);
         if (sigDiff !== 0) return sigDiff;
         return b.engagement - a.engagement;
-      });
+      };
+      rated.sort(opusFirstSort);
+
+      // ── Fable-5 re-rate of the top 10 Opus-scored signals ──
+      // Fable's score replaces the Opus one (merit fields included in merit mode),
+      // then results re-sort. Fail-soft: any error keeps the Opus scores.
+      if (useOpus && anthropicKey && rated.some(s => s._opusScore)) {
+        try {
+          const fableTop = rated.filter(s => s._opusScore).slice(0, 10);
+          sendProgress(`Fable-5 re-rating top ${fableTop.length} picks...`, 'deepscore', { total: fableTop.length });
+
+          if (meritMode) {
+            const fablePrompt = buildMeritPrompt({
+              companies: buildMeritProfiles(fableTop),
+              anchorContext,
+              additionalInfo: additionalInfo.slice(0, 6000),
+              isAnchorSelfRating: false,
+              anchorRatings,
+            });
+            const fRes = await callAnthropicJson(anthropicKey, FABLE_MODEL, fablePrompt, 4096);
+            if (fRes) {
+              recordUsage(FABLE_MODEL, fRes.usage);
+              const m = fRes.text.match(/```json\s*\n?([\s\S]*?)\n?```/);
+              if (m) {
+                const parsed = JSON.parse(m[1]);
+                for (const s of fableTop) {
+                  const name = s.companyName || s.title || '';
+                  const v = parsed[name]
+                    || Object.entries(parsed).find(([k]) => k.toLowerCase().trim() === name.toLowerCase().trim())?.[1]
+                    || Object.entries(parsed).find(([k]) => k.toLowerCase().includes(name.toLowerCase().slice(0, 12)))?.[1];
+                  if (!v) continue;
+                  const dims = {
+                    pedigree: v.pedigree || 0, traction: v.traction || 0,
+                    capital: v.capital || 0, investor: v.investor || 0, defensibility: v.defensibility || 0,
+                  };
+                  const weighted = computeWeightedScore(dims);
+                  const modAdjust = applyModifiers(v.modifiers);
+                  const rawFinal = Math.max(0, Math.min(10, weighted + modAdjust));
+                  let anchorRating = null;
+                  if (s._anchor?.baseline) anchorRating = anchorRatings[s._anchor.baseline.toLowerCase()];
+                  if (!anchorRating && Object.values(anchorRatings).length > 0) anchorRating = Object.values(anchorRatings)[0];
+                  const ceilingResult = applyAnchorCeiling(dims, rawFinal, anchorRating);
+                  s._preFableScore = s._opusScore;
+                  s._merit = {
+                    ...dims,
+                    pedigree_reason: v.pedigree_reason || '',
+                    traction_reason: v.traction_reason || '',
+                    capital_reason: v.capital_reason || '',
+                    investor_reason: v.investor_reason || '',
+                    defensibility_reason: v.defensibility_reason || '',
+                    modifiers: Array.isArray(v.modifiers) ? v.modifiers : [],
+                    modifier_total: modAdjust,
+                    weighted_raw: weighted,
+                    bottom_line: v.bottom_line || '',
+                    final: ceilingResult.final,
+                    capped_to_anchor: ceilingResult.capped,
+                    anchor_used: anchorRating ? Object.keys(anchorRatings).find(k => anchorRatings[k] === anchorRating) : null,
+                  };
+                  s._opusScore = ceilingResult.final;
+                  s._ratedBy = 'fable-5';
+                }
+              }
+            }
+          } else {
+            const fablePrompt = buildLegacyOpusPrompt(fableTop);
+            const fRes = await callAnthropicJson(anthropicKey, FABLE_MODEL, fablePrompt, 4096);
+            if (fRes) {
+              recordUsage(FABLE_MODEL, fRes.usage);
+              const jsonMatch = fRes.text.match(/```json\s*\n?([\s\S]*?)\n?```/);
+              if (jsonMatch) {
+                const fableScores = JSON.parse(jsonMatch[1]);
+                for (const s of fableTop) {
+                  const name = s.companyName || s.title || '';
+                  const match = fableScores[name] || Object.values(fableScores).find((v, i) => Object.keys(fableScores)[i].toLowerCase() === name.toLowerCase());
+                  if (match?.score) {
+                    s._preFableScore = s._opusScore;
+                    s._opusScore = match.score;
+                    s._opusReason = match.reason || '';
+                    s._ratedBy = 'fable-5';
+                  }
+                }
+              }
+            }
+          }
+
+          const fableRefined = rated.filter(s => s._ratedBy === 'fable-5').length;
+          rated.sort(opusFirstSort);
+          console.log(`[Super] Fable-5 re-rated ${fableRefined}/${fableTop.length} top picks`);
+          sendProgress(`Fable-5 re-rated ${fableRefined} top picks`, 'deepscore', { refined: fableRefined });
+        } catch (e) {
+          console.warn('[Super] Fable re-rate failed — keeping Opus scores:', e.message);
+        }
+      }
 
       // AUTO-PUSH HIGH signals to DD pipeline
       const hasHarmonic = sources.includes('harmonic') && sourceStats.harmonic > 0;
@@ -7041,7 +7244,7 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
       const cost = computeCost();
       const estimatedCost = cost.total.toFixed(3);
       const opusRanCount = rated.filter(s => s._opusScore).length;
-      console.log(`[Super] DONE — tier=${superTier} signals=${totalSignals} opusScored=${opusRanCount} cost=$${estimatedCost} (sonnet=$${cost.sonnet.toFixed(3)} opus=$${cost.opus.toFixed(3)} haiku=$${cost.haiku.toFixed(3)}) tokens=${JSON.stringify(usage)}`);
+      console.log(`[Super] DONE — tier=${superTier} signals=${totalSignals} opusScored=${opusRanCount} cost=$${estimatedCost} (sonnet=$${cost.sonnet.toFixed(3)} opus=$${cost.opus.toFixed(3)} haiku=$${cost.haiku.toFixed(3)} fable=$${(cost.fable || 0).toFixed(3)}) tokens=${JSON.stringify(usage)}`);
       return sendResult({
         signals: rated,
         analysis: cleanAnalysis,
@@ -7055,6 +7258,7 @@ ${topForOpus.map((s, i) => `[${i+1}] ${s.companyName || s.title} (${s.source}) �
           sonnet: cost.sonnet,
           opus: cost.opus,
           haiku: cost.haiku,
+          fable: cost.fable,
           tokens: usage,
         },
         tier: superTier,
@@ -9701,16 +9905,46 @@ function cleanupOldScans() {
   saveScansState();
 }
 
+// ── Fable-5 final re-rate stage (shared across all Opus-based search workflows) ──
+// Every workflow that deep-dives with Opus re-rates its TOP 10 ranked results with
+// claude-fable-5 (Anthropic's most capable model) before results are finalized.
+// Fable API quirks: NO temperature/top_p/top_k/thinking params (all 400), and
+// responses may come back stop_reason 'refusal' with empty content. Callers
+// always fail-soft: on any failure keep the Opus ratings and continue.
+const FABLE_MODEL = 'claude-fable-5';
+const FABLE_COST_PER_COMPANY = 0.08; // $10/$50 per MTok ≈ 2x opus rates x ~1.3 token inflation vs OPUS_COST_PER_COMPANY 0.03
+
+// Single batched call helper. Returns { text, usage } or null on ANY failure
+// (HTTP error, refusal, empty content, network) — callers keep prior ratings.
+async function callAnthropicJson(anthropicKey, model, prompt, maxTokens) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+    });
+    if (!res.ok) { console.warn(`[Fable] ${model} HTTP ${res.status}`); return null; }
+    const data = await res.json();
+    if (data.stop_reason === 'refusal') { console.warn(`[Fable] ${model} refused (stop_reason=refusal) — keeping prior ratings`); return null; }
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+    if (!text.trim()) { console.warn(`[Fable] ${model} returned empty content — keeping prior ratings`); return null; }
+    return { text, usage: data.usage || null };
+  } catch (e) {
+    console.warn(`[Fable] ${model} call failed: ${e.message}`);
+    return null;
+  }
+}
+
 const SCAN_TIERS = {
   scout:    { name: 'Quick Scout',    cost: '$5',  budget: 5,   ddPush: 3,  etaMin: 3,  etaMax: 6,  preModel: 'claude-haiku-4-5-20251001', preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-sonnet-4-20250514', deepMax: 25,  preBatch: 200, screenBatch: 80, deepBatch: 10, desc: 'Haiku pre-screen → Sonnet scoring → Sonnet deep (budget-capped) → top to DD' },
-  standard: { name: 'Standard',      cost: '$12', budget: 12,  ddPush: 8,  etaMin: 8,  etaMax: 15, preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 80,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
-  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 15, etaMin: 18, etaMax: 32, preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 150, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
-  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 25, etaMin: 30, etaMax: 50, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 300, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet scoring → Opus deep (budget-capped) → top to DD' },
-  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 40, etaMin: 45, etaMax: 75, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 500, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep (budget-capped) → top to DD' },
+  standard: { name: 'Standard',      cost: '$12', budget: 12,  ddPush: 8,  etaMin: 8,  etaMax: 15, preModel: 'claude-sonnet-4-20250514',  preMax: 1500, screenModel: 'claude-sonnet-4-20250514', screenMax: 200, deepModel: 'claude-opus-4-6',          deepMax: 80,  preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet pre-screen → Sonnet scoring → Opus deep (budget-capped) → Fable-5 re-rates top 10 → top to DD' },
+  deep:     { name: 'Deep Dive',     cost: '$25', budget: 25,  ddPush: 15, etaMin: 18, etaMax: 32, preModel: 'claude-sonnet-4-20250514',  preMax: 5000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6',          deepMax: 150, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet all → Sonnet scoring → Opus deep (budget-capped) → Fable-5 re-rates top 10 → top to DD' },
+  sweep:    { name: 'Full Sweep',    cost: '$35', budget: 35,  ddPush: 25, etaMin: 30, etaMax: 50, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 300, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Sonnet full → Sonnet scoring → Opus deep (budget-capped) → Fable-5 re-rates top 10 → top to DD' },
+  maximum:  { name: 'Maximum',       cost: '$50', budget: 50,  ddPush: 40, etaMin: 45, etaMax: 75, preModel: 'claude-sonnet-4-20250514',  preMax: 9999, screenModel: 'claude-sonnet-4-20250514', screenMax: 999, deepModel: 'claude-opus-4-6',          deepMax: 500, preBatch: 120, screenBatch: 50, deepBatch: 15, desc: 'Full pipeline → Opus deep (budget-capped) → Fable-5 re-rates top 10 → top to DD' },
   // Weekly per-partner search tier — invoked by cron every Monday 09:00 UTC and by /api/partner-searches/:id/run.
   // Mark's brief: deepest pipeline available, $18 ceiling per partner so 6 × $18 = $108/week < $120/week cap.
   // Wall-clock ~35-75 min is fine. Shape mirrors Maximum so it integrates with the existing recurring-scan pipeline.
-  weeklyPartner: { name: 'Weekly Partner (Deep)', cost: '$18', budget: 18, ddPush: 5, etaMin: 35, etaMax: 75, preModel: 'claude-sonnet-4-20250514', preMax: 18000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6', deepMax: 60, preBatch: 120, screenBatch: 60, deepBatch: 15, desc: 'Weekly per-partner search (deep, slow, ≤$18) → top 5 to DD' },
+  weeklyPartner: { name: 'Weekly Partner (Deep)', cost: '$18', budget: 18, ddPush: 5, etaMin: 35, etaMax: 75, preModel: 'claude-sonnet-4-20250514', preMax: 18000, screenModel: 'claude-sonnet-4-20250514', screenMax: 500, deepModel: 'claude-opus-4-6', deepMax: 60, preBatch: 120, screenBatch: 60, deepBatch: 15, desc: 'Weekly per-partner search (deep, slow, ≤$18) → Fable-5 re-rates top 10 → top 5 to DD' },
 };
 
 const RECURRING_HISTORY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'recurring_scan_history.json');
@@ -10558,21 +10792,8 @@ ${batchText}`;
     const opusDeepBatches = Math.ceil(maxOpusCompanies / OPUS_DEEP_BATCH);
     const deepResults = [];
 
-    for (let oi = 0; oi < opusDeepBatches; oi++) {
-      if (scan._cancelled) break;
-      if (budgetUsed >= BUDGET_MAX) {
-        safeWrite(`: 💰 Budget cap reached ($${budgetUsed.toFixed(2)}/${BUDGET_MAX})\n\n`);
-        break;
-      }
-
-      const batch = opusBatch.slice(oi * OPUS_DEEP_BATCH, (oi + 1) * OPUS_DEEP_BATCH);
-      const batchText = buildCompanyTextRecurring(batch, oi * OPUS_DEEP_BATCH);
-
-      scan.progress = `Opus batch ${oi + 1}/${opusDeepBatches} — ${deepResults.length} deep-scored`;
-      safeWrite(`: 🔬 Opus deep batch ${oi + 1}/${opusDeepBatches} (${batch.length} companies)\n\n`);
-
-      try {
-        const deepPrompt = `You are Daxos Capital's top deal analyst performing DEEP due diligence on seed-stage companies.
+    // Deep-dive prompt builder — shared by the Opus deep batches and the Fable-5 top-10 re-rate.
+    const buildDeepPrompt = (batch, batchText) => `You are Daxos Capital's top deal analyst performing DEEP due diligence on seed-stage companies.
 
 CONTEXT: These ${batch.length} companies scored 7+ from screening ${allCompanies.length} total companies. They are the top ~1%.
 
@@ -10610,6 +10831,22 @@ ${filterContext}
 ${similarityContext}
 COMPANIES:
 ${batchText}`;
+
+    for (let oi = 0; oi < opusDeepBatches; oi++) {
+      if (scan._cancelled) break;
+      if (budgetUsed >= BUDGET_MAX) {
+        safeWrite(`: 💰 Budget cap reached ($${budgetUsed.toFixed(2)}/${BUDGET_MAX})\n\n`);
+        break;
+      }
+
+      const batch = opusBatch.slice(oi * OPUS_DEEP_BATCH, (oi + 1) * OPUS_DEEP_BATCH);
+      const batchText = buildCompanyTextRecurring(batch, oi * OPUS_DEEP_BATCH);
+
+      scan.progress = `Opus batch ${oi + 1}/${opusDeepBatches} — ${deepResults.length} deep-scored`;
+      safeWrite(`: 🔬 Opus deep batch ${oi + 1}/${opusDeepBatches} (${batch.length} companies)\n\n`);
+
+      try {
+        const deepPrompt = buildDeepPrompt(batch, batchText);
 
         const oRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
@@ -10680,6 +10917,64 @@ ${batchText}`;
     scan.stats.topResults = deepResults.filter(r => r.score >= 7).length;
 
     // ═══════════════════════════════════════════════
+    // PHASE 6.5: Fable-5 re-rate of top 10 (Opus tiers only)
+    // ═══════════════════════════════════════════════
+    // Fable's score/analysis/confidence REPLACE the Opus ones for the top 10,
+    // then results re-sort. Fail-soft: any error keeps the Opus ratings.
+    if (tier.deepModel.includes('opus') && deepResults.length > 0 && budgetUsed < BUDGET_MAX && !scan._cancelled) {
+      try {
+        const fableTop = deepResults.slice(0, Math.min(10, deepResults.length));
+        scan.progress = `Fable-5 re-rating top ${fableTop.length} picks...`;
+        safeWrite(`: 🧠 Fable-5 re-rating top ${fableTop.length} picks...\n\n`);
+
+        const fableCards = fableTop.map(r => r.card || { name: r.name });
+        const fableText = buildCompanyTextRecurring(fableCards, 0);
+        const fablePrompt = buildDeepPrompt(fableCards, fableText);
+        const fRes = await callAnthropicJson(anthropicKey, FABLE_MODEL, fablePrompt, 8000);
+
+        if (fRes) {
+          budgetUsed += fableTop.length * FABLE_COST_PER_COMPANY;
+          let fableRefined = 0;
+          const sections = fRes.text.split(/###\s+/).filter(s => s.trim());
+          for (const section of sections) {
+            const nameMatch = section.match(/^([^—\n]+?)\s*[—\-–]\s*Final Score:\s*(\d+)\/10/i);
+            if (!nameMatch) continue;
+            const companyName = nameMatch[1].trim().replace(/\*\*/g, '');
+            const score = parseInt(nameMatch[2]);
+            const confMatch = section.match(/Confidence:\s*(High|Medium|Low)/i);
+            const r = fableTop.find(x => {
+              // Strip echoed list numbering ("3. Acme") — the opus parse can
+              // leave it on x.name while the fable batch renumbers 1-10 fresh.
+              const rn = (x.name || '').toLowerCase().replace(/^\d+[\.\)]\s*/, '');
+              const pn = companyName.toLowerCase().replace(/^\d+[\.\)]\s*/, '');
+              return rn === pn || rn.includes(pn) || pn.includes(rn);
+            });
+            if (!r) continue;
+            r._preFableScore = r.score;
+            r.score = score;
+            r.confidence = confMatch ? confMatch[1] : r.confidence;
+            r.analysis = section.trim();
+            r.ratedBy = 'fable-5';
+            fableRefined++;
+            safeWrite(`: 🧠 ${companyName} — Fable ${score}/10 (Opus had ${r._preFableScore}/10)\n\n`);
+          }
+          // Re-sort with the same comparator now that top-10 scores changed
+          deepResults.sort((a, b) => b.score - a.score || (a.confidence === 'High' ? -1 : 1));
+          scan.stats.fableRefined = fableRefined;
+          scan.stats.topResults = deepResults.filter(r => r.score >= 7).length;
+          scan.progress = `Fable-5 re-rated ${fableRefined} top picks`;
+          safeWrite(`: 🧠 Fable-5 re-rated ${fableRefined}/${fableTop.length} top picks (cost +$${(fableTop.length * FABLE_COST_PER_COMPANY).toFixed(2)})\n\n`);
+        } else {
+          scan.stats.fableRefined = 0;
+          safeWrite(`: ⚠️ Fable-5 re-rate unavailable — keeping Opus ratings\n\n`);
+        }
+      } catch (e) {
+        console.warn('[RecurringScan] Fable re-rate failed — keeping Opus ratings:', e.message);
+        safeWrite(`: ⚠️ Fable-5 re-rate failed (${e.message}) — keeping Opus ratings\n\n`);
+      }
+    }
+
+    // ═══════════════════════════════════════════════
     // PHASE 7: Save results
     // ═══════════════════════════════════════════════
     // Push top N results to DD/vetting pipeline.
@@ -10702,6 +10997,7 @@ ${batchText}`;
       _confidence: r.confidence,
       _analysis: (r.analysis || '').slice(0, 500),
       _sourceSearch: r._sourceSearch || '',
+      _ratedBy: r.ratedBy || '',
     }));
 
     let ddPushed = 0;
@@ -10788,6 +11084,7 @@ ${batchText}`;
             location: r.location || '',
             funding_total: r.funding_total || 0,
             funding_stage: r.funding_stage || '',
+            ratedBy: r.ratedBy || '',
             pushedToDD: ddNames.has((r.name || '').toLowerCase()),
           })),
         });
@@ -11081,6 +11378,7 @@ function progressToPhase(progressStr) {
   const s = String(progressStr || '').toLowerCase();
   if (!s) return 'starting';
   if (s.includes('complete') || s.includes('cancelled') || s.startsWith('error')) return 'finalize';
+  if (s.includes('fable')) return 'fable-refine';
   if (s.includes('fetching') || s.includes('saved searches') || s.includes('harmonic')) return 'harmonic-fetch';
   if (s.includes('pre-screen') || s.includes('pre screen')) return 'sonnet-prescreen';
   if (s.includes('enriching')) return 'enrich';
