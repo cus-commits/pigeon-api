@@ -9724,7 +9724,12 @@ app.get('/api/recurring-scan/tiers', (req, res) => {
 
 app.get('/api/recurring-scan/status', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const scans = Object.values(global._deepScans).map(s => {
+  // ?scanId= narrows to one scan (still wrapped in {scans:[...]} for a single client code path)
+  const wantId = req.query.scanId ? String(req.query.scanId) : null;
+  const pool = wantId
+    ? (global._deepScans[wantId] ? [global._deepScans[wantId]] : [])
+    : Object.values(global._deepScans);
+  const scans = pool.map(s => {
     const stats = s.stats || {};
     // Best-effort "current/total" pulled out of `progress` for the UI strip.
     const m = String(s.progress || '').match(/batch\s+(\d+)\/(\d+)/i);
@@ -9899,6 +9904,10 @@ app.post('/api/recurring-scan', async (req, res) => {
   const selectedSearchIds = (bodyData.selectedSearches || []).map(String);
   const selectedPortcos = bodyData.selectedPortcos || null; // null = all, [] = none
   const scanUser = bodyData.user || 'Mark';
+  // Originating workflow, e.g. 'weekly-partner:jake' / 'weekly-cron:jake'. Drives the
+  // vetting-pipeline source label and per-partner run history below.
+  const scanSource = String(bodyData.source || '');
+  const weeklySourceMatch = scanSource.match(/^weekly-(partner|cron):([a-z0-9_-]+)$/);
 
   // Build filter context string for AI prompts
   const filterParts = [];
@@ -10673,8 +10682,12 @@ ${batchText}`;
     // ═══════════════════════════════════════════════
     // PHASE 7: Save results
     // ═══════════════════════════════════════════════
-    // Push top N results to DD/vetting pipeline
-    const ddCount = Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
+    // Push top N results to DD/vetting pipeline.
+    // Weekly partner scans push their top 5 unconditionally (Mark: "send top 5 of weekly
+    // searches to DD") — other tiers keep the score>=6 quality gate.
+    const ddCount = tierKey === 'weeklyPartner'
+      ? Math.min(tier.ddPush, deepResults.length)
+      : Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
     const ddCompanies = deepResults.slice(0, ddCount).map(r => ({
       id: r.card?.id || 0,
       name: (r.name || '').replace(/^\d+\.\s*/, ''),
@@ -10699,7 +10712,7 @@ ${batchText}`;
         const existingNames = new Set(vetting.map(v => (v.name || '').toLowerCase()));
         for (const co of ddCompanies) {
           if (!existingNames.has(co.name.toLowerCase())) {
-            vetting.push({ ...co, addedAt: Date.now(), source: 'recurring-scan', votes: {}, dismissed: false, hiddenBy: [] });
+            vetting.push({ ...co, addedAt: Date.now(), source: scanSource || 'recurring-scan', votes: {}, dismissed: false, hiddenBy: [] });
             ddPushed++;
           }
         }
@@ -10748,6 +10761,38 @@ ${batchText}`;
       saveRecurringScanHistory(history);
     } catch (e) {}
 
+    // Weekly partner scans also get a dedicated per-partner history entry
+    // (surfaced by the History panel on /weekly).
+    if (weeklySourceMatch) {
+      try {
+        const ddNames = new Set(ddCompanies.map(c => (c.name || '').toLowerCase()));
+        appendPartnerHistory(weeklySourceMatch[2], {
+          scanId,
+          partnerId: weeklySourceMatch[2],
+          trigger: weeklySourceMatch[1] === 'cron' ? 'auto' : 'manual',
+          status: 'done',
+          startedAt: new Date(scan.startedAt).toISOString(),
+          finishedAt: new Date().toISOString(),
+          durationSec: finalResults.duration,
+          budgetUsed: finalResults.budgetUsed,
+          corpusSize: finalResults.corpusSize,
+          stats: { ...scan.stats },
+          ddPushed,
+          topResults: flattenedResults.slice(0, 10).map(r => ({
+            name: r.name || '',
+            website: r.website || '',
+            score: r._score ?? r.score ?? null,
+            confidence: r.confidence || '',
+            analysis: (r.analysis || '').slice(0, 300),
+            location: r.location || '',
+            funding_total: r.funding_total || 0,
+            funding_stage: r.funding_stage || '',
+            pushedToDD: ddNames.has((r.name || '').toLowerCase()),
+          })),
+        });
+      } catch (e) { console.error('[PartnerSearches] history append error:', e.message); }
+    }
+
     scan.status = 'done';
     scan.progress = `Complete — ${deepResults.length} deep-scored, ${scan.stats.topResults} rated 7+, ${ddPushed} pushed to DD`;
     scan.results = finalResults;
@@ -10775,6 +10820,26 @@ ${batchText}`;
       scan.finishedAt = Date.now();
       safeWrite(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     }
+    // Record failed/cancelled weekly runs too so the History panel tells the truth.
+    if (weeklySourceMatch) {
+      try {
+        appendPartnerHistory(weeklySourceMatch[2], {
+          scanId,
+          partnerId: weeklySourceMatch[2],
+          trigger: weeklySourceMatch[1] === 'cron' ? 'auto' : 'manual',
+          status: e.message === 'Cancelled' ? 'cancelled' : 'error',
+          error: e.message === 'Cancelled' ? null : e.message,
+          startedAt: new Date(scan.startedAt).toISOString(),
+          finishedAt: new Date().toISOString(),
+          durationSec: Math.round((Date.now() - scan.startedAt) / 1000),
+          budgetUsed: budgetUsed.toFixed(2),
+          corpusSize: scan.stats?.corpusSize ?? null,
+          stats: { ...scan.stats },
+          ddPushed: 0,
+          topResults: [],
+        });
+      } catch (e2) {}
+    }
     try { saveScansState(); } catch (e) {}
   } finally {
     clearInterval(keepalive);
@@ -10790,6 +10855,28 @@ ${batchText}`;
 // ==========================================
 
 const PARTNER_SEARCHES_FILE = path.join(SCAN_VOLUME, 'partner_searches.json');
+
+// Per-partner run history: { [partnerId]: [entry, ...] } newest-first, capped at 26
+// entries per partner (~6 months of weekly runs). Written by the recurring-scan
+// handler when a weekly-sourced scan finishes (done, error, or cancelled).
+const PARTNER_HISTORY_FILE = path.join(SCAN_VOLUME, 'partner_search_history.json');
+function loadPartnerHistory() {
+  try {
+    const h = JSON.parse(fs.readFileSync(PARTNER_HISTORY_FILE, 'utf8'));
+    return (h && typeof h === 'object') ? h : {};
+  } catch { return {}; }
+}
+function savePartnerHistory(h) {
+  try { fs.writeFileSync(PARTNER_HISTORY_FILE, JSON.stringify(h, null, 2)); }
+  catch (e) { console.error('[PartnerSearches] history save error:', e.message); }
+}
+function appendPartnerHistory(partnerId, entry) {
+  const h = loadPartnerHistory();
+  if (!Array.isArray(h[partnerId])) h[partnerId] = [];
+  h[partnerId].unshift(entry);
+  h[partnerId] = h[partnerId].slice(0, 26);
+  savePartnerHistory(h);
+}
 
 // Whitelist — only these 6 ids are valid. Order matches Daxos partner list.
 // Serena removed 2026-06-09; loadPartnerSearches() prunes her from existing on-disk JSON.
@@ -10884,7 +10971,9 @@ function defaultPartnerConfig(seed) {
     id: seed.id,
     name: seed.name,
     emoji: seed.emoji,
-    isEnabled: true,
+    // Off by default (Mark 2026-06-11): a partner's search must be explicitly
+    // enabled via the green/red toggle before the cron will fire it.
+    isEnabled: false,
     searchPrompt: '',
     context: '',
     filters: {
@@ -10924,6 +11013,15 @@ function loadPartnerSearches() {
   // unknown ids alone (graceful — don't crash on unexpected shape).
   let mutated = false;
   if (state.partners.serena) { delete state.partners.serena; mutated = true; }
+  // One-time migration (2026-06-11): weekly searches are now opt-in. Force every
+  // pre-existing partner to disabled once; Mark re-enables via the green/red toggle.
+  if (!state.disableAllMigrated20260611) {
+    for (const p of Object.values(state.partners)) {
+      if (p && p.isEnabled) p.isEnabled = false;
+    }
+    state.disableAllMigrated20260611 = true;
+    mutated = true;
+  }
   // Heal: ensure every seed partner exists with all default fields.
   for (const seed of PARTNER_SEED) {
     if (!state.partners[seed.id]) {
@@ -11069,13 +11167,29 @@ app.put('/api/partner-searches/:id', (req, res) => {
         lockedByUser: !!c.lockedByUser,
       }));
   }
-  // Recompute fingerprints so the next run knows whether to re-roll.
-  current.lastPromptHash = shortHash(current.searchPrompt || '');
-  current.lastContextHash = shortHash((current.contextChunks || []).map(c => c.text).join('\n'));
+  // Optional reschedule: accept a valid ISO/parseable timestamp for nextRunAt.
+  if (body.nextRunAt !== undefined) {
+    const t = Date.parse(body.nextRunAt);
+    if (Number.isFinite(t)) current.nextRunAt = new Date(t).toISOString();
+  }
+  // NOTE: lastPromptHash/lastContextHash are deliberately NOT recomputed here.
+  // They are stamped at run time (buildPartnerScanBody) and mean "content as of
+  // the last run" — recomputing on every PUT made edits look 'unchanged' to the
+  // auto-vary check, so it re-rolled weights over freshly-edited content.
   // Never let client overwrite id/name/emoji/lastRun* — preserved automatically by ignoring them above.
   state.partners[id] = current;
   savePartnerSearches(state);
   res.json(decoratePartner(current));
+});
+
+// Per-partner run history (newest-first). Each entry: scanId, trigger
+// (manual|auto), status (done|error|cancelled), timing, budget, corpus,
+// stats, ddPushed, topResults[] (top 10 with scores + trimmed analysis).
+app.get('/api/partner-searches/:id/history', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const id = (req.params.id || '').toLowerCase();
+  if (!PARTNER_IDS.has(id)) return res.status(404).json({ error: 'unknown partner id' });
+  res.json({ partnerId: id, history: loadPartnerHistory()[id] || [] });
 });
 
 // Preview the weights that WOULD be applied for a given ISO-week offset.
@@ -11162,7 +11276,23 @@ async function triggerRecurringScanLoopback(body) {
     // Safety timeout so we don't hang forever.
     setTimeout(() => resolve(), 8000);
   });
+  // We only needed the scanId — tear the SSE stream down so it doesn't sit open
+  // (and buffer + regex-scan every progress line) for the full 35-75 min scan.
+  // The scan itself keeps running server-side; disconnects only mute safeWrite.
+  try { reader.removeAllListeners('data'); reader.removeAllListeners('end'); reader.removeAllListeners('error'); reader.destroy(); } catch {}
   return scanId;
+}
+
+// Poll the in-process scan table until a scan leaves 'scanning' (or we give up).
+// Used by the cron loop to run due partners strictly one-at-a-time.
+async function waitForScanToFinish(scanId, maxMs = 100 * 60 * 1000) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    const s = global._deepScans?.[scanId];
+    if (!s || s.status !== 'scanning') return s?.status || 'gone';
+    await new Promise(r => setTimeout(r, 60_000));
+  }
+  return 'timeout';
 }
 
 // Build the recurring-scan body for one partner. Mutates `partner` in place to
@@ -11230,13 +11360,22 @@ app.post('/api/partner-searches/:id/run', async (req, res) => {
     const startedAt = Date.now();
     // Bump cooldown BEFORE loopback fires so an overlapping cron tick can't
     // re-fire the same partner if this run is slow to start.
+    const prevNextRunAt = partner.nextRunAt;
     const nextRunAt = new Date(startedAt + 7 * 24 * 60 * 60 * 1000).toISOString();
     partner.nextRunAt = nextRunAt;
     state.partners[id] = partner;
     savePartnerSearches(state);
 
     const scanId = await triggerRecurringScanLoopback(body);
-    if (!scanId) return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
+    if (!scanId) {
+      // Scan never started — put the cooldown back so the failed attempt
+      // doesn't eat the partner's next 7 days.
+      try {
+        const sR = loadPartnerSearches();
+        if (sR.partners[id]) { sR.partners[id].nextRunAt = prevNextRunAt; savePartnerSearches(sR); }
+      } catch {}
+      return res.status(500).json({ error: 'recurring-scan did not emit scanId in time' });
+    }
 
     // Optimistically stamp lastRunAt + scanId. lastRunResultCount and lastCorpusSize will be
     // filled in by the scan-completion sweeper below.
@@ -11289,59 +11428,129 @@ setInterval(() => {
 // rolling 7-day cycle: `nextRunAt` is bumped to now+7d whenever the partner
 // fires (manual or cron). The hourly tick only fires partners whose
 // `nextRunAt` is in the past.
+// Re-entrancy guard: a tick that serializes multiple 35-75 min scans spans hours,
+// and node-cron fires overlapping ticks regardless. Overlaps skip; the partners
+// they would have handled are still due next tick.
+let _weeklyCronTickRunning = false;
 try {
   const cronLib = require('node-cron');
   cronLib.schedule('0 * * * *', async () => {
-    const nowIso = new Date().toISOString();
-    console.log(`[WeeklyCron] Hourly check at ${nowIso}`);
-    const state = loadPartnerSearches();
-    const now = Date.now();
-    const due = [];
-    for (const partner of Object.values(state.partners)) {
-      if (!partner.isEnabled) continue;
-      if (!partner.searchPrompt?.trim()) continue;
-      const nextMs = Date.parse(partner.nextRunAt || '');
-      if (!Number.isFinite(nextMs) || nextMs <= now) due.push(partner);
+    if (_weeklyCronTickRunning) {
+      console.log('[WeeklyCron] Previous tick still running — skipping this tick');
+      return;
     }
-    if (!due.length) { console.log('[WeeklyCron] No partners due this tick'); return; }
-    console.log(`[WeeklyCron] ${due.length} partner(s) due: ${due.map(p => p.id).join(', ')}`);
-    for (const partner of due) {
-      try {
-        // Bump cooldown BEFORE loopback fires so the next hourly tick (or an
-        // overlapping run) can't re-fire the same partner.
-        partner.nextRunAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-        {
-          const s0 = loadPartnerSearches();
-          s0.partners[partner.id] = partner;
-          savePartnerSearches(s0);
+    _weeklyCronTickRunning = true;
+    try {
+      const nowIso = new Date().toISOString();
+      console.log(`[WeeklyCron] Hourly check at ${nowIso}`);
+      const dueIds = [];
+      {
+        const state = loadPartnerSearches();
+        const now = Date.now();
+        for (const partner of Object.values(state.partners)) {
+          if (!partner.isEnabled) continue;
+          if (!partner.searchPrompt?.trim()) continue;
+          const nextMs = Date.parse(partner.nextRunAt || '');
+          if (!Number.isFinite(nextMs) || nextMs <= now) dueIds.push(partner.id);
         }
-        const { body } = buildPartnerScanBody(partner, {
-          anthropicKey: process.env.ANTHROPIC_API_KEY,
-          sourcePrefix: 'weekly-cron',
-        });
-        const scanId = await triggerRecurringScanLoopback(body);
-        if (scanId) {
-          partner.lastRunAt = Date.now();
-          partner.lastRunScanId = scanId;
-          // Re-load + save inside the loop to survive crashes mid-batch. We
-          // overwrite this partner only — leave every other partner's
-          // weeklyAppliedWeights / hashes alone in case another tick mutated them.
-          const s2 = loadPartnerSearches();
-          s2.partners[partner.id] = partner;
-          savePartnerSearches(s2);
-          console.log(`[WeeklyCron] ${partner.id} → scanId ${scanId} (next run ${partner.nextRunAt})`);
-        } else {
-          console.error(`[WeeklyCron] ${partner.id}: no scanId returned`);
-        }
-      } catch (e) {
-        console.error(`[WeeklyCron] ${partner.id} failed:`, e.message);
       }
-      // 30s gap between partners so we don't fan multiple concurrent Sonnet/Opus scans.
-      await new Promise(r => setTimeout(r, 30_000));
+      if (!dueIds.length) { console.log('[WeeklyCron] No partners due this tick'); return; }
+      console.log(`[WeeklyCron] ${dueIds.length} partner(s) due: ${dueIds.join(', ')}`);
+      for (const dueId of dueIds) {
+        let scanId = null;
+        let partner = null;
+        try {
+          // Re-load fresh state each iteration: the previous partner's scan may
+          // have taken an hour+, and Mark may have edited/disabled this partner
+          // (or a manual run may have fired it) in the meantime.
+          const sFresh = loadPartnerSearches();
+          partner = sFresh.partners[dueId];
+          if (!partner || !partner.isEnabled || !partner.searchPrompt?.trim()) {
+            console.log(`[WeeklyCron] ${dueId}: no longer eligible — skipping`);
+            continue;
+          }
+          const nextMs = Date.parse(partner.nextRunAt || '');
+          if (Number.isFinite(nextMs) && nextMs > Date.now()) {
+            console.log(`[WeeklyCron] ${dueId}: no longer due (ran meanwhile) — skipping`);
+            continue;
+          }
+          // Bump cooldown BEFORE loopback fires so the next hourly tick (or an
+          // overlapping run) can't re-fire the same partner.
+          partner.nextRunAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+          savePartnerSearches(sFresh);
+          const { body } = buildPartnerScanBody(partner, {
+            anthropicKey: process.env.ANTHROPIC_API_KEY,
+            sourcePrefix: 'weekly-cron',
+          });
+          scanId = await triggerRecurringScanLoopback(body);
+          if (scanId) {
+            // Write back ONLY the run-related fields onto a fresh load — never
+            // the whole tick-start snapshot (would revert concurrent user edits).
+            const s2 = loadPartnerSearches();
+            const p2 = s2.partners[dueId];
+            if (p2) {
+              p2.lastRunAt = Date.now();
+              p2.lastRunScanId = scanId;
+              p2.weeklyAppliedWeights = partner.weeklyAppliedWeights;
+              p2.lastWeightRollAt = partner.lastWeightRollAt;
+              p2.lastPromptHash = partner.lastPromptHash;
+              p2.lastContextHash = partner.lastContextHash;
+              savePartnerSearches(s2);
+            }
+            console.log(`[WeeklyCron] ${dueId} → scanId ${scanId} (next run ${partner.nextRunAt})`);
+          } else {
+            console.error(`[WeeklyCron] ${dueId}: no scanId returned`);
+          }
+        } catch (e) {
+          console.error(`[WeeklyCron] ${dueId} failed:`, e.message);
+        }
+        if (scanId) {
+          // Run partners strictly one-at-a-time — wait for this scan to finish
+          // before firing the next partner so Mondays don't fan 4+ concurrent
+          // Opus pipelines into the same rate limits.
+          const outcome = await waitForScanToFinish(scanId);
+          console.log(`[WeeklyCron] ${dueId} scan ${scanId} finished (${outcome})`);
+          await new Promise(r => setTimeout(r, 10_000));
+        } else if (partner) {
+          // No scanId within the 8s window. The scan may still have started
+          // (slow event loop) — look for a fresh weeklyPartner scan for this
+          // partner before scheduling a retry, so we never double-fire.
+          const tenMinAgo = Date.now() - 10 * 60 * 1000;
+          const orphan = Object.values(global._deepScans || {}).find(s =>
+            s.status === 'scanning' && s.tier?.key === 'weeklyPartner' &&
+            s.user === partner.name && (s.startedAt || 0) > tenMinAgo);
+          if (orphan) {
+            console.log(`[WeeklyCron] ${dueId}: scan ${orphan.id} did start after all — adopting it`);
+            try {
+              const s4 = loadPartnerSearches();
+              if (s4.partners[dueId]) {
+                s4.partners[dueId].lastRunAt = orphan.startedAt || Date.now();
+                s4.partners[dueId].lastRunScanId = orphan.id;
+                savePartnerSearches(s4);
+              }
+            } catch (e) {}
+            const outcome = await waitForScanToFinish(orphan.id);
+            console.log(`[WeeklyCron] ${dueId} scan ${orphan.id} finished (${outcome})`);
+          } else {
+            // Scan genuinely never started — don't burn the partner's whole
+            // week. Pull the cooldown back to +30 min so the next tick retries.
+            try {
+              const s3 = loadPartnerSearches();
+              if (s3.partners[dueId]) {
+                s3.partners[dueId].nextRunAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+                savePartnerSearches(s3);
+                console.log(`[WeeklyCron] ${dueId}: retry scheduled in 30 min`);
+              }
+            } catch (e) {}
+          }
+        }
+      }
+      console.log('[WeeklyCron] Hourly tick complete');
+    } finally {
+      _weeklyCronTickRunning = false;
     }
-    console.log('[WeeklyCron] Hourly tick complete');
   }, { timezone: 'UTC' });
-  console.log('[WeeklyCron] Scheduled: hourly at :00 UTC (per-partner 7d cooldown)');
+  console.log('[WeeklyCron] Scheduled: hourly at :00 UTC (per-partner 7d cooldown, serialized)');
 } catch (e) {
   console.error('[WeeklyCron] node-cron not available:', e.message);
 }
