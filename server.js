@@ -10978,12 +10978,12 @@ ${batchText}`;
     // PHASE 7: Save results
     // ═══════════════════════════════════════════════
     // Push top N results to DD/vetting pipeline.
-    // Weekly partner scans push their top 5 unconditionally (Mark: "send top 5 of weekly
-    // searches to DD") — other tiers keep the score>=6 quality gate.
-    const ddCount = tierKey === 'weeklyPartner'
-      ? Math.min(tier.ddPush, deepResults.length)
-      : Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
-    const ddCompanies = deepResults.slice(0, ddCount).map(r => ({
+    // Weekly partner scans walk DOWN the ranked list, skipping companies already
+    // in the vetting pipeline, until tier.ddPush NEW companies are selected
+    // (Mark 6/12: top-5 dedupe was shrinking weekly pushes to 1 — most of the
+    // top 5 were already in DD from earlier scans). Other tiers keep the
+    // original top-N (score>=6) selection.
+    const mapDdCompany = (r) => ({
       id: r.card?.id || 0,
       name: (r.name || '').replace(/^\d+\.\s*/, ''),
       website: r.card?.website || '',
@@ -10998,9 +10998,30 @@ ${batchText}`;
       _analysis: (r.analysis || '').slice(0, 500),
       _sourceSearch: r._sourceSearch || '',
       _ratedBy: r.ratedBy || '',
-    }));
+    });
+    let ddCompanies = [];
+    const ddAlreadyInDD = new Set(); // lowercased names of top-ranked results skipped (already in vetting)
+    if (tierKey === 'weeklyPartner') {
+      let existingNames0 = new Set();
+      try {
+        existingNames0 = new Set((loadVetting().companies || []).map(v => (v.name || '').toLowerCase()));
+      } catch (e) { console.error('[RecurringScan] vetting preload error:', e.message); }
+      const chosen = new Set();
+      for (const r of deepResults) {
+        if (ddCompanies.length >= tier.ddPush) break;
+        const nm = (r.name || '').replace(/^\d+\.\s*/, '').toLowerCase();
+        if (!nm || chosen.has(nm)) continue;
+        if (existingNames0.has(nm)) { ddAlreadyInDD.add(nm); continue; }
+        chosen.add(nm);
+        ddCompanies.push(mapDdCompany(r));
+      }
+    } else {
+      const ddCount = Math.min(tier.ddPush, deepResults.filter(r => r.score >= 6).length);
+      ddCompanies = deepResults.slice(0, ddCount).map(mapDdCompany);
+    }
 
     let ddPushed = 0;
+    const ddInsertedNames = new Set(); // lowercased names actually inserted this run
     if (ddCompanies.length > 0) {
       try {
         const vettingData = loadVetting();
@@ -11009,11 +11030,13 @@ ${batchText}`;
         for (const co of ddCompanies) {
           if (!existingNames.has(co.name.toLowerCase())) {
             vetting.push({ ...co, addedAt: Date.now(), source: scanSource || 'recurring-scan', votes: {}, dismissed: false, hiddenBy: [] });
+            ddInsertedNames.add(co.name.toLowerCase());
             ddPushed++;
           }
         }
         saveVetting({ ...vettingData, companies: vetting });
-        safeWrite(`: 📤 Pushed ${ddPushed} companies to DD pipeline\n\n`);
+        const skippedNote = ddAlreadyInDD.size > 0 ? ` (${ddAlreadyInDD.size} top picks already in DD — walked down the list)` : '';
+        safeWrite(`: 📤 Pushed ${ddPushed} companies to DD pipeline${skippedNote}\n\n`);
       } catch (e) {
         console.error('[RecurringScan] DD push error:', e.message);
       }
@@ -11062,7 +11085,6 @@ ${batchText}`;
     // arbitrary client-supplied source ids out of the history file.
     if (weeklySourceMatch && PARTNER_IDS.has(weeklySourceMatch[2])) {
       try {
-        const ddNames = new Set(ddCompanies.map(c => (c.name || '').toLowerCase()));
         appendPartnerHistory(weeklySourceMatch[2], {
           scanId,
           partnerId: weeklySourceMatch[2],
@@ -11075,9 +11097,12 @@ ${batchText}`;
           corpusSize: finalResults.corpusSize,
           stats: { ...scan.stats },
           ddPushed,
-          topResults: flattenedResults.slice(0, 10).map(r => ({
+          // Full deep-scored list (≤60) so the History panel can "Show more"
+          // past the top 10. harmonicId powers the click-through to Harmonic.
+          topResults: flattenedResults.slice(0, 60).map(r => ({
             name: r.name || '',
             website: r.website || '',
+            harmonicId: (typeof r.id === 'number' && r.id > 0) ? r.id : null,
             score: r._score ?? r.score ?? null,
             confidence: r.confidence || '',
             analysis: (r.analysis || '').slice(0, 300),
@@ -11085,7 +11110,10 @@ ${batchText}`;
             funding_total: r.funding_total || 0,
             funding_stage: r.funding_stage || '',
             ratedBy: r.ratedBy || '',
-            pushedToDD: ddNames.has((r.name || '').toLowerCase()),
+            // pushedToDD = actually inserted into Top Picks THIS run.
+            // inDD = was a top pick but already in Top Picks from a prior scan.
+            pushedToDD: ddInsertedNames.has((r.name || '').toLowerCase()),
+            inDD: ddAlreadyInDD.has((r.name || '').toLowerCase()),
           })),
         });
       } catch (e) { console.error('[PartnerSearches] history append error:', e.message); }
