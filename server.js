@@ -782,18 +782,26 @@ async function enhancedSearch(query, apiKey, { size = 50, keywords = null, antiK
         const r = await fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(d)}`, { headers: authHeaders });
         if (r.ok) {
           const data = await r.json();
-          if (data && data.id) {
-            allIds.add(String(data.id));
-            console.log(`[EnhSearch] domain "${d}" → ${data.name} (#${data.id})`);
+          // Harmonic returns either a single company or an array of matches.
+          let hit = null;
+          if (Array.isArray(data)) hit = data.find(c => c && c.id) || null;
+          else if (data && data.id) hit = data;
+          else if (data) {
+            const arr = data.results || data.companies || data.data;
+            if (Array.isArray(arr)) hit = arr.find(c => c && c.id) || null;
+          }
+          if (hit && hit.id) {
+            allIds.add(String(hit.id));
+            console.log(`[EnhSearch] domain "${d}" → ${hit.name} (#${hit.id})`);
           }
         }
       } catch (e) { console.error('[EnhSearch] domain lookup error:', e.message); }
     }));
   }
 
-  // 1. Natural language search (for URL-ish queries, use the local part instead
-  // of the full URL so we still get name matches when domain misses).
-  const nlQuery = isUrlish ? (extractDomain(query).split('.')[0] || query) : query;
+  // 1. Natural language search. For URL-ish queries, use the clean domain so
+  // search_agent does not choke on scheme/path.
+  const nlQuery = isUrlish ? extractDomain(query) : query;
   try {
     const r = await fetch(`${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(nlQuery)}&size=${Math.min(size, 1000)}`, { headers: authHeaders });
     if (r.ok) {
@@ -1664,11 +1672,22 @@ app.get('/api/harmonic/typeahead', async (req, res) => {
   const isUrlish = looksLikeDomain(qRaw);
   const domain = isUrlish ? extractDomain(qRaw) : '';
   const root = isUrlish ? rootDomain(domain) : null;
-  // For URL-ish input, also run a name typeahead using the local part
-  // ("3f" from "3f.xyz", "openai" from "blog.openai.com") so we still
-  // surface name matches even when the domain lookup misses.
-  const nameQ = isUrlish ? (domain.split('.')[0] || qRaw.trim()) : qRaw.trim();
+  // For URL-ish input, hand the CLEAN DOMAIN to typeahead — "3f.xyz" matches
+  // (we used to rely on this), "https://3f.xyz/" reduces to "3f.xyz" so it
+  // matches too. Bare names pass through unchanged.
+  const nameQ = isUrlish ? domain : qRaw.trim();
   const headers = { apikey: harmonicKey };
+
+  // Harmonic's /companies?website_domain= can return either a single company
+  // object or an ARRAY of matches. Pick the first usable hit, defensively.
+  const pickDomainHit = (data) => {
+    if (!data) return null;
+    if (Array.isArray(data)) return data.find(c => c && c.id) || null;
+    if (data.id) return data;
+    const arr = data.results || data.companies || data.data || null;
+    if (Array.isArray(arr)) return arr.find(c => c && c.id) || null;
+    return null;
+  };
 
   try {
     // Build parallel task list
@@ -1709,15 +1728,18 @@ app.get('/api/harmonic/typeahead', async (req, res) => {
       const data = r.value;
       const tn = taskNames[i] || '';
       if (tn.startsWith('domain:')) {
-        // /companies?website_domain= returns a single company object when matched
-        if (data && data.id) {
-          const idStr = String(data.id);
+        // /companies?website_domain= returns either a single company or an array.
+        const hit = pickDomainHit(data);
+        if (hit && hit.id) {
+          const idStr = String(hit.id);
           if (!seenIds.has(idStr)) {
             seenIds.add(idStr);
-            orderedIds.push(data.id);
-            inlineCompanies.push(data);
-            console.log(`[Typeahead] ${tn} → ${data.name} (#${data.id})`);
+            orderedIds.push(hit.id);
+            inlineCompanies.push(hit);
+            console.log(`[Typeahead] ${tn} → ${hit.name} (#${hit.id})`);
           }
+        } else {
+          console.log(`[Typeahead] ${tn} → no hit (data type: ${Array.isArray(data)?'array['+data.length+']':typeof data})`);
         }
       } else if (tn.startsWith('typeahead:')) {
         const arr = Array.isArray(data) ? data : (data.results || []);
