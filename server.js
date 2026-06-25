@@ -1629,30 +1629,41 @@ app.post('/api/chat', async (req, res) => {
 // HARMONIC ENRICHMENT ENDPOINTS
 // ==========================================
 
-// Domain lookup diagnostic
+// Domain lookup diagnostic — tries multiple Harmonic endpoints + shapes so we
+// can see exactly what comes back when a "real" domain like stripe.com misses.
 app.get('/api/harmonic/domain-lookup', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const harmonicKey = process.env.HARMONIC_API_KEY;
   if (!harmonicKey) return res.json({ error: 'No key' });
   const domain = req.query.domain || '';
   if (!domain) return res.json({ error: 'domain param required' });
-  try {
-    const url = `${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(domain)}`;
-    const r = await fetch(url, { headers: { apikey: harmonicKey } });
-    const data = r.ok ? await r.json() : { httpError: r.status };
-    const isMatch = data && !Array.isArray(data) && data.id;
-    res.json({
-      domain,
-      found: !!isMatch,
-      harmonicId: data.id || null,
-      harmonicName: data.name || null,
-      harmonicWebsite: data.website?.url || data.website?.domain || null,
-      rawType: Array.isArray(data) ? 'array' : typeof data,
-      rawKeys: typeof data === 'object' && !Array.isArray(data) ? Object.keys(data).slice(0, 10) : null,
-    });
-  } catch (e) {
-    res.json({ domain, error: e.message });
-  }
+  const headers = { apikey: harmonicKey };
+  const probes = [
+    { name: 'companies?website_domain', url: `${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(domain)}` },
+    { name: 'companies?website_url', url: `${HARMONIC_BASE}/companies?website_url=${encodeURIComponent('https://'+domain)}` },
+    { name: 'companies/?website_domain (trailing)', url: `${HARMONIC_BASE}/companies/?website_domain=${encodeURIComponent(domain)}` },
+    // Some Harmonic endpoints accept entity_urn lookups by website
+    { name: 'companies?domain', url: `${HARMONIC_BASE}/companies?domain=${encodeURIComponent(domain)}` },
+    // Enrichment "find" endpoint
+    { name: 'companies:findByDomain', url: `${HARMONIC_BASE}/companies/findByDomain?domain=${encodeURIComponent(domain)}` },
+    { name: 'companies:findByDomain (path)', url: `${HARMONIC_BASE}/companies/by_domain/${encodeURIComponent(domain)}` },
+  ];
+  const out = {};
+  await Promise.allSettled(probes.map(async p => {
+    try {
+      const r = await fetch(p.url, { headers });
+      const text = await r.text();
+      let data; try { data = JSON.parse(text); } catch { data = text.slice(0, 200); }
+      out[p.name] = {
+        status: r.status,
+        type: Array.isArray(data) ? `array[${data.length}]` : typeof data,
+        firstKeys: data && typeof data === 'object' && !Array.isArray(data) ? Object.keys(data).slice(0, 8) : null,
+        firstArrayItemKeys: Array.isArray(data) && data[0] && typeof data[0] === 'object' ? Object.keys(data[0]).slice(0, 8) : null,
+        sample: typeof data === 'string' ? data : JSON.stringify(data).slice(0, 280),
+      };
+    } catch (e) { out[p.name] = { error: e.message }; }
+  }));
+  res.json({ domain, probes: out });
 });
 
 // Live typeahead search.
