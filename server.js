@@ -29,6 +29,34 @@ function saveReachoutsCreds(creds) {
 const HARMONIC_BASE = 'https://api.harmonic.ai';
 const HARMONIC_GQL = 'https://api.harmonic.ai/graphql';
 
+// ───────── URL / DOMAIN NORMALIZATION FOR SEARCH ─────────
+// Users type "3f.xyz" or "https://3f.xyz" expecting a hit. Harmonic's name
+// typeahead misses bare/scheme'd URLs; the domain endpoint hits exactly.
+// These helpers let typeahead/enhanced-search detect URL-ish input and run
+// /companies?website_domain=... in parallel with the name typeahead.
+function looksLikeDomain(q) {
+  const s = String(q || '').trim();
+  if (!s || /\s/.test(s)) return false;
+  if (/^https?:\/\//i.test(s)) return true;
+  if (/^www\./i.test(s)) return true;
+  // foo.xyz, foo.com, foo.co, sub.foo.io, foo.com/path
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/.*)?$/i.test(s)) return true;
+  return false;
+}
+function extractDomain(q) {
+  let s = String(q || '').trim().toLowerCase();
+  s = s.replace(/^https?:\/\//, '');
+  s = s.replace(/^www\./, '');
+  s = s.split(/[\/?#]/)[0];          // strip path/query/fragment
+  s = s.replace(/:\d+$/, '');         // strip port
+  return s;
+}
+function rootDomain(d) {
+  const parts = String(d || '').split('.').filter(Boolean);
+  if (parts.length < 3) return null;
+  return parts.slice(-2).join('.');
+}
+
 // ───────── SUPER SEARCH STATE PERSISTENCE ─────────
 // Without this, every Railway redeploy wipes _superSearchStatus and any
 // in-progress or recently-completed scan results vanish. We persist to
@@ -735,21 +763,46 @@ function gqlToCard(c) {
   };
 }
 
-// Enhanced search: search_agent + keyword search combined, then GQL enrich
+// Enhanced search: search_agent + keyword search combined, then GQL enrich.
+// If the query looks like a URL or bare domain ("3f.xyz", "https://stripe.com"),
+// also hit /companies?website_domain= so we always surface the exact match —
+// search_agent treats raw domains as NL and often misses.
 async function enhancedSearch(query, apiKey, { size = 50, keywords = null, antiKeywords = null } = {}) {
   const authHeaders = { apikey: apiKey };
   const allIds = new Set();
 
-  // 1. Natural language search
+  // 0. Domain lookup (only if the query LOOKS like a URL/domain)
+  const isUrlish = looksLikeDomain(query);
+  if (isUrlish) {
+    const dom = extractDomain(query);
+    const root = rootDomain(dom);
+    const candidates = root && root !== dom ? [dom, root] : [dom];
+    await Promise.allSettled(candidates.map(async d => {
+      try {
+        const r = await fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(d)}`, { headers: authHeaders });
+        if (r.ok) {
+          const data = await r.json();
+          if (data && data.id) {
+            allIds.add(String(data.id));
+            console.log(`[EnhSearch] domain "${d}" → ${data.name} (#${data.id})`);
+          }
+        }
+      } catch (e) { console.error('[EnhSearch] domain lookup error:', e.message); }
+    }));
+  }
+
+  // 1. Natural language search (for URL-ish queries, use the local part instead
+  // of the full URL so we still get name matches when domain misses).
+  const nlQuery = isUrlish ? (extractDomain(query).split('.')[0] || query) : query;
   try {
-    const r = await fetch(`${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(query)}&size=${Math.min(size, 1000)}`, { headers: authHeaders });
+    const r = await fetch(`${HARMONIC_BASE}/search/search_agent?query=${encodeURIComponent(nlQuery)}&size=${Math.min(size, 1000)}`, { headers: authHeaders });
     if (r.ok) {
       const data = await r.json();
       (data.results || []).forEach(r => {
         const id = r.id || (r.urn || r.entity_urn || '').split(':').pop();
         if (id) allIds.add(String(id));
       });
-      console.log(`[EnhSearch] search_agent "${query.slice(0, 40)}" → ${allIds.size} results`);
+      console.log(`[EnhSearch] search_agent "${nlQuery.slice(0, 40)}" → ${allIds.size} results`);
     }
   } catch (e) { console.error('[EnhSearch] search_agent error:', e.message); }
 
@@ -1594,48 +1647,114 @@ app.get('/api/harmonic/domain-lookup', async (req, res) => {
   }
 });
 
-// Live typeahead search
+// Live typeahead search.
+// Handles three input shapes uniformly so users don't need to think about it:
+//   • "openai"           → name typeahead
+//   • "3f.xyz"           → domain lookup + name typeahead (on the local part) in parallel
+//   • "https://3f.xyz/x" → strip scheme/path, same as above
+// Domain hits are surfaced first; results are deduped by id and backburn-filtered.
 app.get('/api/harmonic/typeahead', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const harmonicKey = process.env.HARMONIC_API_KEY;
   if (!harmonicKey) return res.json({ results: [] });
-  const q = req.query.q || '';
+  const qRaw = String(req.query.q || '');
   const size = parseInt(req.query.size) || 8;
-  if (q.length < 2) return res.json({ results: [] });
+  if (qRaw.trim().length < 2) return res.json({ results: [] });
+
+  const isUrlish = looksLikeDomain(qRaw);
+  const domain = isUrlish ? extractDomain(qRaw) : '';
+  const root = isUrlish ? rootDomain(domain) : null;
+  // For URL-ish input, also run a name typeahead using the local part
+  // ("3f" from "3f.xyz", "openai" from "blog.openai.com") so we still
+  // surface name matches even when the domain lookup misses.
+  const nameQ = isUrlish ? (domain.split('.')[0] || qRaw.trim()) : qRaw.trim();
+  const headers = { apikey: harmonicKey };
+
   try {
-    const url = `${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(q)}&size=${size}`;
-    console.log(`[Typeahead] Fetching: ${url}`);
-    const r = await fetch(url, { headers: { apikey: harmonicKey } });
-    if (!r.ok) {
-      console.error(`[Typeahead] HTTP ${r.status}`);
+    // Build parallel task list
+    const tasks = [];
+    const taskNames = [];
+
+    if (isUrlish && domain) {
+      tasks.push(
+        fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(domain)}`, { headers })
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      );
+      taskNames.push(`domain:${domain}`);
+      if (root && root !== domain) {
+        tasks.push(
+          fetch(`${HARMONIC_BASE}/companies?website_domain=${encodeURIComponent(root)}`, { headers })
+            .then(r => r.ok ? r.json() : null).catch(() => null)
+        );
+        taskNames.push(`domain:${root}`);
+      }
+    }
+
+    // Name typeahead (always)
+    tasks.push(
+      fetch(`${HARMONIC_BASE}/search/typeahead?query=${encodeURIComponent(nameQ)}&size=${size}`, { headers })
+        .then(r => r.ok ? r.json() : null).catch(() => null)
+    );
+    taskNames.push(`typeahead:${nameQ}`);
+
+    const settled = await Promise.allSettled(tasks);
+
+    // Collect IDs in priority order: domain hits first, then typeahead
+    const orderedIds = [];
+    const seenIds = new Set();
+    const inlineCompanies = []; // domain hits arrive as full company objects
+
+    settled.forEach((r, i) => {
+      if (r.status !== 'fulfilled' || !r.value) return;
+      const data = r.value;
+      const tn = taskNames[i] || '';
+      if (tn.startsWith('domain:')) {
+        // /companies?website_domain= returns a single company object when matched
+        if (data && data.id) {
+          const idStr = String(data.id);
+          if (!seenIds.has(idStr)) {
+            seenIds.add(idStr);
+            orderedIds.push(data.id);
+            inlineCompanies.push(data);
+            console.log(`[Typeahead] ${tn} → ${data.name} (#${data.id})`);
+          }
+        }
+      } else if (tn.startsWith('typeahead:')) {
+        const arr = Array.isArray(data) ? data : (data.results || []);
+        for (const r2 of arr) {
+          const urn = r2.entity_urn || r2.entityUrn || r2.urn || '';
+          const id = parseInt(r2.id || urn.split(':').pop());
+          if (!id) continue;
+          const idStr = String(id);
+          if (!seenIds.has(idStr)) {
+            seenIds.add(idStr);
+            orderedIds.push(id);
+          }
+        }
+        console.log(`[Typeahead] ${tn} → ${arr.length} raw, ${orderedIds.length} total unique so far`);
+      }
+    });
+
+    if (orderedIds.length === 0) {
+      console.log(`[Typeahead] "${qRaw}" → 0 results`);
       return res.json({ results: [] });
     }
-    const data = await r.json();
-    console.log(`[Typeahead] Response type: ${typeof data}, isArray: ${Array.isArray(data)}, keys: ${typeof data === 'object' ? Object.keys(data).join(',') : 'n/a'}`);
-    console.log(`[Typeahead] Raw: ${JSON.stringify(data).slice(0, 600)}`);
 
-    let raw = Array.isArray(data) ? data : (data.results || []);
-    console.log(`[Typeahead] "${q}" → ${raw.length} results`);
-
-    // Extract unique numeric IDs
-    const ids = [...new Set(raw.map(r => {
-      const urn = r.entity_urn || r.entityUrn || r.urn || '';
-      return parseInt(r.id || urn.split(':').pop()) || null;
-    }).filter(Boolean))].slice(0, size);
-
-    if (ids.length === 0) return res.json({ results: [] });
-    console.log(`[Typeahead] IDs to enrich: ${ids.join(', ')}`);
-
-    // Fast REST enrichment (skip GQL for speed)
-    const enriched = [];
-    const batchResults = await Promise.allSettled(
-      ids.slice(0, 6).map(id =>
-        fetch(`${HARMONIC_BASE}/companies/${id}`, { headers: { apikey: harmonicKey } })
-          .then(r => r.ok ? r.json() : null)
-          .catch(() => null)
-      )
+    // Enrich the top N (domain hits already enriched inline). For each ordered id,
+    // either reuse an inline company or fetch /companies/{id}.
+    const topIds = orderedIds.slice(0, Math.max(size, 6));
+    const inlineById = new Map(inlineCompanies.map(c => [String(c.id), c]));
+    const fetched = await Promise.allSettled(
+      topIds.map(id => {
+        const cached = inlineById.get(String(id));
+        if (cached) return Promise.resolve(cached);
+        return fetch(`${HARMONIC_BASE}/companies/${id}`, { headers })
+          .then(r => r.ok ? r.json() : null).catch(() => null);
+      })
     );
-    for (const r of batchResults) {
+
+    const enriched = [];
+    for (const r of fetched) {
       if (r.status === 'fulfilled' && r.value) {
         const c = r.value;
         enriched.push({
@@ -1656,11 +1775,11 @@ app.get('/api/harmonic/typeahead', async (req, res) => {
         });
       }
     }
+
     // Per project rule: Backburn companies must NEVER appear in any search result.
-    // The typeahead used to leak Backburn into the global search dropdown.
     const filtered = filterBackburn(enriched);
     if (filtered.length !== enriched.length) console.log(`[Typeahead] Filtered ${enriched.length - filtered.length} backburn`);
-    console.log(`[Typeahead] Enriched ${filtered.length}: ${filtered.map(e => e.name).join(', ')}`);
+    console.log(`[Typeahead] "${qRaw}" (urlish=${isUrlish}, name=${nameQ}) → ${filtered.length}: ${filtered.map(e => e.name).join(', ')}`);
     res.json({ results: filtered });
   } catch (e) {
     console.error('[Typeahead] Error:', e.message);
